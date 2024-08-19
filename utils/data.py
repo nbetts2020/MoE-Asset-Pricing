@@ -48,12 +48,18 @@ def get_batch(split, text, encoder):
     return x, y
 
 @torch.no_grad()
-def estimate_loss(model, eval_iters, device, text, encoder):
+def estimate_loss(model, eval_iters, device, text, encoder, iteration):
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
+            total_steps = max_iters * eval_iters
+            current_step = iteration * eval_iters + k
+            percentage_complete = (current_step / total_steps) * 100
+
+            print(f"Progress: {percentage_complete:.2f}%")
+
             X, Y = get_batch(split, text, encoder)
             X, Y = X.to(device), Y.to(device)
             logits, loss = model(X, Y)
