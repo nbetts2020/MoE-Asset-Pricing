@@ -5,6 +5,10 @@ from utils.config import *
 from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+cuda_available = (device == "cuda")
+if cuda_available:
+    from flash_attention import minimal_attn  # Import the loaded CUDA module
+
 class Head(nn.Module):
     """ one head of self-attention """
 
@@ -26,6 +30,47 @@ class Head(nn.Module):
         wei = self.dropout(wei)
         v = self.value(x) # (B,T,C)
         out = wei @ v # (B, T, T) @ (B, T, C)
+        return out
+    
+class FlashAttentionHead(nn.Module):
+    """One head of self-attention using Flash Attention."""
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
+
+        # Reshape for multi-head attention compatibility
+        q = q.view(B, -1, T, C // T)
+        k = k.view(B, -1, T, C // T)
+        v = v.view(B, -1, T, C // T)
+
+        # Use the custom Flash Attention kernel
+        out = minimal_attn.forward(q, k, v)
+
+        # Flatten back to the original shape
+        out = out.view(B, T, -1)
+        return out
+    
+class FlashMultiHeadAttention(nn.Module):
+    """Multiple heads of self-attention in parallel using Flash Attention."""
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([FlashAttentionHead(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # Concatenate the output of all heads
+        out = self.dropout(self.proj(out))  # Apply a final linear projection
         return out
 
 # Multi-Headed Self Attention
@@ -118,7 +163,10 @@ class Block(nn.Module):
     def __init__(self, n_embed, n_head, num_experts, top_k):
         super().__init__()
         head_size = n_embed // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
+        if cuda_available:
+            self.sa = FlashMultiHeadAttention(n_head, head_size)
+        else:
+            self.sa = MultiHeadAttention(n_head, head_size)
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
