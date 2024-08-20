@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from utils.config import *
 from utils.data import *
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -130,23 +131,24 @@ class Block(nn.Module):
 # Finally putting it all together to create a sparse mixture of experts language model
 class SparseMoELanguageModel(nn.Module):
 
-    def __init__(self, text, encoder, decoder, chars):
+    def __init__(self, tokenizer_name="gpt2"):
         super().__init__()
-        vocab_size = get_vocab_size(chars)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embed) # final layer norm
+        self.ln_f = nn.LayerNorm(n_embed)  # final layer norm
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
-        x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))  # (T,C)
+        x = tok_emb + pos_emb  # (B,T,C)
+        x = self.blocks(x)  # (B,T,C)
+        x = self.ln_f(x)  # (B,T,C)
+        logits = self.lm_head(x)  # (B,T,vocab_size)
 
         if targets is None:
             loss = None
@@ -158,15 +160,20 @@ class SparseMoELanguageModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens, decoder=None, stream=False, temperature=1.0):
+    def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
             logits, loss = self(idx_cond)
-            logits = logits[:, -1, :] # (B, C)
+            logits = logits[:, -1, :]  # (B, C)
             logits = logits / temperature
-            probs = F.softmax(logits, dim=-1) # (B, C)
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-            if stream and decoder is not None:
-                print(decoder(idx_next[0].tolist()), end='', flush=True)
+            probs = F.softmax(logits, dim=-1)  # (B, C)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+
+            if stream:
+                decoded_text = self.tokenizer.decode(idx_next[0].tolist(), skip_special_tokens=True)
+                print(decoded_text, end='', flush=True)
+
         return idx
+
+

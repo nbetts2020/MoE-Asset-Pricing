@@ -3,13 +3,13 @@ from utils.data import get_batch, estimate_loss
 import os
 from utils.config import *
 
-def train_model(model, optimizer, max_iters, eval_interval, device, text, encoder):
+def train_model(model, optimizer, max_iters, eval_interval, device, text):
     for iter in range(max_iters):
         if iter % eval_interval == 0 or iter == max_iters - 1:
-            losses = estimate_loss(model, eval_iters=eval_iters, device=device, text=text, encoder=encoder)
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            losses = estimate_loss(model, eval_iters=eval_iters, device=device, text=text)
+            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-        xb, yb = get_batch('train', text, encoder)
+        xb, yb = get_batch('train', text)
         xb, yb = xb.to(device), yb.to(device)
         logits, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)

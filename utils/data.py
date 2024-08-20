@@ -30,13 +30,13 @@ def decoder(chars):
     
     return decode
 
-# data loading
-def get_batch(split, text, encoder):
+def get_batch(split, data):
     # generate a small batch of data of inputs x and targets y
+    # data = text['input_ids'].squeeze(0)  # Remove batch dimension if present
 
     # Train and test splits
-    data = torch.tensor(encoder(text), dtype=torch.long)
-    n = int(0.9*len(data)) # first 90% will be train, rest val
+    data = data[0]
+    n = int(0.9 * len(data))  # first 90% will be train, rest val
     train_data = data[:n]
     val_data = data[n:]
 
@@ -48,14 +48,13 @@ def get_batch(split, text, encoder):
     return x, y
 
 @torch.no_grad()
-def estimate_loss(model, eval_iters, device, text, encoder):
+def estimate_loss(model, eval_iters, device, text):
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            print(f"{k} of {eval_iters}")
-            X, Y = get_batch(split, text, encoder)
+            X, Y = get_batch(split, text)
             X, Y = X.to(device), Y.to(device)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
