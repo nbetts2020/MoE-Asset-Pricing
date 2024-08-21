@@ -164,6 +164,7 @@ class Block(nn.Module):
         super().__init__()
         head_size = n_embed // n_head
         if cuda_available:
+            print("Using Flash Attention!")
             self.sa = FlashMultiHeadAttention(n_head, head_size)
         else:
             self.sa = MultiHeadAttention(n_head, head_size)
