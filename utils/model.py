@@ -43,14 +43,17 @@ class FlashAttentionHead(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        v = self.value(x)
+        k = self.key(x)   # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
+        v = self.value(x) # (B, T, head_size)
+
+        # Ensure head_size = C // n_head, where n_head is the number of heads
+        head_size = C // n_head
 
         # Reshape for multi-head attention compatibility
-        q = q.view(B, -1, T, C // T)
-        k = k.view(B, -1, T, C // T)
-        v = v.view(B, -1, T, C // T)
+        q = q.view(B, n_head, T, head_size)
+        k = k.view(B, n_head, T, head_size)
+        v = v.view(B, n_head, T, head_size)
 
         # Use the custom Flash Attention kernel
         out = minimal_attn.forward(q, k, v)
@@ -58,7 +61,7 @@ class FlashAttentionHead(nn.Module):
         # Flatten back to the original shape
         out = out.view(B, T, -1)
         return out
-    
+        
 class FlashMultiHeadAttention(nn.Module):
     """Multiple heads of self-attention in parallel using Flash Attention."""
 
