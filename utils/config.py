@@ -15,3 +15,7 @@ n_layer = 28
 dropout = 0.1
 num_experts = 8
 top_k = 2
+
+sparsity_block_size = 32
+num_global_blocks = 1
+causal = True

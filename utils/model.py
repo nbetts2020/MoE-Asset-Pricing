@@ -6,8 +6,14 @@ from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 cuda_available = (device == "cuda")
+
 if cuda_available:
-    from utils.flash_attention import minimal_attn  # Import the loaded CUDA module
+    from utils.flash_blocksparse_attention import FlashBlocksparseMHA
+
+
+cuda_available = (device == "cuda")
+if cuda_available:
+    from flash_attention import minimal_attn  # Import the loaded CUDA module
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -43,17 +49,14 @@ class FlashAttentionHead(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)   # (B, T, head_size)
-        q = self.query(x) # (B, T, head_size)
-        v = self.value(x) # (B, T, head_size)
-
-        # Ensure head_size = C // n_head, where n_head is the number of heads
-        head_size = C // n_head
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
 
         # Reshape for multi-head attention compatibility
-        q = q.view(B, n_head, T, head_size)
-        k = k.view(B, n_head, T, head_size)
-        v = v.view(B, n_head, T, head_size)
+        q = q.view(B, -1, T, C // T)
+        k = k.view(B, -1, T, C // T)
+        v = v.view(B, -1, T, C // T)
 
         # Use the custom Flash Attention kernel
         out = minimal_attn.forward(q, k, v)
@@ -61,7 +64,7 @@ class FlashAttentionHead(nn.Module):
         # Flatten back to the original shape
         out = out.view(B, T, -1)
         return out
-        
+    
 class FlashMultiHeadAttention(nn.Module):
     """Multiple heads of self-attention in parallel using Flash Attention."""
 
@@ -163,12 +166,17 @@ class SparseMoE(nn.Module):
 class Block(nn.Module):
     """ Mixture of Experts Transformer block: communication followed by computation (multi-head self attention + SparseMoE) """
 
-    def __init__(self, n_embed, n_head, num_experts, top_k):
+    def __init__(self, n_embed, n_head, num_experts, top_k, sparsity_config=None):
         super().__init__()
         head_size = n_embed // n_head
         if cuda_available:
-            print("Using Flash Attention!")
-            self.sa = FlashMultiHeadAttention(n_head, head_size)
+            self.sa = FlashBlocksparseMHA(
+            embed_dim=n_embed,
+            num_heads=n_head,
+            sparsity_config=sparsity_config,
+            attention_dropout=dropout,
+            causal=True
+        )
         else:
             self.sa = MultiHeadAttention(n_head, head_size)
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
@@ -183,13 +191,13 @@ class Block(nn.Module):
 # Finally putting it all together to create a sparse mixture of experts language model
 class SparseMoELanguageModel(nn.Module):
 
-    def __init__(self, tokenizer_name="gpt2"):
+    def __init__(self, tokenizer_name="gpt2", sparsity_config=None):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k, sparsity_config=sparsity_config) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embed)  # final layer norm
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
