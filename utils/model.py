@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 cuda_available = (device == "cuda")
 if cuda_available:
-    from flash_attention import minimal_attn  # Import the loaded CUDA module
+    from utils.flash_attention import minimal_attn  # Import the loaded CUDA module
 
 class Head(nn.Module):
     """ one head of self-attention """
