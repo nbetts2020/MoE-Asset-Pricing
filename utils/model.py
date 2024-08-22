@@ -5,9 +5,9 @@ from utils.config import *
 from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-cuda_available = (device == "gpu")
+cuda_available = (device == "cuda")
 if cuda_available:
-    from flash_attn_triton import FlashAttnFunc  # Assuming this is the module where FlashAttention is implemented
+    from utils.flash_attn_triton import FlashAttnFunc  # Assuming this is the module where FlashAttention is implemented
 
 class Head(nn.Module):
     """ One head of self-attention """
