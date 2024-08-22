@@ -7,11 +7,6 @@ from utils.train import train_model
 from utils.utils import kaiming_init_weights
 from utils.config import *
 
-cuda_available = (device == "cuda")
-if cuda_available:
-    from utils.flash_blocksparse_attention import SparsityConfig
-
-
 def main():
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
     parser.add_argument('mode', choices=['train', 'run'], help="Mode: 'train' to train the model, 'run' to generate text")
@@ -28,18 +23,8 @@ def main():
 
     print(f"Using device: {device}, Number of GPUs: {n_gpus}")
 
-    sparsity_config = None
-
-    if cuda_available:
-
-        sparsity_config = SparsityConfig(
-            block_size=sparsity_block_size,
-            num_global_blocks=num_global_blocks,
-            causal=causal
-        )
-
     # Load the model with the tokenizer
-    model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name, sparsity_config=sparsity_config)
+    model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name)
     tokenizer = model.tokenizer
 
     if args.mode == 'train':
