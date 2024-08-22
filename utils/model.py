@@ -5,78 +5,42 @@ from utils.config import *
 from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-cuda_available = (device == "cuda")
-
+cuda_available = (device == "gpu")
 if cuda_available:
-    from utils.flash_blocksparse_attention import FlashBlocksparseMHA
-
-
-cuda_available = (device == "cuda")
-if cuda_available:
-    from flash_attention import minimal_attn  # Import the loaded CUDA module
+    from flash_attn_triton import FlashAttnFunc  # Assuming this is the module where FlashAttention is implemented
 
 class Head(nn.Module):
-    """ one head of self-attention """
+    """ One head of self-attention """
 
     def __init__(self, head_size):
         super().__init__()
+        self.head_size = head_size
         self.key = nn.Linear(n_embed, head_size, bias=False)
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
+        if not cuda_available:
+            self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+            self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)   # (B,T,C)
-        q = self.query(x) # (B,T,C)
-        wei = q @ k.transpose(-2,-1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-        wei = self.dropout(wei)
-        v = self.value(x) # (B,T,C)
-        out = wei @ v # (B, T, T) @ (B, T, C)
-        return out
-    
-class FlashAttentionHead(nn.Module):
-    """One head of self-attention using Flash Attention."""
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        v = self.value(x)
-
-        # Reshape for multi-head attention compatibility
-        q = q.view(B, -1, T, C // T)
-        k = k.view(B, -1, T, C // T)
-        v = v.view(B, -1, T, C // T)
-
-        # Use the custom Flash Attention kernel
-        out = minimal_attn.forward(q, k, v)
-
-        # Flatten back to the original shape
-        out = out.view(B, T, -1)
-        return out
-    
-class FlashMultiHeadAttention(nn.Module):
-    """Multiple heads of self-attention in parallel using Flash Attention."""
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([FlashAttentionHead(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)  # Concatenate the output of all heads
-        out = self.dropout(self.proj(out))  # Apply a final linear projection
+        k = self.key(x)   # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
+        v = self.value(x) # (B, T, head_size)
+        
+        if cuda_available:
+            q = q.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
+            k = k.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
+            v = v.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
+            out = FlashAttnFunc(q, k, v, causal=True)  # Use FlashAttention
+            out = out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
+        else:
+            wei = q @ k.transpose(-2,-1) * C**-0.5  # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
+            wei = F.softmax(wei, dim=-1)  # (B, T, T)
+            wei = self.dropout(wei)
+            out = wei @ v  # (B, T, T) @ (B, T, head_size)
+        
         return out
 
 # Multi-Headed Self Attention
@@ -166,19 +130,10 @@ class SparseMoE(nn.Module):
 class Block(nn.Module):
     """ Mixture of Experts Transformer block: communication followed by computation (multi-head self attention + SparseMoE) """
 
-    def __init__(self, n_embed, n_head, num_experts, top_k, sparsity_config=None):
+    def __init__(self, n_embed, n_head, num_experts, top_k):
         super().__init__()
         head_size = n_embed // n_head
-        if cuda_available:
-            self.sa = FlashBlocksparseMHA(
-            embed_dim=n_embed,
-            num_heads=n_head,
-            sparsity_config=sparsity_config,
-            attention_dropout=dropout,
-            causal=True
-        )
-        else:
-            self.sa = MultiHeadAttention(n_head, head_size)
+        self.sa = MultiHeadAttention(n_head, head_size)
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -197,7 +152,7 @@ class SparseMoELanguageModel(nn.Module):
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k, sparsity_config=sparsity_config) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embed)  # final layer norm
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
