@@ -5,7 +5,7 @@ from utils.config import *
 from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-cuda_available = (device == "cuda")
+cuda_available = (device == "gpu")
 if cuda_available:
     from utils.flash_attn_triton import FlashAttnFunc  # Assuming this is the module where FlashAttention is implemented
 
@@ -24,23 +24,28 @@ class Head(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)   # (B, T, head_size)
-        q = self.query(x) # (B, T, head_size)
-        v = self.value(x) # (B, T, head_size)
+        k = self.key(x).half()   # Ensure k is float16
+        q = self.query(x).half() # Ensure q is float16
+        v = self.value(x).half() # Ensure v is float16
         
         if cuda_available:
+            # Reshape and permute for FlashAttention
             q = q.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
             k = k.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
             v = v.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
-            out = FlashAttnFunc(q, k, v, causal=True)  # Use FlashAttention
+
+            # Apply FlashAttention
+            out = FlashAttnFunc.apply(q, k, v, None, True)
+
+            # Reshape and permute back to original shape
             out = out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
         else:
-            wei = q @ k.transpose(-2,-1) * C**-0.5  # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
-            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
-            wei = F.softmax(wei, dim=-1)  # (B, T, T)
+            wei = q @ k.transpose(-2, -1) * C**-0.5
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+            wei = F.softmax(wei, dim=-1)
             wei = self.dropout(wei)
-            out = wei @ v  # (B, T, T) @ (B, T, head_size)
-        
+            out = wei @ v
+
         return out
 
 # Multi-Headed Self Attention
@@ -50,7 +55,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embed, n_embed)
+        self.proj = nn.Linear(n_embed, n_embed).half()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
