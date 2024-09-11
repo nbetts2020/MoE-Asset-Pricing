@@ -24,9 +24,9 @@ class Head(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x).half()   # Ensure k is float16
-        q = self.query(x).half() # Ensure q is float16
-        v = self.value(x).half() # Ensure v is float16
+        k = self.key(x).half() if cuda_available else self.key(x) # Ensure k is float16
+        q = self.query(x).half() if cuda_available else self.query(x) # Ensure q is float16
+        v = self.value(x).half() if cuda_available else self.value(x) # Ensure v is float16
         
         if cuda_available:
             # Reshape and permute for FlashAttention
