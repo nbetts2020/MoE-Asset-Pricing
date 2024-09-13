@@ -47,8 +47,20 @@ def main():
 
         # Load your dataframe with 'Article' and 'Price' columns
         df = pd.read_csv(args.data_path)
-        articles = df['Article'].tolist()
-        prices = df['weighted_average_720_hrs'].tolist()
+        df = df[df['weighted_avg_720_hrs'] > 0]
+        articles = [
+            "Symbol: " + row['Symbol_x'] +
+            "\nSecurity: " + row['Date_x'] +
+            "\nRelated Stocks/Topics: " + row['RelatedStocksList'] +
+            "\nArticle Content: " + row['Article'] +
+            "\nArticle Title: " + row['Title'] +
+            "\nArticle Type: " + row['articleType'] +
+            "\nArticle Publication: " + row['Publication'] +
+            "\nPublication Author: " + row['Author']
+            for index, row in df.iterrows()
+        ]
+
+        prices = df['weighted_avg_720_hrs'].tolist()
 
         # Optionally normalize prices
         # from sklearn.preprocessing import StandardScaler
