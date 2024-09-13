@@ -1,17 +1,21 @@
 import torch
 import os
 import argparse
+import pandas as pd
 from transformers import AutoTokenizer
 from utils.model import SparseMoELanguageModel
 from utils.train import train_model
 from utils.utils import kaiming_init_weights
 from utils.config import *
+from torch.utils.data import DataLoader
+from utils.data import ArticlePriceDataset
 
 def main():
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
-    parser.add_argument('mode', choices=['train', 'run'], help="Mode: 'train' to train the model, 'run' to generate text")
-    parser.add_argument('input_text', type=str, nargs='?', help="Input text to complete (required if mode is 'run')", default=None)
+    parser.add_argument('mode', choices=['train', 'run'], help="Mode: 'train' to train the model, 'run' to predict price")
+    parser.add_argument('input_text', type=str, nargs='?', help="Input article text (required if mode is 'run')", default=None)
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
+    parser.add_argument('--data_path', type=str, default="/content/test_df.csv", help="Path to the dataset CSV file")
 
     args = parser.parse_args()
 
@@ -23,9 +27,12 @@ def main():
 
     print(f"Using device: {device}, Number of GPUs: {n_gpus}")
 
-    # Load the model with the tokenizer
+    # Initialize the model and tokenizer
     model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name)
     tokenizer = model.tokenizer
+
+    # **Set pad token to eos token**
+    tokenizer.pad_token = tokenizer.eos_token
 
     if args.mode == 'train':
         model.apply(kaiming_init_weights)
@@ -34,18 +41,31 @@ def main():
             model = torch.nn.DataParallel(model)
 
         model = model.to(device)
-        print(sum(p.numel() for p in model.parameters()) / 1e6, 'M parameters')
+        print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-        # Load and tokenize the text data
-        input_path = os.path.join("data", "TinyStoriesV2-GPT4-valid.txt")
-        with open(input_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        tokens = tokenizer(text, return_tensors='pt')['input_ids'].to(device)
+        # Load your dataframe with 'Article' and 'Price' columns
+        df = pd.read_csv(args.data_path)
+        articles = df['Article'].tolist()
+        prices = df['weighted_average_720_hrs'].tolist()
 
-        train_model(model, optimizer, max_iters, eval_interval, device, tokens)
-    
+        # Optionally normalize prices
+        # from sklearn.preprocessing import StandardScaler
+        # scaler = StandardScaler()
+        # prices = scaler.fit_transform(np.array(prices).reshape(-1, 1)).flatten()
+
+        # Create dataset and dataloader
+        dataset = ArticlePriceDataset(articles, prices, tokenizer)
+        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+        print("Training Started!")
+        # Train the model
+        train_model(model, optimizer, EPOCHS, device, dataloader)
+
+        # Save the model weights
+        os.makedirs('model', exist_ok=True)
+        torch.save(model.state_dict(), 'model/model_weights.pth')
+
     elif args.mode == 'run':
         if not args.input_text:
             raise ValueError("You must provide input text when mode is 'run'")
@@ -55,25 +75,24 @@ def main():
         filename = "model_weights.pth"
         filepath = os.path.join(directory, filename)
 
-        model = model.to(device)
         model.load_state_dict(torch.load(filepath, map_location=device))
-
-        if n_gpus > 1:
-            model = torch.nn.DataParallel(model)
-
+        model = model.to(device)
         model.eval()
 
         # Tokenize the input text
-        encoded_input = tokenizer(args.input_text, return_tensors='pt').to(device)
-        idx = encoded_input["input_ids"]
-        print(idx)
-        print(tokenizer.decode(idx[0]))
+        encoding = tokenizer(
+            args.input_text,
+            truncation=True,
+            padding='max_length',
+            max_length=256,
+            return_tensors='pt'
+        ).to(device)
+        input_ids = encoding["input_ids"]
 
-        # Generate continuation
-        generated_tokens = model.generate(idx, max_new_tokens=100, stream=True)
-        generated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-        
-        print(f"Generated text: {generated_text}")
+        # Make prediction
+        with torch.no_grad():
+            prediction, _ = model(input_ids=input_ids)
+        print(f"Predicted Price: {prediction.item()}")
 
 if __name__ == "__main__":
     main()
