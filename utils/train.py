@@ -1,26 +1,31 @@
 import torch
-from utils.data import get_batch, estimate_loss
-import os
-from utils.config import *
+from sklearn.metrics import mean_absolute_error, r2_score
 
-def train_model(model, optimizer, max_iters, eval_interval, device, text):
-    for iter in range(max_iters):
-        if iter % eval_interval == 0 or iter == max_iters - 1:
-            losses = estimate_loss(model, eval_iters=eval_iters, device=device, text=text)
-            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+def train_model(model, optimizer, epochs, device, dataloader):
+    model.train()
+    for epoch in range(epochs):
+        print(f"Start of Epoch {epoch}")
+        total_loss = 0
+        predictions = []
+        actuals = []
+        for batch in dataloader:
+            optimizer.zero_grad()
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            outputs, loss = model(input_ids=input_ids, targets=labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-        xb, yb = get_batch('train', text)
-        xb, yb = xb.to(device), yb.to(device)
-        logits, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+            # Collect predictions and actuals for metrics
+            predictions.extend(outputs.detach().cpu().numpy())
+            actuals.extend(labels.cpu().numpy())
 
-    directory = "model"
-    filename = "model_weights.pth"
+        avg_loss = total_loss / len(dataloader)
+        # Calculate metrics
+        mae = mean_absolute_error(actuals, predictions)
+        r2 = r2_score(actuals, predictions)
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}, MAE: {mae:.4f}, R2 Score: {r2:.4f}")
 
-    # Create the full path
-    filepath = os.path.join(directory, filename)
-
-    # Save the model weights
-    torch.save(model.state_dict(), filepath)
+    # Save the final model (optional)
+    # torch.save(model.state_dict(), 'model/model_weights_final.pth')

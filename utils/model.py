@@ -6,8 +6,8 @@ from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 cuda_available = (device == "cuda")
-if cuda_available:
-    from utils.flash_attn_triton import FlashAttnFunc
+# if cuda_available:
+#     from utils.flash_attn_triton import FlashAttnFunc
 
 class Head(nn.Module):
     """ One head of self-attention """
@@ -18,33 +18,20 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embed, head_size, bias=False)
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
-        if not cuda_available:
-            self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-            self.dropout = nn.Dropout(dropout)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x).half() if cuda_available else self.key(x) # Ensure k is float16
-        q = self.query(x).half() if cuda_available else self.query(x) # Ensure q is float16
-        v = self.value(x).half() if cuda_available else self.value(x) # Ensure v is float16
+        k = self.key(x) # Ensure k is float16
+        q = self.query(x) # Ensure q is float16
+        v = self.value(x) # Ensure v is float16
         
-        if cuda_available:
-            # Reshape and permute for FlashAttention
-            q = q.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
-            k = k.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
-            v = v.view(B, T, -1, self.head_size).permute(0, 2, 1, 3)
-
-            # Apply FlashAttention
-            out = FlashAttnFunc.apply(q, k, v, None, True)
-
-            # Reshape and permute back to original shape
-            out = out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
-        else:
-            wei = q @ k.transpose(-2, -1) * C**-0.5
-            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-            wei = F.softmax(wei, dim=-1)
-            wei = self.dropout(wei)
-            out = wei @ v
+        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+        out = wei @ v
 
         return out
 
@@ -55,7 +42,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embed, n_embed).half()
+        self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -150,35 +137,40 @@ class Block(nn.Module):
 
 # Finally putting it all together to create a sparse mixture of experts language model
 class SparseMoELanguageModel(nn.Module):
-
     def __init__(self, tokenizer_name="gpt2", sparsity_config=None):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embed)  # final layer norm
-        self.lm_head = nn.Linear(n_embed, vocab_size)
+        self.blocks = nn.Sequential(
+            *[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)]
+        )
+        self.ln_f = nn.LayerNorm(n_embed)
+        # Regression head
+        self.regression_head = nn.Linear(n_embed, 1)
 
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))  # (T,C)
-        x = tok_emb + pos_emb  # (B,T,C)
-        x = self.blocks(x)  # (B,T,C)
-        x = self.ln_f(x)  # (B,T,C)
-        logits = self.lm_head(x)  # (B,T,vocab_size)
-
-        if targets is None:
-            loss = None
+    def forward(self, input_ids, targets=None):
+        B, T = input_ids.shape
+        tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
+        x = tok_emb + pos_emb  # (B, T, n_embed)
+        x = self.blocks(x)     # (B, T, n_embed)
+        x = self.ln_f(x)       # (B, T, n_embed)
+        
+        # Mean pooling over the sequence length
+        x = x.mean(dim=1)      # (B, n_embed)
+        
+        # Regression head
+        output = self.regression_head(x)  # (B, 1)
+        output = output.squeeze(-1)       # (B,)
+        
+        if targets is not None:
+            loss = F.mse_loss(output, targets)
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits, loss
+            loss = None
+        
+        return output, loss
 
     def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
         for _ in range(max_new_tokens):
