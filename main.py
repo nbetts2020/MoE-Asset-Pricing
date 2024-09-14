@@ -60,7 +60,11 @@ def main():
             "\nArticle Title: " + str(row['Title']) +
             "\nArticle Type: " + str(row['articleType']) +
             "\nArticle Publication: " + str(row['Publication']) +
-            "\nPublication Author: " + str(row['Author'])
+            "\nPublication Author: " + str(row['Author']) + 
+            "\nStock Price 4 days before: " + str(row['weighted_avg_-96_hrs']) +
+            "\nStock Price 2 days before: " + str(row['weighted_avg_-48_hrs']) +
+            "\nStock Price 1 days before: " + str(row['weighted_avg_-24_hrs']) +
+            "\nStock Price 0 days before: " + str(row['weighted_avg_0_hrs'])
             for index, row in df.iterrows()
         ]
         print(articles[0],"aaa")
@@ -105,7 +109,11 @@ def main():
                 "\nArticle Title: " + str(row['Title']) +
                 "\nArticle Type: " + str(row['articleType']) +
                 "\nArticle Publication: " + str(row['Publication']) +
-                "\nPublication Author: " + str(row['Author'])
+                "\nPublication Author: " + str(row['Author']) + 
+                "\nStock Price 4 days before: " + str(row['weighted_avg_-96_hrs']) +
+                "\nStock Price 2 days before: " + str(row['weighted_avg_-48_hrs']) +
+                "\nStock Price 1 days before: " + str(row['weighted_avg_-24_hrs']) +
+                "\nStock Price 0 days before: " + str(row['weighted_avg_0_hrs'])
                 for index, row in df.iterrows()
             ]
 
