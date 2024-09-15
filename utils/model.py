@@ -4,6 +4,7 @@ from torch.nn import functional as F
 from utils.config import *
 from utils.data import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from torch.utils.checkpoint import checkpoint
 
 cuda_available = (device == "cuda")
 # if cuda_available:
@@ -155,7 +156,11 @@ class SparseMoELanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
         pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
         x = tok_emb + pos_emb  # (B, T, n_embed)
-        x = self.blocks(x)     # (B, T, n_embed)
+        
+        # Apply gradient checkpointing to each block
+        for block in self.blocks:
+            x = checkpoint(block, x)
+        
         x = self.ln_f(x)       # (B, T, n_embed)
         
         # Mean pooling over the sequence length
@@ -169,7 +174,7 @@ class SparseMoELanguageModel(nn.Module):
             loss = F.mse_loss(output, targets)
         else:
             loss = None
-        
+    
         return output, loss
 
     def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
