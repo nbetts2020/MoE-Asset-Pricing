@@ -136,110 +136,33 @@ def main():
         model.load_state_dict(torch.load(filepath, map_location=device))
         model = model.to(device)
         model.eval()
-
+    
         if args.test:
-            # Evaluate the model on the test set
-
-            # Load and prepare the data
-            df = pd.read_csv(args.data_path)
-            df = df[df['weighted_avg_720_hrs'] > 0]
-
-            # Convert 'Date_x' to datetime
-            df['Date_x'] = pd.to_datetime(df['Date_x'])
-
-            # Sort DataFrame by date
-            df = df.sort_values(by='Date_x')
-
-            # Group by symbol
-            grouped = df.groupby('Symbol_x', sort=False)
-
-            # Prepare the articles and prices
-            articles = []
-            prices = []
-
-            for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
-                current_symbol = row['Symbol_x']
-                current_date = row['Date_x']
-
-                # Get all articles for the current symbol before the current date
-                symbol_df = grouped.get_group(current_symbol)
-                previous_articles = symbol_df[symbol_df['Date_x'] < current_date]
-
-                # Get the last 10 previous articles
-                last_articles = previous_articles.tail(10)
-
-                # Build the concatenated text
-                concatenated_text = ''
-
-                # Add previous articles
-                for _, prev_row in last_articles.iterrows():
-                    concatenated_text += (
-                        "\nPrevious Article Date: " + str(prev_row['Date_x']) +
-                        "\nPrevious Article Content: " + str(prev_row['Article']) +
-                        "\nPrevious Article Title: " + str(prev_row['Title']) +
-                        "\nPrevious Article Type: " + str(prev_row['articleType']) +
-                        "\nPrevious Article Publication: " + str(prev_row['Publication']) +
-                        "\nPrevious Publication Author: " + str(prev_row['Author']) +
-                        "\n---\n"
-                    )
-
-                # Add the current article
-                concatenated_text += (
-                    "Symbol: " + str(row['Symbol_x']) +
-                    "\nSecurity: " + str(row['Date_x']) +
-                    "\nRelated Stocks/Topics: " + str(row['RelatedStocksList']) +
-                    "\nArticle Content: " + str(row['Article']) +
-                    "\nArticle Title: " + str(row['Title']) +
-                    "\nArticle Type: " + str(row['articleType']) +
-                    "\nArticle Publication: " + str(row['Publication']) +
-                    "\nPublication Author: " + str(row['Author']) +
-                    "\nStock Price 4 days before: " + str(row['weighted_avg_-96_hrs']) +
-                    "\nStock Price 2 days before: " + str(row['weighted_avg_-48_hrs']) +
-                    "\nStock Price 1 days before: " + str(row['weighted_avg_-24_hrs']) +
-                    "\nStock Price 0 days before: " + str(row['weighted_avg_0_hrs'])
-                )
-
-                # Append to lists
-                articles.append(concatenated_text)
-                prices.append(row['weighted_avg_720_hrs'])
-
-            # Split the data (we only need the test set here)
-            _, test_articles, _, test_prices = train_test_split(
-                articles, prices, test_size=0.15, random_state=42
-            )
-
-            # Create dataset and dataloader for testing
-            test_dataset = ArticlePriceDataset(test_articles, test_prices, tokenizer)
-            test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-            # Evaluate the model
-            from sklearn.metrics import mean_absolute_error, r2_score
-
+            # Evaluation on the test set
             predictions = []
             actuals = []
             with torch.no_grad():
                 for batch in test_dataloader:
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
-                    labels = batch['labels'].to(device)
-                    outputs, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+    
+                    # Forward pass with autocast
+                    with autocast():
+                        outputs, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+    
                     predictions.extend(outputs.cpu().numpy())
-                    actuals.extend(labels.cpu().numpy())
-
+                    actuals.extend(batch['labels'].cpu().numpy())
+    
             # Calculate metrics
             mae = mean_absolute_error(actuals, predictions)
             r2 = r2_score(actuals, predictions)
             print(f"Test MAE: {mae:.4f}, R2 Score: {r2:.4f}")
-
+    
         else:
             # Predict on a single input
             if not args.input_text:
                 raise ValueError("You must provide input text when mode is 'run' without --test")
-
-            # Since we need previous articles for the same symbol, we need to process input accordingly
-            # For a single input, we can't get previous articles unless provided, so we'll proceed with the input text
-
-            # Tokenize the input text
+    
             encoding = tokenizer(
                 args.input_text,
                 truncation=True,
@@ -247,13 +170,14 @@ def main():
                 max_length=block_size,
                 return_tensors='pt'
             ).to(device)
+    
             input_ids = encoding["input_ids"]
             attention_mask = encoding["attention_mask"]
-
-            # Make prediction
-            with torch.no_grad():
+    
+            # Inference with autocast
+            with torch.no_grad(), autocast():
                 prediction, _ = model(input_ids=input_ids, attention_mask=attention_mask)
-            print(f"Predicted Price: {prediction.item()}")
 
+        print(f"Predicted Price: {prediction.item()}")
 if __name__ == "__main__":
     main()
