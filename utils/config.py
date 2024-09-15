@@ -4,7 +4,7 @@ import torch
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 n_embed = 96        # Embedding dimension
-n_head = 48        # Number of attention heads
+n_head = 96        # Number of attention heads
 n_layer = 48         # Number of transformer blocks
 block_size = 1024     # Maximum sequence length
 dropout = 0.1        # Dropout rate
