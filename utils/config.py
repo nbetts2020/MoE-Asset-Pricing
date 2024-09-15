@@ -13,3 +13,5 @@ top_k = 2            # Number of experts to use per token
 learning_rate = 2e-5
 EPOCHS = 20
 BATCH_SIZE = 16
+
+# r2 score with this setup after one epoch: -0.17
