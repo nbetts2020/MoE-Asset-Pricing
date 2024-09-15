@@ -4,7 +4,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 def train_model(model, optimizer, epochs, device, dataloader):
     model.train()
-    scaler = GradScaler()  # Initialize GradScaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler()  # Initialize GradScaler for mixed precision
 
     for epoch in range(epochs):
         print(f"Start of Epoch {epoch}")
@@ -24,7 +24,7 @@ def train_model(model, optimizer, epochs, device, dataloader):
             labels = batch['labels'].to(device)
 
             # Forward pass with autocast for mixed precision
-            with autocast():
+            with torch.cuda.amp.autocast():
                 outputs, loss = model(input_ids=input_ids, targets=labels)
 
             # Scale the loss and backpropagate
