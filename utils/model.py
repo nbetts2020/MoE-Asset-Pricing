@@ -3,57 +3,48 @@ import torch.nn as nn
 from torch.nn import functional as F
 from utils.config import *
 from utils.data import *
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from torch.utils.checkpoint import checkpoint
+from flash_attn.flash_attn_interface import flash_attn_func
 
 cuda_available = (device == "cuda")
-# if cuda_available:
-#     from utils.flash_attn_triton import FlashAttnFunc
 
-class Head(nn.Module):
-    """ One head of self-attention """
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.head_size = head_size
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x) # Ensure k is float16
-        q = self.query(x) # Ensure q is float16
-        v = self.value(x) # Ensure v is float16
-        
-        wei = q @ k.transpose(-2, -1) * C**-0.5
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        out = wei @ v
-
-        return out
-
-# Multi-Headed Self Attention
+# Multi-Headed Self Attention with FlashAttention
 class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
+    """ Multi-head self-attention using FlashAttention """
 
-    def __init__(self, num_heads, head_size):
+    def __init__(self, n_head):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(dropout)
+        self.n_head = n_head
+        self.head_size = n_embed // n_head
+        assert n_embed % n_head == 0, "Embedding dimension must be divisible by number of heads"
+        self.qkv_proj = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.out_proj = nn.Linear(n_embed, n_embed, bias=False)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
+        B, T, C = x.size()  # x: (B, T, n_embed)
+        qkv = self.qkv_proj(x)  # (B, T, 3 * n_embed)
+        qkv = qkv.view(B, T, 3, self.n_head, self.head_size)  # (B, T, 3, n_head, head_size)
+        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, 3, n_head, T, head_size)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each is (B, n_head, T, head_size)
+
+        # Ensure inputs are in half-precision and contiguous
+        q = q.half().contiguous()
+        k = k.half().contiguous()
+        v = v.half().contiguous()
+
+        # Apply FlashAttention
+        attn_output = flash_attn_func(q, k, v, causal=True)  # (B, n_head, T, head_size)
+
+        # Reshape back to (B, T, n_embed)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
+
+        out = self.out_proj(attn_output)
         return out
 
-# Expert module
+# Expert module remains unchanged
 class Expert(nn.Module):
-    """ An MLP is a simple linear layer followed by a non-linearity i.e. each Expert """
+    """ An MLP is a simple linear layer followed by a non-linearity i.e., each Expert """
 
     def __init__(self, n_embed):
         super().__init__()
@@ -67,7 +58,7 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# Noisy top-k gating
+# Noisy top-k gating remains unchanged
 class NoisyTopkRouter(nn.Module):
     def __init__(self, n_embed, num_experts, top_k):
         super(NoisyTopkRouter, self).__init__()
@@ -86,6 +77,7 @@ class NoisyTopkRouter(nn.Module):
         router_output = F.softmax(sparse_logits, dim=-1)
         return router_output, indices
 
+# SparseMoE remains unchanged
 class SparseMoE(nn.Module):
     def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
         super(SparseMoE, self).__init__()
@@ -120,23 +112,23 @@ class SparseMoE(nn.Module):
         final_output += updates.view(batch_size, seq_len, -1)
         return final_output
 
+# Corrected Block class
 class Block(nn.Module):
-    """ Mixture of Experts Transformer block: communication followed by computation (multi-head self attention + SparseMoE) """
+    """ Transformer block with FlashAttention and SparseMoE """
 
     def __init__(self, n_embed, n_head, num_experts, top_k):
         super().__init__()
-        head_size = n_embed // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.smoe = SparseMoE(n_embed, num_experts, top_k)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
+        self.sa = MultiHeadAttention(n_head)
+        self.smoe = SparseMoE(n_embed, num_experts, top_k)
 
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.smoe(self.ln2(x))
         return x
 
-# Finally putting it all together to create a sparse mixture of experts language model
+# SparseMoELanguageModel with corrections
 class SparseMoELanguageModel(nn.Module):
     def __init__(self, tokenizer_name="gpt2", sparsity_config=None):
         super().__init__()
@@ -144,8 +136,8 @@ class SparseMoELanguageModel(nn.Module):
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(
-            *[Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)]
+        self.blocks = nn.ModuleList(
+            [Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         # Regression head
@@ -156,41 +148,36 @@ class SparseMoELanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
         pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
         x = tok_emb + pos_emb  # (B, T, n_embed)
-        
+
         # Apply gradient checkpointing to each block
         for block in self.blocks:
             x = checkpoint(block, x)
-        
+
         x = self.ln_f(x)       # (B, T, n_embed)
-        
+
         # Mean pooling over the sequence length
         x = x.mean(dim=1)      # (B, n_embed)
-        
+
         # Regression head
         output = self.regression_head(x)  # (B, 1)
         output = output.squeeze(-1)       # (B,)
-        
+
         if targets is not None:
             loss = F.mse_loss(output, targets)
         else:
             loss = None
-    
+
         return output, loss
 
+    # If your model is for regression, you might not need the generate method
+    # If you need it, ensure it aligns with your model's output
     def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
+        # Adjusted generate method (may need further modification)
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, -1, :]  # (B, C)
-            logits = logits / temperature
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
-
-            if stream:
-                decoded_text = self.tokenizer.decode(idx_next[0].tolist(), skip_special_tokens=True)
-                print(decoded_text, end='', flush=True)
+            output, _ = self(idx_cond)
+            # Since output is (B,), generating new tokens may not be applicable
+            # Placeholder for custom generation logic
+            pass
 
         return idx
-
-
