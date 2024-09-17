@@ -62,7 +62,7 @@ contextlib2==21.6.0
 contourpy==1.3.0
 cryptography==43.0.1
 cuda-python==12.2.1
-cudf-cu12 @ https://pypi.nvidia.com/cudf-cu12/cudf_cu12-24.4.1-cp310-cp310-manylinux_2_28_x86_64.whl#sha256=57366e7ef09dc63e0b389aff20df6c37d91e2790065861ee31a4720149f5b694
+cudf-cu12 @ https://pypi.nvidia.com/cudf-cu12/cudf_cu12-24.4.1-cp310-cp310-manylinux_2_28_x86_64.whl
 cufflinks==0.17.3
 cupy-cuda12x==12.2.0
 cvxopt==1.3.2
@@ -93,7 +93,7 @@ ecos==2.0.14
 editdistance==0.8.1
 eerepr==0.0.4
 einops==0.8.0
-en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl#sha256=86cc141f63942d4b2c5fcee06630fd6f904788d2f0ab005cce45aadb8fb73889
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 entrypoints==0.4
 et-xmlfile==1.1.0
 etils==1.9.4
@@ -153,12 +153,8 @@ google-cloud-pubsub==2.23.1
 google-cloud-resource-manager==1.12.5
 google-cloud-storage==2.8.0
 google-cloud-translate==3.15.5
-google-colab @ file:///colabtools/dist/google_colab-1.0.0.tar.gz#sha256=62765616b3a76e764d5c7a856ebe1b04f68174394af3aba7e719fb14948992e8
 google-crc32c==1.6.0
 google-generativeai==0.7.2
-google-pasta==0.2.0
-google-resumable-media==2.7.2
-googleapis-common-protos==1.65.0
 googledrivedownloader==0.4
 graphviz==0.20.3
 greenlet==3.1.0
@@ -179,7 +175,7 @@ httplib2==0.22.0
 huggingface-hub==0.24.7
 humanize==4.10.0
 hyperopt==0.2.7
-ibis-framework==8.0.0
+ibis-framework>=8.0.0
 idna==3.8
 imageio==2.34.2
 imageio-ffmpeg==0.5.1
@@ -206,7 +202,7 @@ ipytree==0.2.2
 ipywidgets==7.7.1
 itsdangerous==2.2.0
 jax==0.4.26
-jaxlib @ https://storage.googleapis.com/jax-releases/cuda12/jaxlib-0.4.26+cuda12.cudnn89-cp310-cp310-manylinux2014_x86_64.whl#sha256=813cf1fe3e7ca4dbf5327d6e7b4fc8521e92d8bba073ee645ae0d5d036a25750
+jaxlib @ https://storage.googleapis.com/jax-releases/cuda12/jaxlib-0.4.26+cuda12.cudnn89-cp310-cp310-manylinux2014_x86_64.whl
 jeepney==0.7.1
 jellyfish==1.1.0
 jieba==0.42.1
@@ -336,7 +332,7 @@ psycopg2==2.9.9
 ptyprocess==0.7.0
 py-cpuinfo==9.0.0
 py4j==0.10.9.7
-pyarrow==17.0.0
+pyarrow>=10.0.1,<=15.0.0
 pyarrow-hotfix==0.6
 pyasn1==0.6.1
 pyasn1_modules==0.4.1
@@ -461,10 +457,10 @@ toml==0.10.2
 tomli==2.0.1
 tomlkit==0.13.2
 toolz==0.12.1
-torch @ https://download.pytorch.org/whl/cu121_full/torch-2.4.0%2Bcu121-cp310-cp310-linux_x86_64.whl#sha256=6f3aabcec8b7728943d22bec2d8017b1bd2d69cd903eefb7dd3a373e4f779c40
-torchaudio @ https://download.pytorch.org/whl/cu121_full/torchaudio-2.4.0%2Bcu121-cp310-cp310-linux_x86_64.whl#sha256=8bc4c22a701f4567a15cc98ff48c392147583b9ec4157d147025f297bf305acc
+torch @ https://download.pytorch.org/whl/cu121_full/torch-2.4.0%2Bcu121-cp310-cp310-linux_x86_64.whl
+torchaudio @ https://download.pytorch.org/whl/cu121_full/torchaudio-2.4.0%2Bcu121-cp310-cp310-linux_x86_64.whl
 torchsummary==1.5.1
-torchvision @ https://download.pytorch.org/whl/cu121_full/torchvision-0.19.0%2Bcu121-cp310-cp310-linux_x86_64.whl#sha256=53c7ee4a98c8464ec964a6ab3804f5925b19bac698ef728f148bffebe27a9081
+torchvision @ https://download.pytorch.org/whl/cu121_full/torchvision-0.19.0%2Bcu121-cp310-cp310-linux_x86_64.whl
 tornado==6.3.3
 tqdm==4.66.5
 traitlets==5.7.1
