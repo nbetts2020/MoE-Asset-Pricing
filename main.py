@@ -17,7 +17,6 @@ def main():
     parser.add_argument('mode', choices=['train', 'run'], help="Mode: 'train' to train the model, 'run' to predict price")
     parser.add_argument('input_text', type=str, nargs='?', help="Input article text (required if mode is 'run' without --test)", default=None)
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
-    parser.add_argument('--data_path', type=str, default="/content/test_df.csv", help="Path to the dataset CSV file")
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
 
     args = parser.parse_args()
@@ -49,14 +48,8 @@ def main():
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
         # Load your dataframe with 'Article' and 'Price' columns
-        df = pd.read_csv(args.data_path)
+        df = get_data()
         df = df[df['weighted_avg_720_hrs'] > 0]
-
-        # Convert 'Date_x' to datetime
-        df['Date_x'] = pd.to_datetime(df['Date_x'])
-
-        # Sort DataFrame by date
-        df = df.sort_values(by='Date_x')
 
         # Group by symbol
         grouped = df.groupby('Symbol_x', sort=False)
