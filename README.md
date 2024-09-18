@@ -51,11 +51,11 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 - **Optimizer**: AdamW optimizer with a learning rate of $2 \times 10^{-5}$.
 
-- **Tokenizer:** GPT-2
-
 - **Batch Size**: 16 sequences per batch.
 
 - **Epochs**: Trained over 20 epochs.
+
+- **Tokenizer:** GPT-2
 
 - **Techniques Used**:
   - **Gradient Checkpointing**: Reduces memory usage by recomputing intermediate activations during the backward pass.
