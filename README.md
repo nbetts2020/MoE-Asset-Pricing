@@ -34,7 +34,11 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
      - **FlashAttention**: Efficient computation of attention mechanisms for long sequences.
      - **Attention Calculation**:
 
-       $\text{Attention}(Q, K, V) = \text{Softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V$
+         $ \text{Noisy Logits} = W_r x + \epsilon \odot \sigma(W_n x) $
+
+         $ \text{Top-}k = \text{Indices of top } k \text{ elements in Noisy Logits} $
+
+         $ \text{Router Output} = \text{Softmax}(\text{Sparse\_Logits}) $
 
    - **Layer Normalization**: Applied before attention and MoE layers to stabilize training.
 
@@ -54,7 +58,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
    - **Residual Connections**: Each sub-layer includes a residual path to facilitate gradient flow.
 
-3. **Output Layers**:
+2. **Output Layers**:
    - **Layer Normalization**: Final normalization before regression.
    - **Mean Pooling**: Averages the sequence embeddings to obtain a fixed-size vector.
    - **Regression Head**: A linear layer that outputs the predicted stock price as a continuous scalar value:
