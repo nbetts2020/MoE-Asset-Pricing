@@ -55,6 +55,10 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 - **Epochs**: Trained over 20 epochs.
 
+- **# of Experts:** 8
+
+- **# of Active Experts per Token:** 2
+
 - **Tokenizer:** GPT-2
 
 - **Techniques Used**:
