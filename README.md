@@ -44,13 +44,11 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
        - Routes tokens to the top $k = 2$ experts based on a gating mechanism.
        - **Routing Mechanism**:
 
-         $
-         \begin{align*}
+         $\begin{align*}
          \text{Noisy Logits} & = W_r x + \epsilon \odot \sigma(W_n x) \\
          \text{Top-}k & = \text{Indices of top } k \text{ elements in Noisy Logits} \\
          \text{Router Output} & = \text{Softmax}(\text{Sparse\_Logits})
-         \end{align*}
-         $
+         \end{align*}$
 
        - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
 
@@ -65,17 +63,13 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
    - **Mean Pooling**: Averages the sequence embeddings to obtain a fixed-size vector.
    - **Regression Head**: A linear layer that outputs the predicted stock price as a continuous scalar value:
 
-     $
-     \text{Predicted Price} = W_{\text{reg}} x_{\text{pooled}} + b_{\text{reg}}
-     $
+     $\text{Predicted Price} = W_{\text{reg}} x_{\text{pooled}} + b_{\text{reg}}$
 
 ### Training Details
 
 - **Loss Function**: Mean Squared Error (MSE) between the predicted and actual stock prices.
 
-  $
-  \text{Loss} = \frac{1}{N} \sum_{i=1}^{N} (\hat{y}_i - y_i)^2
-  $
+  $\text{Loss} = \frac{1}{N} \sum_{i=1}^{N} (\hat{y}_i - y_i)^2$
 
 - **Optimizer**: AdamW optimizer with a learning rate of $2 \times 10^{-5}$.
 
