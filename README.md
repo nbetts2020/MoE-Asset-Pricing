@@ -25,7 +25,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 ### Model Components
 
 1. **Embedding Layers**:
-   - **Token Embedding**: Converts input tokens into embeddings of dimension \( n_{\text{embed}} = 192 \).
+   - **Token Embedding**: Converts input tokens into embeddings of dimension $n_{\text{embed}} = 192$.
    - **Positional Embedding**: Adds positional information to token embeddings to maintain the sequence order.
 
 2. **Transformer Blocks** (Total of 96 layers):
