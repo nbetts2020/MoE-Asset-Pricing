@@ -12,9 +12,9 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
 **16k Context Window**: A relatively large context window was chosen to ensure the model has access to as much relevant information as possible. For a given input, the current article, along with its metadata (title, publication, author, etc.), are included in the context. Additionally, the previous 10 articles related to the stock are provided. Building on this further, stock prices from 96 hours, 48 hours, and 24 hours prior to the article's release, as well as the price at the time of the article's release, are included. This comprehensive data allows the model to consider both historical articles and market trends when making predictions.
 
-**FlashAttention 2**: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
-
 **Custom Training Pipeline:** Optimized for training on NVIDIA A100 GPUs, employing techniques like mixed precision and gradient checkpointing for efficient resource utilization.
+
+**FlashAttention 2**: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
 ## Model Architecture
 
@@ -34,9 +34,9 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
      - **FlashAttention**: Efficient computation of attention mechanisms for long sequences.
      - **Attention Calculation**:
 
-       \[
+       $
        \text{Attention}(Q, K, V) = \text{Softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V
-       \]
+       $
 
    - **Layer Normalization**: Applied before attention and MoE layers to stabilize training.
 
@@ -46,13 +46,13 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
        - Routes tokens to the top $k = 2$ experts based on a gating mechanism.
        - **Routing Mechanism**:
 
-         \[
+         $
          \begin{align*}
          \text{Noisy Logits} & = W_r x + \epsilon \odot \sigma(W_n x) \\
          \text{Top-}k & = \text{Indices of top } k \text{ elements in Noisy Logits} \\
          \text{Router Output} & = \text{Softmax}(\text{Sparse\_Logits})
          \end{align*}
-         \]
+         $
 
        - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
 
@@ -67,17 +67,17 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
    - **Mean Pooling**: Averages the sequence embeddings to obtain a fixed-size vector.
    - **Regression Head**: A linear layer that outputs the predicted stock price as a continuous scalar value:
 
-     \[
+     $
      \text{Predicted Price} = W_{\text{reg}} x_{\text{pooled}} + b_{\text{reg}}
-     \]
+     $
 
 ### Training Details
 
 - **Loss Function**: Mean Squared Error (MSE) between the predicted and actual stock prices.
 
-  \[
+  $
   \text{Loss} = \frac{1}{N} \sum_{i=1}^{N} (\hat{y}_i - y_i)^2
-  \]
+  $
 
 - **Optimizer**: AdamW optimizer with a learning rate of $2 \times 10^{-5}$.
 
