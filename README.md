@@ -48,7 +48,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
          $\text{Top-}k = \text{Indices of top } k \text{ elements in Noisy Logits}$
          
-         $\text{Router Output} = \text{Softmax}(\text{Sparse}_Logits)$
+         $\text{Router Output} = \text{Softmax}(\text{Sparse}_{Logits})$
 
        - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
 
