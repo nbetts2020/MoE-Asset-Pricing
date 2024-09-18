@@ -4,7 +4,27 @@ Traditional models for asset pricing, such as the Capital Asset Pricing Model (C
 
 Recent research, such as [Deep Learning for Asset Pricing by Chen et al. (2023)](https://arxiv.org/abs/1904.00745) and [Structural Deep Learning in Conditional Asset Pricing by Fan et al. (2022)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4117882), demonstrates the effectiveness of deep learning in handling the non-linearities and time-varying dynamics of asset prices. These approaches leverage advanced techniques like feed-forward networks, LSTMs, and GANs to incorporate a wide range of economic and firm-specific factors, providing a more flexible and data-driven method for predicting future prices and risk premiums.
 
-Building upon an abundance of research in Large Language Models (LLMs) and Mixture-of-Experts (MoE) architectures, this project introduces a transformer-based SparseMoE Language Model tailored for asset price prediction, wherein the model's final fully connected (dense) layer consists of one output unit (where the output is a singular continuous scalar value), as opposed to a probability distribution. Drawing from extensive textual data related to a stock in the form of articles, news reports, and financial statements, the model predicts the stock price 1 month out.
+Building upon an abundance of research in Large Language Models (LLMs) and Mixture-of-Experts (MoE) architectures, this project introduces a transformer-based SparseMoE Language Model tailored for asset price prediction for small cap stocks, wherein the model's final fully connected (dense) layer consists of one output unit (where the output is a singular continuous scalar value), as opposed to a probability distribution. Drawing from extensive textual data related to a stock in the form of articles, news reports, and financial statements, the model predicts the stock price 1 month out.
+
+## Data
+
+The data for this model draws from [SC454k](https://huggingface.co/datasets/nbettencourt/SC454k), a dataset of roughly 454k news articles and press releases related to small cap stocks from nasdaq.com, soon to be paired with market data. 
+
+**Schema**
+
+- **Symbol**: the ticker symbol of respective stock (e.g., AAPL)
+- **Security**: the full name of stock associated with the ticker symbol (e.g., Apple Inc.)
+- **URL**: URL associated with the 'Article' column
+- **Date**: the date the 'Article' was published, in the format of MMM DD, YYYY HH:MM AM/PM ET (e.g., Aug 06, 2024 12:11 PM ET)
+- **RelatedStocksList**: stocks/topics that are related or appear in the 'Article' (excluding the respective stock mentioned in the 'Symbol' column). Delineated by '|'s (e.g., Markets|INTC|UNH|DOW)
+- **Article**: text of the news article or press release. Any specially formatted text (bold text, tables, etc.) are treated in a pseudo-LaTeX format. For example, bold text are surrounded by '**'s and tables are wrapped in \begin{table}{...}\end{table}
+- **Title**: title of the news article or press release
+- **articleType**: value denoting the type of 'Article', either 'News' or 'Press Release'
+- **Publication**: source responsible for publishing the 'Article' (e.g., The Motley Fool)
+- **Author**: person or entity responsible for publishing the 'Article'. May appear as an entity similar to the 'Publication' (e.g., Publication: Zacks, Author: Zacks Equity Research) or as individual person (e.g., Publication: Validea, Author: John Reese)
+**Scraping**
+
+Scraping this dataset was conducted across 10 EC2 t2.large instances across two parts: scraping links, then the content of these links. Puppeteer, a headless Chrome browser in JavaScript, was used for lightweight, quick scraping. Data was subsequently cleaned with a combination of PySpark and NumPy.
 
 ## Key Features
 
@@ -22,50 +42,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
 **Active Parameters**: Approximately **84 million parameters** are active during a forward pass. This includes the shared parameters and the parameters from the experts that are selected by the routing mechanism.
 
-### Model Components
-
-1. **Embedding Layers**:
-   - **Token Embedding**: Converts input tokens into embeddings of dimension $n_{\text{embed}} = 192$.
-   - **Positional Embedding**: Adds positional information to token embeddings to maintain the sequence order.
-
-2. **Transformer Blocks** (Total of 96 layers):
-   - **Multi-Head FlashAttention**:
-     - **Heads**: $n_{\text{head}} = 12$ attention heads.
-     - **FlashAttention**: Efficient computation of attention mechanisms for long sequences.
-     - **Attention Calculation**:
-
-        $\text{Attention}(Q, K, V) = \text{Softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V$
-
-   - **Layer Normalization**: Applied before attention and MoE layers to stabilize training.
-
-   - **Sparse Mixture-of-Experts (MoE) Layer**:
-     - **Experts**: 8 experts in total, each a feed-forward network (MLP) with two linear layers and ReLU activation.
-     - **Noisy Top-$k$ Routing**:
-       - Routes tokens to the top $k = 2$ experts based on a gating mechanism.
-       - **Routing Mechanism**:
-    
-         $\text{Noisy Logits} = W_r x + \epsilon \odot \sigma(W_n x)$
-
-         $\text{Top-}k = \text{Indices of top } k \text{ elements in Noisy Logits}$
-         
-         $\text{Router Output} = \text{Softmax}(\text{Sparse}_{Logits})$
-
-       - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
-
-     - **Expert Processing**:
-       - Each selected expert processes its assigned tokens independently.
-       - Outputs are combined and passed on to the next layer.
-
-   - **Residual Connections**: Each sub-layer includes a residual path to facilitate gradient flow.
-
-2. **Output Layers**:
-   - **Layer Normalization**: Final normalization before regression.
-   - **Mean Pooling**: Averages the sequence embeddings to obtain a fixed-size vector.
-   - **Regression Head**: A linear layer that outputs the predicted stock price as a continuous scalar value:
-
-     $\text{Predicted Price} = W_{\text{reg}} x_{\text{pooled}} + b_{\text{reg}}$
-
-### Training Details
+## Training Details
 
 - **Loss Function**: Mean Squared Error (MSE) between the predicted and actual stock prices.
 
@@ -82,6 +59,10 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
   - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
   - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
 
----
+ As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
 
-This model architecture leverages advanced neural network components to capture complex dependencies between textual data and future stock prices. By integrating a high-capacity SparseMoE transformer with efficient attention mechanisms, the model effectively processes and learns from vast amounts of unstructured text, enabling more accurate and insightful financial forecasting.
+ ## Coming Soon
+
+ - **SC454k:** Full implementation of SC454k, complete with market data, comprising of 18 data points across 10 unique days timed around the release of the article. Running across 41 (yes, 41) m7g.medium instances currently, stay tuned!
+ - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as wel
+ - **Layer-wise Learning Rate Decay**: Attempting to squeeze out the most performance gains in this relatively-small model
