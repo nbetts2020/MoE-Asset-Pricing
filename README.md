@@ -34,11 +34,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
      - **FlashAttention**: Efficient computation of attention mechanisms for long sequences.
      - **Attention Calculation**:
 
-         $ \text{Noisy Logits} = W_r x + \epsilon \odot \sigma(W_n x) $
-
-         $ \text{Top-}k = \text{Indices of top } k \text{ elements in Noisy Logits} $
-
-         $ \text{Router Output} = \text{Softmax}(\text{Sparse\_Logits}) $
+        $\text{Attention}(Q, K, V) = \text{Softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V$
 
    - **Layer Normalization**: Applied before attention and MoE layers to stabilize training.
 
@@ -48,8 +44,12 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
        - Routes tokens to the top $k = 2$ experts based on a gating mechanism.
        - **Routing Mechanism**:
     
-         Noisy Logits = W_r * x + ε ⊙ σ(W_n * x), Top-k = Indices of top k elements in Noisy Logits, Router Output = Softmax(Sparse_Logits)
-     
+         $\text{Noisy Logits} = W_r x + \epsilon \odot \sigma(W_n x)$
+
+         $\text{Top-}k = \text{Indices of top } k \text{ elements in Noisy Logits}$
+         
+         $\text{Router Output} = \text{Softmax}(\text{Sparse\_Logits})$
+
        - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
 
      - **Expert Processing**:
