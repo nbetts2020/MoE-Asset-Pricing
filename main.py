@@ -5,7 +5,7 @@ import pandas as pd
 from transformers import AutoTokenizer
 from utils.model import SparseMoELanguageModel
 from utils.train import train_model
-from utils.utils import kaiming_init_weights
+from utils.utils import kaiming_init_weights, get_data
 from utils.config import *
 from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset
