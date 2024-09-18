@@ -8,7 +8,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
 ## Data
 
-The data for this model draws from [SC454k](https://huggingface.co/datasets/nbettencourt/SC454k), a dataset of roughly 454k news articles and press releases related to small cap stocks from nasdaq.com, soon to be paired with market data.  The schema of the data looks something like this:
+The data for this model draws from [SC454k](https://huggingface.co/datasets/nbettencourt/SC454k), a dataset of roughly 454k news articles and press releases related to small cap stocks from nasdaq.com, soon to be paired with market data. The schema of the data looks something like this:
 
 - **Symbol**: the ticker symbol of respective stock (e.g., AAPL)
 - **Security**: the full name of stock associated with the ticker symbol (e.g., Apple Inc.)
@@ -24,6 +24,8 @@ The data for this model draws from [SC454k](https://huggingface.co/datasets/nbet
 **Scraping/Pairing Market Data**
 
 Scraping this dataset was conducted across 10 EC2 t2.large instances across two parts: scraping links, then the content of these links. Puppeteer, a headless Chrome browser in JavaScript, was used for lightweight, quick scraping. Data was subsequently cleaned with a combination of PySpark and NumPy. Pairing this with market data was made available through Wharton Research Data Services and their extensive collection of financial datasets. One collection of these datasets is the Trade and Quote Millisecond dataset (TAQ/MSEC), consisting of millisecond level access to the tick-by-tick trade and quote data of all activity within the U.S. National Market System. The process of pairing this pricing data with the timestamped news article/press release data through their API was magnitudes more tricky than meets the eye. The issue comes down to one thing: latency. The granularity of the API call can only be day-level, meaning a simple call to get the pricing data for say Apr. 3, 2020 will return around 10-15 thousand records of data, and because multiple prices are being retrieved for each news article/press release (I'm grabbing the price of the stock 4 days before, 2 days before, all the way to 30 days after with more granularity in between, totaling 18 different prices across 10 unique days), this is a large amount of data to pair, even with highly-optimized C++ code. Thus, the pairing algorithm went through a number of iterations to optimize efficiency such as promoting a more indexed-based approach to finding dates, a stringent approach to clearing out unused memory, and customized bash scripts for easy deployment of multiple EC2 instances. Ultimately, totaling around 1200 hours of compute across 41 (yes, 41) m7g,medium instances.
+
+Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial News Dataset in Time Series](https://arxiv.org/abs/2402.06698).
 
 ## Key Features
 
@@ -59,6 +61,8 @@ Scraping this dataset was conducted across 10 EC2 t2.large instances across two 
   - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
 
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
+
+ Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - taken from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
 
  ## Coming Soon
 
