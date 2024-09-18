@@ -30,7 +30,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
 2. **Transformer Blocks** (Total of 96 layers):
    - **Multi-Head FlashAttention**:
-     - **Heads**: \( n_{\text{head}} = 12 \) attention heads.
+     - **Heads**: $n_{\text{head}} = 12$ attention heads.
      - **FlashAttention**: Efficient computation of attention mechanisms for long sequences.
      - **Attention Calculation**:
 
@@ -42,8 +42,8 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
 
    - **Sparse Mixture-of-Experts (MoE) Layer**:
      - **Experts**: 8 experts in total, each a feed-forward network (MLP) with two linear layers and ReLU activation.
-     - **Noisy Top-\( k \) Routing**:
-       - Routes tokens to the top \( k = 2 \) experts based on a gating mechanism.
+     - **Noisy Top-$k$ Routing**:
+       - Routes tokens to the top $k = 2$ experts based on a gating mechanism.
        - **Routing Mechanism**:
 
          \[
@@ -54,7 +54,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
          \end{align*}
          \]
 
-       - \( W_r \) and \( W_n \) are learnable parameters, \( \epsilon \) is Gaussian noise, and \( \sigma \) is the softplus activation.
+       - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
 
      - **Expert Processing**:
        - Each selected expert processes its assigned tokens independently.
@@ -79,7 +79,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
   \text{Loss} = \frac{1}{N} \sum_{i=1}^{N} (\hat{y}_i - y_i)^2
   \]
 
-- **Optimizer**: AdamW optimizer with a learning rate of \( 2 \times 10^{-5} \).
+- **Optimizer**: AdamW optimizer with a learning rate of $2 \times 10^{-5}$.
 
 - **Batch Size**: 16 sequences per batch.
 
