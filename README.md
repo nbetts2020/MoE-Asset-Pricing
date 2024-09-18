@@ -34,9 +34,7 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
      - **FlashAttention**: Efficient computation of attention mechanisms for long sequences.
      - **Attention Calculation**:
 
-       $
-       \text{Attention}(Q, K, V) = \text{Softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V
-       $
+       $\text{Attention}(Q, K, V) = \text{Softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V$
 
    - **Layer Normalization**: Applied before attention and MoE layers to stabilize training.
 
