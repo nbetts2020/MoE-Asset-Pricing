@@ -63,5 +63,5 @@ Scraping this dataset was conducted across 10 EC2 t2.large instances across two 
  ## Coming Soon
 
  - **SC454k:** Full implementation of SC454k, complete with market data, comprising of 18 data points across 10 unique days timed around the release of the article. Running across 41 m7g.medium instances currently, stay tuned!
- - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as wel
- - **Layer-wise Learning Rate Decay**: Attempting to squeeze out the most performance gains in this relatively-small model
+ - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as well.
+ - **Layer-wise Learning Rate Decay**: Applying progressively smaller learning rates to earlier layers and higher rates to later layers in attempting to squeeze out the most performance gains in this relatively-small model.
