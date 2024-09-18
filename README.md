@@ -44,7 +44,11 @@ Building upon an abundance of research in Large Language Models (LLMs) and Mixtu
        - Routes tokens to the top $k = 2$ experts based on a gating mechanism.
        - **Routing Mechanism**:
 
-         $\begin{align*}\text{Noisy Logits} & = W_r x + \epsilon \odot \sigma(W_n x) \\\text{Top-}k & = \text{Indices of top } k \text{ elements in Noisy Logits} \\\text{Router Output} & = \text{Softmax}(\text{Sparse\_Logits})\end{align*}$
+         $$
+         \text{Noisy Logits} = W_r x + \epsilon \odot \sigma(W_n x) \\
+         \text{Top-}k = \text{Indices of top } k \text{ elements in Noisy Logits} \\
+         \text{Router Output} = \text{Softmax}(\text{Sparse\_Logits})
+         $$
 
        - $W_r$ and $W_n$ are learnable parameters, $\epsilon$ is Gaussian noise, and $\sigma$ is the softplus activation.
 
