@@ -65,6 +65,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
   - **Gradient Checkpointing**: Reduces memory usage by recomputing intermediate activations during the backward pass.
   - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
   - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
+  - **Layer-wise Learning Rate Decay (LLRD)**: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
 
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
 
@@ -74,4 +75,3 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
  - **SC454k:** Full implementation of SC454k, complete with market data, comprising of 18 data points across 10 unique days timed around the release of the article. Running across 41 m7g.medium instances currently, stay tuned!
  - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as well.
- - **Layer-wise Learning Rate Decay**: Applying progressively smaller learning rates to earlier layers and higher rates to later layers in attempting to squeeze out the most performance gains in this relatively-small model.
