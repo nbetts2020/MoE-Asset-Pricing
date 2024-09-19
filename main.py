@@ -44,8 +44,32 @@ def main():
 
         model = model.to(device)
         print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
+        base_lr = learning_rate   # From config.py
+        lr_decay = LR_DECAY       # From config.py
+        num_layers = len(model.blocks)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        # Collect parameters for each layer
+        param_groups = []
+
+        # Embedding layers (assign lowest learning rate)
+        embedding_params = list(model.token_embedding_table.parameters()) + list(model.position_embedding_table.parameters())
+        param_groups.append({
+            'params': embedding_params,
+            'lr': base_lr * (lr_decay ** (num_layers + 1))
+        })
+
+        # Transformer blocks (decay learning rate per layer)
+        for i, block in enumerate(model.blocks):
+            # Deeper layers have higher indices
+            layer_lr = base_lr * (lr_decay ** (num_layers - i))
+            block_params = block.parameters()
+            param_groups.append({'params': block_params, 'lr': layer_lr})
+
+        # Regression head (assign base learning rate)
+        regression_params = model.regression_head.parameters()
+        param_groups.append({'params': regression_params, 'lr': base_lr})
+
+        optimizer = torch.optim.AdamW(param_groups)
 
         # Load your dataframe with 'Article' and 'Price' columns
         df = get_data()
