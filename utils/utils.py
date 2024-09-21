@@ -29,15 +29,6 @@ def get_data():
 def process_data(df, tokenizer_name="gpt2"):
     """
     Preprocess the data for article-based price prediction.
-
-    Args:
-        df (pandas.DataFrame): DataFrame containing article and price data.
-        tokenizer_name (str): Name of the tokenizer (default "gpt2").
-        block_size (int): Maximum token length for each article (default 512).
-
-    Returns:
-        articles (list of torch.Tensor): List of tokenized concatenated articles.
-        prices (list of float): List of corresponding stock prices.
     """
     # Initialize the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -106,12 +97,39 @@ def process_data(df, tokenizer_name="gpt2"):
 
     return articles, prices
 
+def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE):
+    """
+    Prepare DataLoader for a given DataFrame and tokenizer.
+    """
+    articles, prices = process_data(df)
+    dataset = ArticlePriceDataset(articles, prices, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return dataloader
+
+def load_model_weights(model, filepath, device):
+    """
+    Load model weights from the given file path.
+    """
+    model.load_state_dict(torch.load(filepath, map_location=device))
+    model = model.to(device)
+    print(f"Model loaded from {filepath}.")
+    return model
+
+def initialize_si(model, si_path, lambda_si):
+    """
+    Initialize Synaptic Intelligence (SI) and load its state if it exists.
+    """
+    si = SynapticIntelligence(model, lambda_si=lambda_si)
+    if os.path.exists(si_path):
+        si.load_state(si_path)
+        print(f"SI state loaded from {si_path}.")
+    else:
+        print("No existing SI state found. Starting fresh.")
+    return si
+
 def prepare_tasks():
     """
     Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting.
-    
-    Returns:
-        tasks (list of DataLoader): A list of DataLoader objects representing different tasks.
     """
     df = get_data()  # Load your data
 
@@ -124,11 +142,7 @@ def prepare_tasks():
 
     # Create DataLoaders for each task
     for df_task in [df_task_1, df_task_2, df_task_3]:
-        articles, prices = process_data(df_task)  # Preprocess data
-        dataset = ArticlePriceDataset(articles, prices, tokenizer)
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+        dataloader = prepare_dataloader(df_task, tokenizer)
         tasks.append(dataloader)
 
     return tasks
-
-
