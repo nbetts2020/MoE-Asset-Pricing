@@ -1,3 +1,5 @@
+# main.py
+
 import torch
 import os
 import argparse
@@ -11,13 +13,16 @@ from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm  # For progress bar
+from utils.si import SynapticIntelligence  # Import the SI class
+from utils.test import test_forgetting
 
 def main():
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
-    parser.add_argument('mode', choices=['train', 'run'], help="Mode: 'train' to train the model, 'run' to predict price")
+    parser.add_argument('mode', choices=['train', 'run', 'test_forgetting'], help="Mode: 'train' to train the model, 'run' to predict price")
     parser.add_argument('input_text', type=str, nargs='?', help="Input article text (required if mode is 'run' without --test)", default=None)
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
+    parser.add_argument('--update', action='store_true', help="If specified in 'train' mode, update a pre-existing model with SI.")
 
     args = parser.parse_args()
 
@@ -36,7 +41,31 @@ def main():
     # Set pad token to eos token
     tokenizer.pad_token = tokenizer.eos_token
 
-    if args.mode == 'train':
+    if args.mode == 'test_forgetting':
+        # Initialize the model and tokenizer
+        model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name)
+        model = model.to(device)
+
+        # Load the model weights
+        model.load_state_dict(torch.load('model/model_weights.pth', map_location=device))
+        print("Pre-trained model loaded.")
+
+        # Prepare the tasks (create separate dataloaders for each task)
+        task_dataloaders = prepare_tasks()  # A helper function to prepare multiple task dataloaders
+
+        # Initialize SI if applicable
+        si = SynapticIntelligence(model, lambda_si=lambda_si) if args.update else None
+        if si and os.path.exists('model/si_state.pth'):
+            si.load_state('model/si_state.pth')
+            print("SI state loaded.")
+
+        # Run the catastrophic forgetting test
+        results = test_forgetting(model, task_dataloaders, optimizer, EPOCHS, device, si=si)
+
+        # Print or save the results
+        print(results)
+
+    elif args.mode == 'train':
         model.apply(kaiming_init_weights)
 
         if n_gpus > 1:
@@ -70,6 +99,31 @@ def main():
         param_groups.append({'params': regression_params, 'lr': base_lr})
 
         optimizer = torch.optim.AdamW(param_groups)
+
+        # Initialize SI if update is specified
+        if args.update:
+            # Ensure that a pre-trained model exists
+            model_path = 'model/model_weights.pth'
+            si_path = 'model/si_state.pth'
+            if not os.path.exists(model_path):
+                raise FileNotFoundError("Pre-trained model not found. Please train the model first before updating.")
+
+            # Load the pre-trained model
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print("Pre-trained model loaded.")
+
+            # Initialize SI
+            si = SynapticIntelligence(model, lambda_si=lambda_si)  # Define lambda_si in config.py or elsewhere
+
+            # Load SI state if exists
+            if os.path.exists(si_path):
+                si.load_state(si_path)
+                print("SI state loaded.")
+            else:
+                print("No existing SI state found. Starting fresh.")
+
+        else:
+            si = None  # SI is not used
 
         # Load your dataframe with 'Article' and 'Price' columns
         df = get_data()
@@ -137,13 +191,25 @@ def main():
         train_dataset = ArticlePriceDataset(train_articles, train_prices, tokenizer)
         train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
+        # Initialize SI if updating
+        if args.update:
+            # SI was already initialized above
+            pass
+        else:
+            si = None
+
         # Train the model
         print("Training Started!")
-        train_model(model, optimizer, EPOCHS, device, train_dataloader)
+        train_model(model, optimizer, EPOCHS, device, train_dataloader, si=si)
 
         # Save the model weights
         os.makedirs('model', exist_ok=True)
         torch.save(model.state_dict(), 'model/model_weights.pth')
+
+        # Save the SI state if SI is used
+        if args.update and si is not None:
+            si.save_state('model/si_state.pth')
+            print("SI state saved.")
 
     elif args.mode == 'run':
         # Load the model weights
