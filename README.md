@@ -83,10 +83,7 @@ Regularization of a model's parameters is one of the most commonly used strategi
 
 The L2 regularization term adds a quadratic penalty to the loss function, expressed as:
 
-$\mathcal{L}_{\text{total}} = $
-
-$\mathcal{L}_{\text{task}}$
-$+ \lambda \sum_{i} \theta_i^2$
+![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}=\mathcal{L}_{\text{task}}+\lambda\sum_{i}\theta_i^2)
 
 Where:
 - $\mathcal{L}_{\text{task}}$ is the original task-specific loss,
@@ -102,10 +99,6 @@ This regularization discourages large parameter values, ensuring the model maint
 **Memory Replay Buffers**: *Coming Soon*. Implementing replay buffers will allow the model to store and periodically revisit historical data samples during training. By replaying past information alongside new data, the model can maintain its performance on previously learned tasks while adapting to new information, thereby preserving valuable historical insights.
 
 **Fisher Information Regularization**: *Coming Soon*. This method involves computing the Fisher Information Matrix to estimate the importance of each parameter to previous tasks. By regularizing updates based on these importance scores, the model can prevent significant alterations to crucial parameters, ensuring stability and continuity in its knowledge base.
-
-**Continual Learning with Regularization**: *Coming Soon*. Incorporating L2 regularization on shared parameters will help stabilize essential weights during updates. This approach ensures that the foundational features learned by the model remain consistent, providing a solid base upon which new knowledge can be built without disrupting existing capabilities.
-
-
 
  ## Coming Soon
 
