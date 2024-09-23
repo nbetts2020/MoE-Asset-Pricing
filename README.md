@@ -104,7 +104,15 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-**Synaptic Intelligence**: Created a class to track parameter importance and adjusted the training loop to include SI loss. SI assigns an importance score to each model parameter based on its contribution to minimizing the loss during training. By dynamically protecting these critical parameters from significant updates, SI ensures that the model retains previously learned knowledge while seamlessly integrating new insights. This balance between stability and plasticity enhances the model's robustness and long-term predictive performance in fluctuating financial markets. 
+**Synaptic Intelligence**: Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
+
+$\Omega_i = \sum_{t=1}^{T} \frac{\partial \ell_t}{\partial \theta_i} \Delta \theta_i$
+
+The total loss, including SI regularization, is:
+
+$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} \Omega_i (\theta_i - \theta_i^{\text{old}})^2$
+
+Adapting to new data while preserving important past knowledge. Its namesake is inspired by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
 **Memory Replay Buffers**: *Coming Soon*. Implementing replay buffers will allow the model to store and periodically revisit historical data samples during training. By replaying past information alongside new data, the model can maintain its performance on previously learned tasks while adapting to new information, thereby preserving valuable historical insights.
 
