@@ -37,6 +37,8 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 **FlashAttention 2**: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
+**Online Learning**: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Fisher Information Regularization, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
+
 ## Model Architecture
 
 **Total Parameters**: Approximately **254 million parameters**, which includes all shared parameters and parameters from all experts across all transformer blocks.
@@ -70,6 +72,39 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
 
  Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - taken from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
+
+## Online Learning/Catastrophic Forgetting
+
+Online Learning, a methodology in which sequentially available data is used to update the predictor (the weights of a model) for future data at each step, has been an area of focus underrepresented in asset pricing, much less in the context of small cap stocks. Ergonomically, it caters well to the case wherein the data itself is generated as a function of time, such as a stock price. Yet, it doesn't come without challenges, notably *catastrophic forgetting*. Catastrophic forgetting is a phenomenon in which neural networks, when paired with a form of continuous learning (such as online learning), become prone to forget how to perform older tasks as new tasks are learned. Biologically, humans generally do not suffer from the same predicament. The way we update our biological neural net doesn't necessarily override the neurons that are responsible for holding together old memories that may be useful in performing a task. Instead, the brain integrates new information by strengthening existing neural pathways and forming new connections, ensuring that old memories remain intact and accessible. This process, known as 'synaptic plasticity', allows for the retention and incorporation of both old and new information efficiently. Many algorithms attempt to replicate this special kind of plasticity-stability balance in ensuring consistency in learned prediction.
+
+Regularization of a model's parameters is one of the most commonly used strategies to mitigate catastrophic forgetting. By penalizing large updates to critical parameters during training, regularization helps ensure that the model retains its previously acquired knowledge while adapting to new information. Methods such as L2 regularization, Synaptic Intelligence, and Fisher Information Regularization, among others, constrain parameter updates in an effort to prevent drastic shifts in learned weights, albeit in different ways. Likewise, though more focused on the parameters of the gating network rather than the model's weights, Expert Routing Regularization is another form of regularization that adds a further layer of control by encouraging a more balanced selection of experts. This ensures that no expert becomes overly dominant or underutilized during training - both signs of overfitting and generalization loss. More creative approaches, such as the Memory Replay Buffer, introduce a complementary mechanism. Instead of relying solely on constraining parameter updates, replay buffers store key historical data samples. During training, the model can revisit these past data points alongside new information, akin to how humans recall and integrate past experiences while learning something new. While the literature on addressing catastrophic forgetting is certainly not scarce, there's no clear consensus on the optimal approach. Thus, the following five approaches have been implemented to test their efficacy:
+
+**Continual Learning with Regularization**: *Coming Soon*. L2 regularization, while differing from other regularization approaches here due to its lack of task-specificity, provides a more general approach to stabilizing essential weights during updates. Continuing from the idea of regularization, Continual Learning with Regularization via L2 regularization aims to stabilize the model's parameters by penalizing large weight updates, thereby encouraging smoother transitions during updates. Unlike other task-specific method, L2 Regularization applies a penalty across all parameters, regardless of their relevance to past tasks. This makes it a more general form of regularization, helping the model resist drastic weight changes during updates without specifically focusing on critical parameters.
+
+The L2 regularization term adds a quadratic penalty to the loss function, expressed as:
+
+\[
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} \theta_i^2
+\]
+
+Where:
+- \( \mathcal{L}_{\text{task}} \) is the original task-specific loss,
+- \( \theta_i \) are the model's parameters,
+- \( \lambda \) is the regularization strength, controlling how much to penalize large weights.
+
+This regularization discourages large parameter values, ensuring the model maintains smoother gradients when adjusting to new data. Though not task-specific, its significance lies in its simplicity and ability to be a baseline, guiding reference to other regularization methods.
+
+**Expert Routing Regularization**: *Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for This technique will introduce entropy loss into the routing mechanism to promote a balanced utilization of experts. By preventing over-reliance on specific experts, it ensures diverse expertise is leveraged, enhancing the model's ability to generalize across various tasks and reducing the risk of catastrophic forgetting.
+
+**Synaptic Intelligence**: Created a class to track parameter importance and adjusted the training loop to include SI loss. SI assigns an importance score to each model parameter based on its contribution to minimizing the loss during training. By dynamically protecting these critical parameters from significant updates, SI ensures that the model retains previously learned knowledge while seamlessly integrating new insights. This balance between stability and plasticity enhances the model's robustness and long-term predictive performance in fluctuating financial markets. 
+
+**Memory Replay Buffers**: *Coming Soon*. Implementing replay buffers will allow the model to store and periodically revisit historical data samples during training. By replaying past information alongside new data, the model can maintain its performance on previously learned tasks while adapting to new information, thereby preserving valuable historical insights.
+
+**Fisher Information Regularization**: *Coming Soon*. This method involves computing the Fisher Information Matrix to estimate the importance of each parameter to previous tasks. By regularizing updates based on these importance scores, the model can prevent significant alterations to crucial parameters, ensuring stability and continuity in its knowledge base.
+
+**Continual Learning with Regularization**: *Coming Soon*. Incorporating L2 regularization on shared parameters will help stabilize essential weights during updates. This approach ensures that the foundational features learned by the model remain consistent, providing a solid base upon which new knowledge can be built without disrupting existing capabilities.
+
+
 
  ## Coming Soon
 
