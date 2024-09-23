@@ -114,7 +114,31 @@ The total loss, including SI regularization, is:
 
 Adapting to new data while preserving important past knowledge. Its namesake is inspired by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-**Fisher Information Regularization**: *Coming Soon*. This method involves computing the Fisher Information Matrix to estimate the importance of each parameter to previous tasks. By regularizing updates based on these importance scores, the model can prevent significant alterations to crucial parameters, ensuring stability and continuity in its knowledge base.
+**Fisher Information Regularization**: *Coming Soon*. Fisher Information Regularization estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. By penalizing updates to parameters with high Fisher Information, the model preserves critical knowledge from previous tasks.
+
+### **How it Works**:
+
+1. **Compute Fisher Information**:
+    - Calculate the Fisher Information $F_i$ for each parameter $\theta_i$:
+    
+    $F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]$
+    
+    - This measures how much the probability of the correct prediction changes with small variations in $\theta_i$.
+
+2. **Regularization Term**:
+    - Incorporate the Fisher Information into the loss function to penalize significant changes to important parameters:
+    
+    $\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} F_i (\theta_i - \theta_i^{\text{old}})^2$
+    
+    - Here, $\mathcal{L}_{\text{task}}$ is the original loss, $\lambda$ controls the strength of regularization, and $\theta_i^{\text{old}}$ represents the parameter values from previous tasks.
+
+3. **Parameter Update**:
+    - During training, parameters with higher $F_i$ values receive larger penalties for changes, discouraging significant updates and thus protecting essential knowledge.
+
+4. **Integration with Training Loop**:
+    - The Fisher Information regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that respect the importance of each parameter.
+
+The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
 
 **Memory Replay Buffers**: *Coming Soon*. Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences while learning something new.
 
