@@ -85,7 +85,9 @@ The L2 regularization term adds a quadratic penalty to the loss function, expres
 
 $\mathcal{L}_{\text{total}}$ 
 
-$\mathcal{L}_{\text{task}} + \lambda \sum_{i} \theta_i^2$
+$\mathcal{L}_{\text{task}}$
+
+$+ \lambda \sum_{i} \theta_i^2$
 
 Where:
 - $\mathcal{L}_{\text{task}}$ is the original task-specific loss,
