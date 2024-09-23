@@ -155,7 +155,7 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
 4. **Updating the Buffer**: The buffer has a fixed size. When new data is added, older data may be removed, typically using a FIFO strategy or a priority-based mechanism. This maintains a balance of both recent and older examples in the buffer.
 
 5. **Buffer Strategies**:
-   - **FIFO**: Oldest data is replaced when the buffer is full.
+   - **FIFO** (focus): Oldest data is replaced when the buffer is full.
    - **Reservoir Sampling**: Maintains a random selection of data.
    - **Prioritized Sampling**: Selects important past data based on a specific metric (e.g., importance to model performance).
 
