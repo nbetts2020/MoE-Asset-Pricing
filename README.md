@@ -114,11 +114,30 @@ The total loss, including SI regularization, is:
 
 Adapting to new data while preserving important past knowledge. Its namesake is inspired by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-**Memory Replay Buffers**: *Coming Soon*. Implementing replay buffers will allow the model to store and periodically revisit historical data samples during training. By replaying past information alongside new data, the model can maintain its performance on previously learned tasks while adapting to new information, thereby preserving valuable historical insights.
-
 **Fisher Information Regularization**: *Coming Soon*. This method involves computing the Fisher Information Matrix to estimate the importance of each parameter to previous tasks. By regularizing updates based on these importance scores, the model can prevent significant alterations to crucial parameters, ensuring stability and continuity in its knowledge base.
 
- ## Coming Soon
+**Memory Replay Buffers**: *Coming Soon*. Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences while learning something new.
+
+### **How it Works**:
+
+1. **New Data**: At each time step \$t$, new data $(x_t, y_t)$ is received and added to the buffer.
+   
+2. **Old Data**: The model retrieves a random batch of old data $(x_{\text{old}}, y_{\text{old}})$ from the buffer.
+
+3. **Training**: The model trains on both the new data $(x_t, y_t)$ and a sampled batch from the memory buffer $(x_{\text{old}}, y_{\text{old}})$, allowing the model to learn from new information while reinforcing its knowledge of past data.
+
+4. **Updating the Buffer**: The buffer has a fixed size. When new data is added, older data may be removed, typically using a FIFO strategy or a priority-based mechanism. This maintains a balance of both recent and older examples in the buffer.
+
+5. **Buffer Strategies**:
+   - **FIFO**: Oldest data is replaced when the buffer is full.
+   - **Reservoir Sampling**: Maintains a random selection of data.
+   - **Prioritized Sampling**: Selects important past data based on a specific metric (e.g., importance to model performance).
+
+6. **Synthetic Data Replay**: Another similar approach to mention involves generating synthetic examples instead of replaying real data. This is often beneficial in scenarios where storing all historical data is impractical, yet retaining performance on older tasks is essential. The model can generate past examples for training, mixing them with new data.
+
+Simply: By replaying old data or generating synthetic samples, the model is less likely to overwrite critical knowledge with new information.
+
+## Coming Soon
 
  - **SC454k:** Full implementation of SC454k, complete with market data, comprising of 18 data points across 10 unique days timed around the release of the article. Running across 41 m7g.medium instances currently, stay tuned!
  - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as well.
