@@ -83,7 +83,9 @@ Regularization of a model's parameters is one of the most commonly used strategi
 
 The L2 regularization term adds a quadratic penalty to the loss function, expressed as:
 
-$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}}$ 
+$\mathcal{L}_{\text{total}} = $
+
+$\mathcal{L}_{\text{task}}$ 
 
 $+ \lambda \sum_{i} \theta_i^2$
 
