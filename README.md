@@ -100,7 +100,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 3. **Entropy Regularization** (focus of this project): This method encourages diversity in expert selection by maximizing the entropy of the routing decisions. The idea is to increase the uncertainty in selecting experts, which leads to a more balanced and dynamic allocation of experts for different data points. The entropy loss is formulated as:
 
-  ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{entropy}}=-\sum_{i=1}^{K}p_i\log{p_i})
+    ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{entropy}}=-\sum_{i=1}^{K}p_i\log{p_i})
 
 where \$p_i$ is the probability of selecting expert $i$.
 
