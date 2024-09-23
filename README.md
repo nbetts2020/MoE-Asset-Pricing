@@ -83,14 +83,12 @@ Regularization of a model's parameters is one of the most commonly used strategi
 
 The L2 regularization term adds a quadratic penalty to the loss function, expressed as:
 
-\[
-\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} \theta_i^2
-\]
+$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} \theta_i^2$
 
 Where:
-- \( \mathcal{L}_{\text{task}} \) is the original task-specific loss,
-- \( \theta_i \) are the model's parameters,
-- \( \lambda \) is the regularization strength, controlling how much to penalize large weights.
+- $\mathcal{L}_{\text{task}}$ is the original task-specific loss,
+- $\theta_i$ are the model's parameters,
+- $\lambda$ is the regularization strength, controlling how much to penalize large weights.
 
 This regularization discourages large parameter values, ensuring the model maintains smoother gradients when adjusting to new data. Though not task-specific, its significance lies in its simplicity and ability to be a baseline, guiding reference to other regularization methods.
 
