@@ -110,7 +110,7 @@ $\Omega_i = \sum_{t=1}^{T} \frac{\partial \ell_t}{\partial \theta_i} \Delta \the
 
 The total loss, including SI regularization, is:
 
-$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} \Omega_i (\theta_i - \theta_i^{\text{old}})^2$
+![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}=\mathcal{L}_{\text{task}}+\lambda\sum_{i}\Omega_i(\theta_i-\theta_i^{\text{old}})^2)
 
 Adapting to new data while preserving important past knowledge. Its namesake is inspired by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
