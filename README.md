@@ -123,14 +123,14 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 1. **Compute Fisher Information**:
     - Calculate the Fisher Information $F_i$ for each parameter $\theta_i$:
     
-    $F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]$
+      $F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]$
     
     - This measures how much the probability of the correct prediction changes with small variations in $\theta_i$.
 
 2. **Regularization Term**:
     - Incorporate the Fisher Information into the loss function to penalize significant changes to important parameters:
     
-    ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}=\mathcal{L}_{\text{task}}+\lambda\sum_{i}F_i(\theta_i-\theta_i^{\text{old}})^2)
+      ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}=\mathcal{L}_{\text{task}}+\lambda\sum_{i}F_i(\theta_i-\theta_i^{\text{old}})^2)
     
     - Here, $\mathcal{L}_{\text{task}}$ is the original loss, $\lambda$ controls the strength of regularization, and $\theta_i^{\text{old}}$ represents the parameter values from previous tasks.
 
