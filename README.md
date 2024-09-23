@@ -130,7 +130,7 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 2. **Regularization Term**:
     - Incorporate the Fisher Information into the loss function to penalize significant changes to important parameters:
     
-    $\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda \sum_{i} F_i (\theta_i - \theta_i^{\text{old}})^2$
+    ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}=\mathcal{L}_{\text{task}}+\lambda\sum_{i}F_i(\theta_i-\theta_i^{\text{old}})^2)
     
     - Here, $\mathcal{L}_{\text{task}}$ is the original loss, $\lambda$ controls the strength of regularization, and $\theta_i^{\text{old}}$ represents the parameter values from previous tasks.
 
