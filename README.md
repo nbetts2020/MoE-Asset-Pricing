@@ -133,7 +133,7 @@ Adapting to new data while preserving important past knowledge. Its namesake is 
    - **Reservoir Sampling**: Maintains a random selection of data.
    - **Prioritized Sampling**: Selects important past data based on a specific metric (e.g., importance to model performance).
 
-6. **Synthetic Data Replay** (Optional; not the focus of this project): Another similar approach to mention involves generating synthetic examples instead of replaying real data. This is often beneficial in scenarios where storing all historical data is impractical, yet retaining performance on older tasks is essential. The model can generate past examples for training, mixing them with new data.
+6. **Synthetic Data Replay** (Optional; not the focus of this project): Another similar approach to mention involves generating synthetic examples instead of replaying real data. This is often beneficial in scenarios where storing all historical data is impractical, yet retaining performance on older tasks is essential.
 
 Simply: By replaying old data or generating synthetic samples, the model is less likely to overwrite critical knowledge with new information.
 
