@@ -92,7 +92,17 @@ Where:
 
 This regularization discourages large parameter values, ensuring the model maintains smoother gradients when adjusting to new data. Though not task-specific, its significance lies in its simplicity and ability to be a baseline, guiding reference to other regularization methods.
 
-**Expert Routing Regularization**: *Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for This technique will introduce entropy loss into the routing mechanism to promote a balanced utilization of experts. By preventing over-reliance on specific experts, it ensures diverse expertise is leveraged, enhancing the model's ability to generalize across various tasks and reducing the risk of catastrophic forgetting.
+**Expert Routing Regularization**: *Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting balanced load across experts, various approaches to regularizing the expert routing mechanism include:
+
+1. **Load Balancing Loss**: This method aims to evenly distribute data points across all experts by adding a penalty term that encourages a more uniform selection of experts.
+
+2. **Expert Dropout**: Similar to standard dropout, expert dropout randomly drops certain experts during training, which prevents over-reliance on any specific expert.
+
+3. **Entropy Regularization** (focus of this project): This method encourages diversity in expert selection by maximizing the entropy of the routing decisions. The idea is to increase the uncertainty in selecting experts, which leads to a more balanced and dynamic allocation of experts for different data points. The entropy loss is formulated as:
+
+$\mathcal{L}_{\text{entropy}} = -\sum_{i=1}^{K} p_i \log p_i$
+
+where \$p_i$ is the probability of selecting expert $i$.
 
 **Synaptic Intelligence**: Created a class to track parameter importance and adjusted the training loop to include SI loss. SI assigns an importance score to each model parameter based on its contribution to minimizing the loss during training. By dynamically protecting these critical parameters from significant updates, SI ensures that the model retains previously learned knowledge while seamlessly integrating new insights. This balance between stability and plasticity enhances the model's robustness and long-term predictive performance in fluctuating financial markets. 
 
