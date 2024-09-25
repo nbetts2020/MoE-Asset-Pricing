@@ -12,6 +12,8 @@ The data for this model draws from [SC454k](https://huggingface.co/datasets/nbet
 
 - **Symbol**: the ticker symbol of respective stock (e.g., AAPL)
 - **Security**: the full name of stock associated with the ticker symbol (e.g., Apple Inc.)
+- **Sector**: broader economic sector the stock belongs to, sourced from nasdaq.com (e.g., Technology)
+- **Industry**: more specific business segment within 'Sector', sourced from nasdaq.com (e.g., Computer Manufactoring)
 - **URL**: URL associated with the 'Article' column
 - **Date**: the date the 'Article' was published, in the format of MMM DD, YYYY HH:MM AM/PM ET (e.g., Aug 06, 2024 12:11 PM ET)
 - **RelatedStocksList**: stocks/topics that are related or appear in the 'Article' (excluding the respective stock mentioned in the 'Symbol' column). Delineated by '|'s (e.g., Markets|INTC|UNH|DOW)
