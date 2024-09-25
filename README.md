@@ -167,7 +167,7 @@ Simply: By replaying old data or generating synthetic samples, the model is less
 
 ### Catastrophic Forgetting Testing
 
-Assessing catastrophic forgetting involves systematically evaluating the model's ability to retain knowledge from previous tasks after incorporating new information. The testing suite is designed to simulate real-world scenarios in financial modeling, where new stock market data is continually incoming. In each test, the model is incrementally trained on new tasks and evaluated on its performance on previously learned tasks. The core evaluation metric for each task is the Mean Squared Error (MSE), but additional metrics such as R-squared are also considered to provide a broader view of performance.
+Assessing catastrophic forgetting involves systematically evaluating the model's ability to retain knowledge from previous tasks after incorporating new information. The testing suite is designed to simulate real-world scenarios in financial modeling, where new market data is continually available. In each test, the model is incrementally trained on new tasks and evaluated on its performance on previously learned tasks. The core evaluation metric for each task is the Mean Squared Error (MSE), but additional metrics such as R-squared are also considered to provide a broader view of performance.
 
 #### Testing Setup
 
