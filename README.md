@@ -175,7 +175,7 @@ Assessing catastrophic forgetting involves systematically evaluating the model's
 
     - In our case, let's say $k=3$ and our sectors are "Technology", "Finance", and "Utilities". The data from each sector is treated as a distinct task.
 
-**Training and Evaluation Process**:
+2. **Training and Evaluation Process**:
 
 For each Catastrophic Forgetting mitigation method (or combination of a them):
 
