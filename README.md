@@ -173,7 +173,7 @@ Assessing catastrophic forgetting involves systematically evaluating the model's
 
 1. **Task Definition**: A task represents a specific subset of the data, in this case split into $k$ sectors. Each task consists of training data and a corresponding test set - constituting an 85/15 split.
 
-- In our case, let's say $k=3$ and our sectors are "Technology", "Finance", and "Utilities". The data from each sector is treated as a distinct task.
+    - In our case, let's say $k=3$ and our sectors are "Technology", "Finance", and "Utilities". The data from each sector is treated as a distinct task.
 
 **Training and Evaluation Process**:
 
