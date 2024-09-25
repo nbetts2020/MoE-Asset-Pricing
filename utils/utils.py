@@ -127,22 +127,30 @@ def initialize_si(model, si_path, lambda_si):
         print("No existing SI state found. Starting fresh.")
     return si
 
-def prepare_tasks():
+def prepare_tasks(k=3):
     """
-    Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting.
+    Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
+    
+    Args:
+        k (int): Number of sectors to randomly select for the tasks.
+        
+    Returns:
+        tasks (list): List of DataLoaders for the selected sectors.
     """
     df = get_data()  # Load your data
-
-    # Split your data into different tasks (this is just an example)
-    df_task_1 = df[df['year'] < 2015]  # Task 1: Articles before 2015
-    df_task_2 = df[(df['year'] >= 2015) & (df['year'] < 2018)]  # Task 2: Articles from 2015-2017
-    df_task_3 = df[df['year'] >= 2018]  # Task 3: Articles from 2018 onwards
-
+    
+    # Get the unique sectors from the dataset
+    unique_sectors = df['Sector'].unique()
+    
+    # Randomly sample k sectors from the unique sectors
+    selected_sectors = np.random.choice(unique_sectors, size=k, replace=False)
+    
     tasks = []
 
-    # Create DataLoaders for each task
-    for df_task in [df_task_1, df_task_2, df_task_3]:
-        dataloader = prepare_dataloader(df_task, tokenizer)
+    # For each selected sector, create a DataLoader
+    for sector in selected_sectors:
+        df_task = df[df['Sector'] == sector]  # Filter data by the selected sector
+        dataloader = prepare_dataloader(df_task, tokenizer)  # Create DataLoader for each sector
         tasks.append(dataloader)
 
     return tasks
