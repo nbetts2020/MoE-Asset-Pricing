@@ -53,7 +53,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
   $\text{Loss} = \frac{1}{N} \sum_{i=1}^{N} (\hat{y}_i - y_i)^2$
 
-- **Optimizer**: AdamW optimizer with a learning rate of $2 \times 10^{-5}$.
+- **Optimizer**: AdamW optimizer with a base learning rate of $2 \times 10^{-5}$. Layer-wise learning rate decay is applied with a decay factor of $0.95$ per layer, starting from the deepest layers. The embedding layers and regression head use the base learning rate, while deeper layers have progressively smaller learning rates due to the decay.
 
 - **Batch Size**: 16 sequences per batch.
 
