@@ -198,7 +198,7 @@ Where:
 
 The loss for a task is recalculated after training on each subsequent task to detect any increases in error, which would indicate forgetting. This looped evaluation provides insight into how well the model retains knowledge from previous tasks after learning new ones.
 
-By summing losses across all tasks, we can track how the total error changes, which helps quantify the extent of catastrophic forgetting. The goal is to minimize the increase in the total loss across all previous tasks as new tasks are introduced.
+By summing losses across all tasks, how the total error changes can be tracked, which helps quantify the extent of catastrophic forgetting. The goal is to minimize the increase in the total loss across all previous tasks as new tasks are introduced.
 
 # Coming Soon
 
