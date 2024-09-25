@@ -188,7 +188,7 @@ This method incorporates a recursive approach to evaluating the model's ability 
 
 At step $t$, after training on task $T_t$, the model is evaluated on all tasks from $T_1$ to $T_t$, and the total loss function can be expressed as:
 
-$\mathcal{L}_{\text{total}}^{(t)} = \sum_{i=1}^{t} \mathcal{L}(\hat{y}_i^{(t)}, y_i)$
+![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}^{(t)}=\sum_{i=1}^{t}\mathcal{L}(\hat{y}_i^{(t)},y_i))
 
 Where:
 - $\mathcal{L}(\hat{y}_i^{(t)}, y_i)$ is the loss on task $i$ after training on task $T_t$,
