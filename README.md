@@ -177,12 +177,12 @@ Assessing catastrophic forgetting involves systematically evaluating the model's
 
 2. **Training and Evaluation Process**:
 
-For each Catastrophic Forgetting mitigation method (or combination of a them):
+    For each Catastrophic Forgetting mitigation method (or combination of a them):
 
-- The model is first trained on the Task 1 dataset (e.g., Technology sector).
-- After completing the training on Task 1, the model’s performance is evaluated on the Task 1 test set to establish a baseline.
-- The model is then updated with the Task 2 dataset (e.g., Finance sector), and its performance is evaluated again on both the Task 1 and Task 2 test sets to observe any degradation (or forgetting) in its performance on Task 1.
-- This process is repeated for Task 3 (e.g., Utilities sector), testing the model’s performance on all previously encountered tasks.
+        - The model is first trained on the Task 1 dataset (e.g., Technology sector).
+        - After completing the training on Task 1, the model’s performance is evaluated on the Task 1 test set to establish a baseline.
+        - The model is then updated with the Task 2 dataset (e.g., Finance sector), and its performance is evaluated again on both the Task 1 and Task 2 test sets to observe any degradation (or forgetting) in its performance on Task 1.
+        - This process is repeated for Task 3 (e.g., Utilities sector), testing the model’s performance on all previously encountered tasks.
 
 This method incorporates a recursive approach to evaluating the model's ability to maintain performance across previously learned tasks while being updated with new ones. At each training step, the model is updated with new data from a specific sector, and its performance is measured not only on the current task but also on all previously encountered tasks. This ensures that any degradation in performance (i.e., catastrophic forgetting) is tracked in real time across all sectors.
 
