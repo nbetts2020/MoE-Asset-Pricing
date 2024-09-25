@@ -165,7 +165,42 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
 
 Simply: By replaying old data or generating synthetic samples, the model is less likely to overwrite critical knowledge with new information.
 
-## Coming Soon
+### Catastrophic Forgetting Testing
+
+Assessing catastrophic forgetting involves systematically evaluating the model's ability to retain knowledge from previous tasks after incorporating new information. The testing suite is designed to simulate real-world scenarios in financial modeling, where new stock market data is continually incoming. In each test, the model is incrementally trained on new tasks and evaluated on its performance on previously learned tasks. The core evaluation metric for each task is the Mean Squared Error (MSE), but additional metrics such as R-squared are also considered to provide a broader view of performance.
+
+#### Testing Setup
+
+1. **Task Definition**: A task represents a specific subset of the data, in this case split into $k$ sectors. Each task consists of training data and a corresponding test set - constituting an 85/15 split.
+
+- In our case, let's say $k=3$ and our sectors are "Technology", "Finance", and "Utilities". The data from each sector is treated as a distinct task.
+
+**Training and Evaluation Process**:
+
+For each Catastrophic Forgetting mitigation method (or combination of a them):
+
+- The model is first trained on the Task 1 dataset (e.g., Technology sector).
+- After completing the training on Task 1, the model’s performance is evaluated on the Task 1 test set to establish a baseline.
+- The model is then updated with the Task 2 dataset (e.g., Finance sector), and its performance is evaluated again on both the Task 1 and Task 2 test sets to observe any degradation (or forgetting) in its performance on Task 1.
+- This process is repeated for Task 3 (e.g., Utilities sector), testing the model’s performance on all previously encountered tasks.
+
+This method incorporates a recursive approach to evaluating the model's ability to maintain performance across previously learned tasks while being updated with new ones. At each training step, the model is updated with new data from a specific sector, and its performance is measured not only on the current task but also on all previously encountered tasks. This ensures that any degradation in performance (i.e., catastrophic forgetting) is tracked in real time across all sectors.
+
+At step $t$, after training on task $T_t$, the model is evaluated on all tasks from $T_1$ to $T_t$, and the total loss function can be expressed as:
+
+$\mathcal{L}_{\text{total}}^{(t)} = \sum_{i=1}^{t} \mathcal{L}(\hat{y}_i^{(t)}, y_i)$
+
+Where:
+- $\mathcal{L}(\hat{y}_i^{(t)}, y_i)$ is the loss on task $i$ after training on task $T_t$,
+- $\hat{y}_i^{(t)}$ is the model’s prediction for task $i$ after being updated on task $T_t$,
+- $y_i$ is the true value for task $i$,
+- $t$ represents the current task being trained on.
+
+The loss for a task is recalculated after training on each subsequent task to detect any increases in error, which would indicate forgetting. This looped evaluation provides insight into how well the model retains knowledge from previous tasks after learning new ones.
+
+By summing losses across all tasks, we can track how the total error changes, which helps quantify the extent of catastrophic forgetting. The goal is to minimize the increase in the total loss across all previous tasks as new tasks are introduced.
+
+# Coming Soon
 
  - **SC454k:** Full implementation of SC454k, complete with market data, comprising of 18 data points across 10 unique days timed around the release of the article. Running across 41 m7g.medium instances currently, stay tuned!
  - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as well.
