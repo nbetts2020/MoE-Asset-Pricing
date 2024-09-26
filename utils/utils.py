@@ -22,7 +22,7 @@ def get_data():
 
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k-valid")
-    df = dataset['train'].to_pandas()
+    df = dataset['test'].to_pandas()
     return df
 
 def get_new_data(new_data_url):
@@ -31,7 +31,7 @@ def get_new_data(new_data_url):
 
     login(hf_token)
     dataset = load_dataset(new_data_url)
-    df = dataset['train'].to_pandas()
+    df = dataset['test'].to_pandas()
     return df
 
 def process_data(df, tokenizer_name="gpt2"):
