@@ -17,20 +17,24 @@ class SynapticIntelligence:
         self.omega = {}
         self.theta_star = {}
         self.previous_params = {}
-        self.loss_previous_task = 0.0
+        self.accumulated_gradients = {}
+        self.total_path = 0.0
         self.epsilon = 1e-8  # Small constant to prevent division by zero
 
         # Initialize omega and theta_star
         for name, param in self.model.named_parameters():
-            self.omega[name] = torch.zeros_like(param.data)
-            self.theta_star[name] = param.data.clone()
+            if param.requires_grad:
+                self.omega[name] = torch.zeros_like(param.data)
+                self.theta_star[name] = param.data.clone()
+                self.previous_params[name] = param.data.clone()
+                self.accumulated_gradients[name] = torch.zeros_like(param.data)
 
     def update_omega(self, loss, batch_size):
         """
-        Update omega based on parameter changes.
+        Update omega based on parameter changes and gradients.
 
         Args:
-            loss (float): The loss value.
+            loss (torch.Tensor): The current loss.
             batch_size (int): The number of samples in the batch.
         """
         # Compute gradients w.r.t. parameters
@@ -38,16 +42,22 @@ class SynapticIntelligence:
         grads = list(grads)
         for (name, param), grad in zip(self.model.named_parameters(), grads):
             if param.requires_grad:
-                delta_theta = param.data - self.theta_star[name]
-                delta_loss = -grad * delta_theta
-                self.omega[name] += delta_loss.abs() * batch_size
+                delta_theta = param.data - self.previous_params[name]
+                self.accumulated_gradients[name] += grad * delta_theta
+
+        self.total_path += loss.item() * batch_size
 
     def consolidate_omega(self):
         """
         Consolidate omega after a task is completed.
         """
         for name, param in self.model.named_parameters():
-            self.theta_star[name] = param.data.clone()
+            if param.requires_grad:
+                self.omega[name] += (self.accumulated_gradients[name] / (self.total_path + self.epsilon)).abs()
+                self.theta_star[name] = param.data.clone()
+                self.previous_params[name] = param.data.clone()
+                self.accumulated_gradients[name].zero_()
+        self.total_path = 0.0
 
     def penalty(self):
         """
@@ -71,7 +81,10 @@ class SynapticIntelligence:
         """
         state = {
             'omega': {name: param.cpu() for name, param in self.omega.items()},
-            'theta_star': {name: param.cpu() for name, param in self.theta_star.items()}
+            'theta_star': {name: param.cpu() for name, param in self.theta_star.items()},
+            'previous_params': {name: param.cpu() for name, param in self.previous_params.items()},
+            'accumulated_gradients': {name: param.cpu() for name, param in self.accumulated_gradients.items()},
+            'total_path': self.total_path
         }
         torch.save(state, filepath)
 
@@ -88,3 +101,8 @@ class SynapticIntelligence:
                 self.omega[name] = state['omega'][name].to(self.model.device)
             if name in state['theta_star']:
                 self.theta_star[name] = state['theta_star'][name].to(self.model.device)
+            if name in state['previous_params']:
+                self.previous_params[name] = state['previous_params'][name].to(self.model.device)
+            if name in state['accumulated_gradients']:
+                self.accumulated_gradients[name] = state['accumulated_gradients'][name].to(self.model.device)
+        self.total_path = state.get('total_path', 0.0)
