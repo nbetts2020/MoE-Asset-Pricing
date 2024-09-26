@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 
 from utils.data import ArticlePriceDataset
 from utils.config import BATCH_SIZE, block_size
-from utils.data import process_data
 
 from tqdm import tqdm
 from transformers import AutoTokenizer
