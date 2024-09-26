@@ -23,7 +23,16 @@ def get_data():
 
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k-valid")
-    df = dataset['test'].to_pandas().drop(columns=['Unnamed: 0'])
+    df = dataset['train'].to_pandas()
+    return df
+
+def get_new_data(new_data_url):
+    load_dotenv('/content/MoE-Asset-Pricing/.env')
+    hf_token = os.getenv('HF_TOKEN')
+
+    login(hf_token)
+    dataset = load_dataset(new_data_url)
+    df = dataset['train'].to_pandas()
     return df
 
 def process_data(df, tokenizer_name="gpt2"):
