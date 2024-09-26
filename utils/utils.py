@@ -24,7 +24,7 @@ def get_data():
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k-valid")
     df = dataset['test'].to_pandas()
-    return df
+    return df.head(1024)
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
@@ -99,8 +99,8 @@ def process_data(df, tokenizer):
         )
 
         # Append tokenized articles and prices
-        articles.append(tokenized_article['input_ids'].squeeze())  # Convert to tensor
-        prices.append(row['weighted_avg_720_hrs'])  # Target price for prediction
+        articles.append(concatenated_text)
+        prices.append(row['weighted_avg_720_hrs'])
 
     return articles, prices
 
