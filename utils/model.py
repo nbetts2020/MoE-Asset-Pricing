@@ -21,7 +21,7 @@ class MultiHeadAttention(nn.Module):
         self.qkv_proj = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.out_proj = nn.Linear(n_embed, n_embed, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         B, T, C = x.size()  # x: (B, T, n_embed)
         qkv = self.qkv_proj(x)  # (B, T, 3 * n_embed)
         qkv = qkv.view(B, T, 3, self.n_head, self.head_size)  # (B, T, 3, n_head, head_size)
@@ -34,6 +34,7 @@ class MultiHeadAttention(nn.Module):
         v = v.half().contiguous()
 
         # Apply FlashAttention
+        # Removed 'attn_mask=attn_mask' since flash_attn_func does not accept it
         attn_output = flash_attn_func(q, k, v, causal=True)  # (B, n_head, T, head_size)
 
         # Reshape back to (B, T, n_embed)
@@ -58,7 +59,7 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# Noisy top-k gating remains unchanged
+# Noisy top-k routing remains unchanged
 class NoisyTopkRouter(nn.Module):
     def __init__(self, n_embed, num_experts, top_k):
         super(NoisyTopkRouter, self).__init__()
@@ -123,8 +124,9 @@ class Block(nn.Module):
         self.sa = MultiHeadAttention(n_head)
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, attention_mask=None):
+        # Removed 'attention_mask=attention_mask' from self.sa call
+        x = x + self.sa(self.ln1(x))  # Self-attention without attention_mask
         x = x + self.smoe(self.ln2(x))
         return x
 
@@ -151,7 +153,7 @@ class SparseMoELanguageModel(nn.Module):
 
         # Apply gradient checkpointing to each block
         for block in self.blocks:
-            x = checkpoint(block, x)
+            x = checkpoint(block, x)  # Removed 'attention_mask'
 
         x = self.ln_f(x)       # (B, T, n_embed)
 
