@@ -35,13 +35,11 @@ def get_new_data(new_data_url):
     df = dataset['test'].to_pandas()
     return df
 
-def process_data(df, tokenizer_name="gpt2"):
+def process_data(df, tokenizer):
     """
     Preprocess the data for article-based price prediction.
     """
-    # Initialize the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-
+    
     articles = []
     prices = []
 
@@ -110,7 +108,7 @@ def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE):
     """
     Prepare DataLoader for a given DataFrame and tokenizer.
     """
-    articles, prices = process_data(df)
+    articles, prices = process_data(df, tokenizer)
     dataset = ArticlePriceDataset(articles, prices, tokenizer)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     return dataloader
