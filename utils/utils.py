@@ -46,16 +46,16 @@ def process_data(df, tokenizer_name="gpt2"):
     prices = []
 
     # Group the data by symbol
-    grouped = df.groupby('Symbol_x', sort=False)
+    grouped = df.groupby('Symbol', sort=False)
 
     print("Processing articles and prices...")
     for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
-        current_symbol = row['Symbol_x']
-        current_date = row['Date_x']
+        current_symbol = row['Symbol']
+        current_date = row['Date']
 
         # Get all articles for the current symbol before the current date
         symbol_df = grouped.get_group(current_symbol)
-        previous_articles = symbol_df[symbol_df['Date_x'] < current_date]
+        previous_articles = symbol_df[symbol_df['Date'] < current_date]
 
         # Get the last 10 previous articles
         last_articles = previous_articles.tail(10)
@@ -66,7 +66,7 @@ def process_data(df, tokenizer_name="gpt2"):
         # Add previous articles
         for _, prev_row in last_articles.iterrows():
             concatenated_text += (
-                "\nPrevious Article Date: " + str(prev_row['Date_x']) +
+                "\nPrevious Article Date: " + str(prev_row['Date']) +
                 "\nPrevious Article Content: " + str(prev_row['Article']) +
                 "\nPrevious Article Title: " + str(prev_row['Title']) +
                 "\nPrevious Article Type: " + str(prev_row['articleType']) +
@@ -77,8 +77,8 @@ def process_data(df, tokenizer_name="gpt2"):
 
         # Add the current article
         concatenated_text += (
-            "Symbol: " + str(row['Symbol_x']) +
-            "\nSecurity: " + str(row['Date_x']) +
+            "Symbol: " + str(row['Symbol']) +
+            "\nSecurity: " + str(row['Date']) +
             "\nRelated Stocks/Topics: " + str(row['RelatedStocksList']) +
             "\nArticle Content: " + str(row['Article']) +
             "\nArticle Title: " + str(row['Title']) +
