@@ -3,15 +3,7 @@ import os
 import argparse
 from utils.model import SparseMoELanguageModel
 from utils.train import train_model
-from utils.utils import (
-    kaiming_init_weights, 
-    get_data, 
-    prepare_dataloader, 
-    load_model_weights, 
-    initialize_si, 
-    get_new_data, 
-    get_model
-)
+from utils.utils import kaiming_init_weights, get_data, prepare_dataloader, load_model_weights, initialize_si, get_new_data
 from utils.config import *
 from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset
@@ -20,7 +12,6 @@ from utils.test import test_forgetting
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import logging
-import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
@@ -39,67 +30,41 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # Initialize the model and tokenizer (always needed)
+    # Initialize the model and tokenizer
     model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name)
     tokenizer = model.tokenizer
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Handle different modes
     if args.mode == 'test_forgetting':
-        # Load pre-trained model for testing catastrophic forgetting
-        weights_path, _ = get_model("nbettencourt/NLAS-test")
-        model = load_model_weights(model, weights_path, device)
+        # Load pre-trained model
+        model = load_model_weights(model, 'model/model_weights.pth', device)
         logging.info("Pre-trained model loaded for testing catastrophic forgetting.")
 
         # Prepare tasks
-        task_dataloaders = prepare_tasks()
+        task_dataloaders = prepare_tasks()  # Ensure this function is properly defined elsewhere
 
-        # Initialize Synaptic Intelligence (SI) if updating the model
+        # Initialize Synaptic Intelligence (SI) if update flag is specified
         si = initialize_si(model, 'model/si_state.pth') if args.update else None
 
-        # Run the catastrophic forgetting test
+        # Run catastrophic forgetting test
         results = test_forgetting(model, task_dataloaders, EPOCHS, device, si=si)
         print("Catastrophic Forgetting Test Results:")
         print(results)
 
     elif args.mode == 'train':
-        # Apply Kaiming initialization to the model
+        # Apply Kaiming initialization
         model.apply(kaiming_init_weights)
         logging.info("Applied Kaiming initialization to the model.")
 
-        # If updating, load the model weights
-        si = None
-        if args.update:
-            # Load pre-trained model weights from Hugging Face
-            weights_path, _ = get_model("nbettencourt/NLAS-test")
-            model = load_model_weights(model, weights_path, device)
-            logging.info("Loaded pre-trained model weights for updating.")
+        # Check for multiple GPUs
+        if torch.cuda.device_count() > 1:
+            model = torch.nn.DataParallel(model)
+            logging.info(f"Using {torch.cuda.device_count()} GPUs for training.")
 
-            # Initialize SI for updating
-            si = initialize_si(model, 'model/si_state.pth')
-            logging.info("Initialized Synaptic Intelligence (SI) from saved state.")
+        model = model.to(device)
+        logging.info(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters.")
 
-            # Load new data from Hugging Face
-            new_data_url = args.update
-            logging.info(f"Fetching new data from Hugging Face URL: {new_data_url}")
-            df_new = get_new_data(new_data_url)
-            logging.info(f"Fetched {len(df_new)} new data samples.")
-            df_new = df_new[df_new['weighted_avg_720_hrs'] > 0]
-
-            # Create DataLoader for the new data
-            actual_batch_size = min(16, len(df_new))
-            train_dataloader = prepare_dataloader(df_new, tokenizer, batch_size=actual_batch_size)
-            logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} new training samples.")
-        else:
-            # Train from scratch (no need to load weights)
-            df = get_data()
-            df = df[df['weighted_avg_720_hrs'] > 0]
-            train_df, test_df = train_test_split(df, test_size=0.15, random_state=42)
-            actual_batch_size = 16
-            train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size)
-            logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
-
-        # Define the optimizer with layer-wise learning rate decay
+        # Initialize optimizer with layer-wise learning rate decay
         param_groups = [
             {'params': list(model.token_embedding_table.parameters()) + list(model.position_embedding_table.parameters()), 'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1))},
             {'params': model.regression_head.parameters(), 'lr': learning_rate}
@@ -110,41 +75,79 @@ def main():
         optimizer = torch.optim.AdamW(param_groups)
         logging.info("Initialized AdamW optimizer with layer-wise learning rate decay.")
 
-        # Determine accumulation steps for gradient accumulation
-        desired_effective_batch_size = 16
-        accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
-        logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
+        # Initialize SI and load new data if updating
+        si = None
+        if args.update:
+            # Load pre-trained model weights
+            model = load_model_weights(model, 'model/model_weights.pth', device)
+            logging.info("Loaded pre-trained model weights for updating.")
 
-        # Start training the model
+            # Initialize SI
+            si = initialize_si(model, 'model/si_state.pth')
+            logging.info("Initialized Synaptic Intelligence (SI) from saved state.")
+
+            # Load new data from Hugging Face URL
+            new_data_url = args.update
+            logging.info(f"Fetching new data from Hugging Face URL: {new_data_url}")
+            df_new = get_new_data(new_data_url)  # Placeholder function to implement
+            logging.info(f"Fetched {len(df_new)} new data samples.")
+
+            # Preprocess new data as needed
+            df_new = df_new[df_new['weighted_avg_720_hrs'] > 0]
+
+            # Create DataLoader for new data
+            actual_batch_size = min(16, len(df_new))  # Adjust batch size based on data size
+            train_dataloader = prepare_dataloader(df_new, tokenizer, batch_size=actual_batch_size)
+            logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} new training samples.")
+
+            # Determine accumulation_steps
+            desired_effective_batch_size = 16  # Set your desired effective batch size
+            accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
+            logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
+        else:
+            # Load data and create DataLoader for initial training
+            df = get_data()
+            df = df[df['weighted_avg_720_hrs'] > 0]
+            train_df, test_df = train_test_split(df, test_size=0.15, random_state=42)
+            actual_batch_size = 16  # You can adjust this based on your resources
+            train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size)
+            logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
+
+            # Determine accumulation_steps
+            desired_effective_batch_size = 16  # For initial training, this might be the same as actual_batch_size
+            accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
+            logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
+
+        # Train the model
         logging.info("Starting training...")
         train_model(model, optimizer, EPOCHS, device, train_dataloader, si=si, accumulation_steps=accumulation_steps)
         logging.info("Training completed.")
 
-        # Save model weights
+        # Save the model weights
         os.makedirs('model', exist_ok=True)
         torch.save(model.state_dict(), 'model/model_weights.pth')
         logging.info("Model weights saved to 'model/model_weights.pth'.")
 
-        # Save SI state if used
+        # Save SI state
         if si is not None:
             si.save_state('model/si_state.pth')
             logging.info("Synaptic Intelligence (SI) state saved to 'model/si_state.pth'.")
 
     elif args.mode == 'run':
-        # Load the model for inference
-        weights_path, _ = get_model("nbettencourt/NLAS-test")
-        model = load_model_weights(model, weights_path, device)
+        # Load the model weights
+        model = load_model_weights(model, 'model/model_weights.pth', device)
         logging.info("Loaded model weights for inference.")
 
         if args.test:
-            # Load data for testing
+            # Ensure test_df is loaded
             df = get_data()
             df = df[df['weighted_avg_720_hrs'] > 0]
             _, test_df = train_test_split(df, test_size=0.15, random_state=42)
+
+            # Create DataLoader for test data
             test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=16, shuffle=False)
             logging.info(f"Prepared DataLoader with {len(test_dataloader.dataset)} test samples.")
 
-            # Perform evaluation
             predictions, actuals = [], []
             model.eval()
             with torch.no_grad():
@@ -167,7 +170,6 @@ def main():
             logging.info(f"Test MAE: {mae:.4f}, R2 Score: {r2:.4f}")
 
         else:
-            # Perform inference on provided text
             if not args.input_text:
                 raise ValueError("You must provide input text when mode is 'run' without --test")
 
