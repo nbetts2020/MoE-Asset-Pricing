@@ -27,7 +27,7 @@ def get_data():
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k-valid")
     df = dataset['test'].to_pandas()
-    return df.head(1024)
+    return df
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
