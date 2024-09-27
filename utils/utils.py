@@ -13,6 +13,9 @@ from utils.config import BATCH_SIZE, block_size
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+import json
+from huggingface_hub import hf_hub_download
+
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
@@ -34,6 +37,16 @@ def get_new_data(new_data_url):
     dataset = load_dataset(new_data_url)
     df = dataset['test'].to_pandas()
     return df
+
+def get_model(model_repo_id):
+    config_path = hf_hub_download(repo_id=model_repo_id, filename="config.json")
+    weights_path = hf_hub_download(repo_id=model_repo_id, filename="model_weights.pth")
+    
+    # Load the configuration
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    return weights_path, config
 
 def process_data(df, tokenizer):
     """
