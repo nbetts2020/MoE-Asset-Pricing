@@ -15,3 +15,4 @@ EPOCHS = 20
 BATCH_SIZE = 16
 
 LR_DECAY = 0.95      # Decay rate per layer
+LAMBDA_SI = 0.1      # Lambda val for synaptic intelligence
