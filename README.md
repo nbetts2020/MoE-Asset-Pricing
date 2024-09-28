@@ -120,7 +120,7 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 
 **Fisher Information Regularization**: *Coming Soon*. Fisher Information Regularization estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. By penalizing updates to parameters with high Fisher Information, the model preserves critical knowledge from previous tasks.
 
-### **How it Works**:
+**How it Works**:
 
 1. **Compute Fisher Information**:
     - Calculate the Fisher Information $F_i$ for each parameter $\theta_i$:
@@ -146,7 +146,7 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
 
 **Memory Replay Buffers**: *Coming Soon*. Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
-### **How it Works**:
+**How it Works**:
 
 1. **New Data**: At each time step $t$, new data $(x_t, y_t)$ is received and added to the buffer along with its prediction error.
 
@@ -163,20 +163,20 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
 
 6. **Synthetic Data Replay** (Optional; not the focus of this project): Another similar approach to mention involves generating synthetic examples instead of replaying real data. This is often beneficial in scenarios where storing all historical data is impractical, yet retaining performance on older tasks is essential.
 
-### Error-Based Sampling
+**Error-Based Sampling**
 
 An Error-Based Sampling strategy is implemented to enhance the effectiveness of the Memory Replay Buffer. In this approach, each sector (e.g., Finance, Technology, Utilities) is treated as a distinct task. The model continuously monitors its prediction performance across these sectors by tracking the average prediction error for each. During the sampling process, sectors with higher average errors are assigned a higher probability of their samples being replayed. This ensures that the model allocates more training resources to sectors where it is underperforming, thereby improving its predictive accuracy in those areas. By focusing on sectors with greater prediction challenges, the model becomes more robust and adaptable to handle diverse market conditions.
 
-### Fixed Limit on New Data per Batch
+**Fixed Limit on New Data per Batch**
 
 In order to prevent the model from overfitting to new data, a fixed limit is imposed on the amount of new data that can be included in each training batch. Specifically, the number of new data samples is capped (e.g., 8 samples per batch). When a larger batch of new data is available, it is divided into multiple smaller batches that adhere to this limit. For instance, let's say the number of new samples is 44:
 
-#### No Fixed Limit
+**No Fixed Limit**
 
 - 2 batches with 16 new samples each
 - 1 batch with 12 new samples and 4 replayed samples from the Memory Replay Buffer
 
-#### Fixed Limit
+**Fixed Limit**
 
 - 5 batches with 8 new samples each paired with 8 replayed samples from the Memory Replay Buffer
 - 1 batch with 4 new samples paired with 12 replayed samples
