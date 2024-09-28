@@ -81,7 +81,9 @@ Online Learning, a methodology in which sequentially available data is used to u
 
 Regularization of a model's parameters is one of the most commonly used strategies to mitigate catastrophic forgetting. By penalizing large updates to critical parameters during training, regularization helps ensure that the model retains its previously acquired knowledge while adapting to new information. Methods such as L2 regularization, Synaptic Intelligence, and Fisher Information Regularization, among others, constrain parameter updates in an effort to prevent drastic shifts in learned weights, albeit in different ways. Likewise, though more focused on the parameters of the gating network rather than the model's weights, Expert Routing Regularization is another form of regularization that adds a further layer of control by encouraging a more balanced selection of experts. This ensures that no expert becomes overly dominant or underutilized during training - both signs of overfitting and generalization loss. More creative approaches, such as the Memory Replay Buffer, introduce a complementary mechanism. Instead of relying solely on constraining parameter updates, replay buffers store key historical data samples. During training, the model can revisit these past data points alongside new information, akin to how humans recall and integrate past experiences while learning something new. While the literature on addressing catastrophic forgetting is certainly not scarce, there's no clear consensus on the optimal approach. Thus, the following five approaches have been implemented to test their efficacy:
 
-**Continual Learning with Regularization**: *Coming Soon*. L2 regularization, while differing from other regularization approaches here due to its lack of task-specificity, provides a more general approach to stabilizing essential weights during updates. Continuing from the idea of regularization, Continual Learning with Regularization via L2 regularization aims to stabilize the model's parameters by penalizing large weight updates, thereby encouraging smoother transitions during updates. Unlike other task-specific methods, a penalty is applied across all parameters, regardless of their relevance to past tasks. This makes it a more general form of regularization, helping the model resist drastic weight changes during updates without specifically focusing on critical parameters.
+### Continual Learning with Regularization
+
+*Coming Soon*. L2 regularization, while differing from other regularization approaches here due to its lack of task-specificity, provides a more general approach to stabilizing essential weights during updates. Continuing from the idea of regularization, Continual Learning with Regularization via L2 regularization aims to stabilize the model's parameters by penalizing large weight updates, thereby encouraging smoother transitions during updates. Unlike other task-specific methods, a penalty is applied across all parameters, regardless of their relevance to past tasks. This makes it a more general form of regularization, helping the model resist drastic weight changes during updates without specifically focusing on critical parameters.
 
 The L2 regularization term adds a quadratic penalty to the loss function, expressed as:
 
@@ -94,7 +96,9 @@ Where:
 
 This regularization discourages large parameter values, ensuring the model maintains smoother gradients when adjusting to new data. Though not task-specific, its significance lies in its simplicity and ability to be a baseline, guiding reference to other regularization methods.
 
-**Expert Routing Regularization**: *Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting a balanced load across experts, various approaches to regularizing the expert routing mechanism include:
+### Expert Routing Regularization
+
+*Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting a balanced load across experts, various approaches to regularizing the expert routing mechanism include:
 
 1. **Load Balancing Loss**: This method aims to evenly distribute data points across all experts by adding a penalty term that encourages a more uniform selection of experts.
 
@@ -106,7 +110,9 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-**Synaptic Intelligence**: Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
+### Synaptic Intelligence
+
+Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
 
 $\Omega_i = \sum_{t=1}^{T} \frac{\partial \ell_t}{\partial \theta_i} \Delta \theta_i$
 
@@ -118,7 +124,9 @@ Adapting to new data while preserving important past knowledge.
 
 Its namesake is derived by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-**Fisher Information Regularization**: *Coming Soon*. Fisher Information Regularization estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. By penalizing updates to parameters with high Fisher Information, the model preserves critical knowledge from previous tasks.
+### Fisher Information Regularization
+
+*Coming Soon*. Fisher Information Regularization estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. By penalizing updates to parameters with high Fisher Information, the model preserves critical knowledge from previous tasks.
 
 **How it Works**:
 
@@ -144,7 +152,9 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 
 The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
 
-**Memory Replay Buffers**: *Coming Soon*. Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
+### Memory Replay Buffer
+
+*Coming Soon*. Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
 **How it Works**:
 
