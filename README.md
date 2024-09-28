@@ -179,7 +179,7 @@ An Error-Based Sampling strategy is implemented to enhance the effectiveness of 
 
 **Fixed Limit on New Data per Batch**
 
-In order to prevent the model from overfitting to new data, a fixed limit is imposed on the amount of new data that can be included in each training batch. Specifically, the number of new data samples is capped (e.g., 8 samples per batch). When a larger batch of new data is available, it is divided into multiple smaller batches that adhere to this limit. For instance, let's say the number of new samples is 44:
+In order to prevent the model from overfitting to new data, a fixed limit is imposed on the amount of new data that can be included in each training batch. Specifically, the number of new data samples is capped (e.g., 8 samples per batch). When a larger batch of new data is available, it is divided into multiple smaller batches that adhere to this limit. For instance, let's say the number of new samples is 44 and the fixed new data limit is 8:
 
 **No Fixed Limit**
 
