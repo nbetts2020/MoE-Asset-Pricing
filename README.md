@@ -148,13 +148,13 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
 
 ### **How it Works**:
 
-1. **New Data**: At each time step \$t$, new data $(x_t, y_t)$ is received and added to the buffer.
+1. **New Data**: At each time step $t$, new data $(x_t, y_t)$ is received and added to the buffer along with its prediction error.
+
+2. **Error-Based Sampling**: The model retrieves a batch of old data $(x_{\text{old}}, y_{\text{old}})$ from the buffer based on their prediction errors and sector performance. Sectors with higher average prediction errors have a higher probability of their samples being replayed.
    
-2. **Old Data**: The model retrieves a random batch of old data $(x_{\text{old}}, y_{\text{old}})$ from the buffer.
+3. **Training**: The model trains on both the new data $(x_t, y_t)$ and the sampled batch from the memory buffer $(x_{\text{old}}, y_{\text{old}})$, allowing it to learn from new information while reinforcing its knowledge of past data.
 
-3. **Training**: The model trains on both the new data $(x_t, y_t)$ and a sampled batch from the memory buffer $(x_{\text{old}}, y_{\text{old}})$, allowing the model to learn from new information while reinforcing its knowledge of past data.
-
-4. **Updating the Buffer**: The buffer has a fixed size. When new data is added, older data may be removed, typically using a FIFO strategy or a priority-based mechanism. This maintains a balance of both recent and older examples in the buffer.
+4. **Updating the Buffer**: The buffer has a fixed size. When new data is added, older data is removed using a FIFO strategy. Additionally, samples with lower prediction errors can be deprioritized to make room for more informative examples, maintaining a balance of both recent and older, high-error examples in the buffer.
 
 5. **Buffer Strategies**:
    - **FIFO** (focus): Oldest data is replaced when the buffer is full.
@@ -163,7 +163,25 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
 
 6. **Synthetic Data Replay** (Optional; not the focus of this project): Another similar approach to mention involves generating synthetic examples instead of replaying real data. This is often beneficial in scenarios where storing all historical data is impractical, yet retaining performance on older tasks is essential.
 
-Simply: By replaying old data or generating synthetic samples, the model is less likely to overwrite critical knowledge with new information.
+### Error-Based Sampling
+
+An Error-Based Sampling strategy is implemented to enhance the effectiveness of the Memory Replay Buffer. In this approach, each sector (e.g., Finance, Technology, Utilities) is treated as a distinct task. The model continuously monitors its prediction performance across these sectors by tracking the average prediction error for each. During the sampling process, sectors with higher average errors are assigned a higher probability of their samples being replayed. This ensures that the model allocates more training resources to sectors where it is underperforming, thereby improving its predictive accuracy in those areas. By focusing on sectors with greater prediction challenges, the model becomes more robust and adaptable to handle diverse market conditions.
+
+### Fixed Limit on New Data per Batch
+
+In order to prevent the model from overfitting to new data, a fixed limit is imposed on the amount of new data that can be included in each training batch. Specifically, the number of new data samples is capped (e.g., 8 samples per batch). When a larger batch of new data is available, it is divided into multiple smaller batches that adhere to this limit. For instance, let's say the number of new samples is 44:
+
+#### No Fixed Limit
+
+- 2 batches with 16 new samples each
+- 1 batch with 12 new samples and 4 replayed samples from the Memory Replay Buffer
+
+#### Fixed Limit
+
+- 5 batches with 8 new samples each paired with 8 replayed samples from the Memory Replay Buffer
+- 1 batch with 4 new samples paired with 12 replayed samples
+
+The fixed limit approach ensures a consistent balance between new data and replayed data in each batch, helping the model avoid overfitting to recent data and ensuring that past knowledge is continually reinforced. 
 
 ### Catastrophic Forgetting Testing
 
