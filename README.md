@@ -164,7 +164,7 @@ The approach prioritizes preserving critical knowledge, ensuring that parameters
    
 3. **Training**: The model trains on both the new data $(x_t, y_t)$ and the sampled batch from the memory buffer $(x_{\text{old}}, y_{\text{old}})$, allowing it to learn from new information while reinforcing its knowledge of past data.
 
-4. **Updating the Buffer**: The buffer has a fixed size. When new data is added, older data is removed using a FIFO strategy. Additionally, samples with lower prediction errors are deprioritized to make room for more informative examples, maintaining a balance of both recent and older, high-error examples in the buffer.
+4. **Updating the Buffer**: The buffer has a fixed size. When new data is added, older data is removed using a FIFO strategy. Another strategy could be that samples with lower prediction errors are deprioritized to make room for more informative examples, maintaining a balance of both recent and older, high-error examples in the buffer. Let's stick to FIFO for now, though.
 
 5. **Buffer Strategies**:
    - **FIFO** (focus): Oldest data is replaced when the buffer is full.
