@@ -1,6 +1,7 @@
 # utils/memory_replay_buffer.py
 
 import random
+import torch
 
 class MemoryReplayBuffer:
     def __init__(self, capacity):
@@ -70,3 +71,21 @@ class MemoryReplayBuffer:
         sampled_examples = [self.buffer[i] for i in sampled_indices]
 
         return sampled_examples
+
+    def save(self, filepath):
+        """Save the replay buffer to a file."""
+        state = {
+            'capacity': self.capacity,
+            'buffer': self.buffer,
+            'errors': self.errors,
+            'total_error': self.total_error
+        }
+        torch.save(state, filepath)
+
+    def load(self, filepath):
+        """Load the replay buffer from a file."""
+        state = torch.load(filepath)
+        self.capacity = state['capacity']
+        self.buffer = state['buffer']
+        self.errors = state['errors']
+        self.total_error = state['total_error']
