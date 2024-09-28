@@ -27,7 +27,7 @@ def get_data():
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k-valid")
     df = dataset['test'].to_pandas()
-    return df
+    return df#.head(1024)
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
@@ -49,17 +49,12 @@ def get_model(model_repo_id):
     return weights_path, config
 
 def process_data(df, tokenizer):
-    """
-    Preprocess the data for article-based price prediction.
-    """
-    
     articles = []
     prices = []
+    sectors = []
 
-    # Group the data by symbol
     grouped = df.groupby('Symbol', sort=False)
 
-    print("Processing articles and prices...")
     for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
         current_symbol = row['Symbol']
         current_date = row['Date']
@@ -98,31 +93,19 @@ def process_data(df, tokenizer):
             "\nPublication Author: " + str(row['Author']) +
             "\nStock Price 4 days before: " + str(row['weighted_avg_-96_hrs']) +
             "\nStock Price 2 days before: " + str(row['weighted_avg_-48_hrs']) +
-            "\nStock Price 1 days before: " + str(row['weighted_avg_-24_hrs']) +
-            "\nStock Price 0 days before: " + str(row['weighted_avg_0_hrs'])
+            "\nStock Price 1 day before: " + str(row['weighted_avg_-24_hrs']) +
+            "\nStock Price at release: " + str(row['weighted_avg_0_hrs'])
         )
 
-        # Tokenize the concatenated text
-        tokenized_article = tokenizer(
-            concatenated_text,
-            truncation=True,
-            padding='max_length',
-            max_length=block_size,
-            return_tensors="pt"
-        )
-
-        # Append tokenized articles and prices
         articles.append(concatenated_text)
         prices.append(row['weighted_avg_720_hrs'])
+        sectors.append(row['Sector'])  # Include sector
 
-    return articles, prices
+    return articles, prices, sectors
 
 def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE):
-    """
-    Prepare DataLoader for a given DataFrame and tokenizer.
-    """
-    articles, prices = process_data(df, tokenizer)
-    dataset = ArticlePriceDataset(articles, prices, tokenizer)
+    articles, prices, sectors = process_data(df, tokenizer)
+    dataset = ArticlePriceDataset(articles, prices, sectors, tokenizer)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     return dataloader
 
