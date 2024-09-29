@@ -16,6 +16,9 @@ from transformers import AutoTokenizer
 import json
 from huggingface_hub import hf_hub_download
 
+import logging
+from utils.model import SparseMoELanguageModel
+
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
@@ -38,15 +41,63 @@ def get_new_data(new_data_url):
     df = dataset['test'].to_pandas()
     return df
 
-def get_model(model_repo_id):
-    config_path = hf_hub_download(repo_id=model_repo_id, filename="config.json")
-    weights_path = hf_hub_download(repo_id=model_repo_id, filename="model_weights.pth")
-    
-    # Load the configuration
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+def load_model_weights(model, weights_path, device):
+    if os.path.exists(weights_path):
+        model.load_state_dict(torch.load(weights_path, map_location=device))
+        logging.info(f"Loaded model weights from '{weights_path}'.")
+    else:
+        logging.error(f"Weights file '{weights_path}' not found.")
+        raise FileNotFoundError(f"Weights file '{weights_path}' not found.")
+    model.to(device)
+    return model
 
-    return weights_path, config
+def get_model_from_hf(model_repo_id, device):
+    logging.info(f"Downloading 'config.json' from Hugging Face repository '{model_repo_id}'.")
+    try:
+        config_path = hf_hub_download(repo_id=model_repo_id, filename="config.json")
+        logging.info(f"Downloaded 'config.json' to '{config_path}'.")
+    except Exception as e:
+        logging.error(f"Failed to download 'config.json' from '{model_repo_id}': {e}")
+        raise e
+
+    logging.info(f"Downloading 'model_weights.pth' from Hugging Face repository '{model_repo_id}'.")
+    try:
+        weights_path = hf_hub_download(repo_id=model_repo_id, filename="model_weights.pth")
+        logging.info(f"Downloaded 'model_weights.pth' to '{weights_path}'.")
+    except Exception as e:
+        logging.error(f"Failed to download 'model_weights.pth' from '{model_repo_id}': {e}")
+        raise e
+
+    # Load the configuration
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        logging.info("Loaded model configuration from 'config.json'.")
+    except Exception as e:
+        logging.error(f"Failed to load configuration from '{config_path}': {e}")
+        raise e
+
+    # Initialize the model with the configuration
+    try:
+        model = SparseMoELanguageModel(**config)
+        logging.info("Initialized SparseMoELanguageModel with configuration.")
+    except Exception as e:
+        logging.error(f"Failed to initialize SparseMoELanguageModel: {e}")
+        raise e
+
+    # Load the model weights
+    try:
+        model.load_state_dict(torch.load(weights_path, map_location=device))
+        logging.info("Loaded model weights from 'model_weights.pth'.")
+    except Exception as e:
+        logging.error(f"Failed to load model weights from '{weights_path}': {e}")
+        raise e
+
+    # Move the model to the specified device
+    model.to(device)
+    logging.info(f"Model moved to device '{device}'.")
+
+    return model
 
 def process_data(df, tokenizer):
     articles = []
