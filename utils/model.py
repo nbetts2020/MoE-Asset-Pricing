@@ -28,13 +28,11 @@ class MultiHeadAttention(nn.Module):
         qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, 3, n_head, T, head_size)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each is (B, n_head, T, head_size)
 
-        # Ensure inputs are in half-precision and contiguous
         q = q.half().contiguous()
         k = k.half().contiguous()
         v = v.half().contiguous()
 
-        # Apply FlashAttention
-        # Removed 'attn_mask=attn_mask' since flash_attn_func does not accept it
+        # Apply FlashAttention - note no attention mask
         attn_output = flash_attn_func(q, k, v, causal=True)  # (B, n_head, T, head_size)
 
         # Reshape back to (B, T, n_embed)
@@ -43,7 +41,6 @@ class MultiHeadAttention(nn.Module):
         out = self.out_proj(attn_output)
         return out
 
-# Expert module remains unchanged
 class Expert(nn.Module):
     """ An MLP is a simple linear layer followed by a non-linearity i.e., each Expert """
 
@@ -59,7 +56,6 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# Noisy top-k routing remains unchanged
 class NoisyTopkRouter(nn.Module):
     def __init__(self, n_embed, num_experts, top_k):
         super(NoisyTopkRouter, self).__init__()
@@ -78,7 +74,6 @@ class NoisyTopkRouter(nn.Module):
         router_output = F.softmax(sparse_logits, dim=-1)
         return router_output, indices
 
-# SparseMoE remains unchanged
 class SparseMoE(nn.Module):
     def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
         super(SparseMoE, self).__init__()
@@ -113,7 +108,6 @@ class SparseMoE(nn.Module):
         final_output += updates.view(batch_size, seq_len, -1)
         return final_output
 
-# Corrected Block class
 class Block(nn.Module):
     """ Transformer block with FlashAttention and SparseMoE """
 
@@ -125,15 +119,13 @@ class Block(nn.Module):
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
 
     def forward(self, x, attention_mask=None):
-        # Removed 'attention_mask=attention_mask' from self.sa call
         x = x + self.sa(self.ln1(x))  # Self-attention without attention_mask
         x = x + self.smoe(self.ln2(x))
         return x
 
-# SparseMoELanguageModel with corrections
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, tokenizer_name="gpt2", sparsity_config=None):
-        super().__init__()
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name='gpt2'):
+        super(SparseMoELanguageModel, self).__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
@@ -171,15 +163,14 @@ class SparseMoELanguageModel(nn.Module):
 
         return output, loss
 
-    # If your model is for regression, you might not need the generate method
-    # If you need it, ensure it aligns with your model's output
-    def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
-        # Adjusted generate method (may need further modification)
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            output, _ = self(idx_cond)
-            # Since output is (B,), generating new tokens may not be applicable
-            # Placeholder for custom generation logic
-            pass
+    # Model is regressive, so a streaming output doesn't make sense - keeping it for potential future use
+    # def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
+    #     # Adjusted generate method (may need further modification)
+    #     for _ in range(max_new_tokens):
+    #         idx_cond = idx[:, -block_size:]
+    #         output, _ = self(idx_cond)
+    #         # Since output is (B,), generating new tokens may not be applicable
+    #         # Placeholder for custom generation logic
+    #         pass
 
-        return idx
+    #     return idx
