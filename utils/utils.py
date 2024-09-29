@@ -3,15 +3,16 @@ import torch.nn as nn
 from torch.nn import init
 from torch.utils.data import DataLoader
 
+from sklearn.model_selection import train_test_split
+
 from utils.config import *
+from utils.data import ArticlePriceDataset
+from utils.model import SparseMoELanguageModel
 
 import os
 from huggingface_hub import login
 from datasets import load_dataset
 from dotenv import load_dotenv
-
-from utils.data import ArticlePriceDataset
-from utils.config import BATCH_SIZE, block_size
 
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -20,7 +21,6 @@ import json
 from huggingface_hub import hf_hub_download
 
 import logging
-from utils.model import SparseMoELanguageModel
 
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
