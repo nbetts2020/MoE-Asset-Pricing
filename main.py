@@ -10,6 +10,7 @@ from utils.data import ArticlePriceDataset
 from utils.si import SynapticIntelligence
 from utils.test import test_forgetting
 from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer
 from tqdm import tqdm
 import logging
 
