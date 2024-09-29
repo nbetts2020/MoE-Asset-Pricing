@@ -1,9 +1,22 @@
 import torch
 import os
 import argparse
+import logging
 from utils.model import SparseMoELanguageModel
 from utils.train import train_model
-from utils.utils import kaiming_init_weights, get_data, prepare_dataloader, load_model_weights, initialize_si, get_new_data, initialize_model, prepare_optimizer, prepare_data, initialize_replay_buffer, save_model_and_states
+from utils.utils import (
+    get_data,
+    prepare_dataloader,
+    get_model_from_hf,
+    get_new_data,
+    initialize_si,
+    initialize_model,
+    prepare_optimizer,
+    prepare_data,
+    initialize_replay_buffer,
+    save_model_and_states,
+    kaiming_init_weights
+)
 from utils.config import *
 from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset
@@ -12,7 +25,6 @@ from utils.test import test_forgetting
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
 from tqdm import tqdm
-import logging
 
 from utils.memory_replay_buffer import MemoryReplayBuffer
 
@@ -25,10 +37,10 @@ def main():
     parser.add_argument('input_text', type=str, nargs='?', help="Input article text (required if mode is 'run' without --test)", default=None)
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
-    parser.add_argument('--update', type=str, help="Hugging Face URL to the new dataset for updating the model.", default=None)
+    parser.add_argument('--update', type=str, help="Hugging Face dataset URL for updating the model.", default=None)
     parser.add_argument('--use_si', action='store_true', help="Use Synaptic Intelligence during training or updating.")
     parser.add_argument('--use_replay_buffer', action='store_true', help="Use Memory Replay Buffer during training or updating.")
-    parser.add_argument('--model_repo_id', type=str, help="Hugging Face repository ID to load the model from.", default=None)
+    parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
 
     args = parser.parse_args()
 
@@ -41,11 +53,12 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     if args.mode == 'train':
-        # Initialize model
-        model = initialize_model(args, device)
-        # Apply Kaiming initialization (since we are training from scratch)
-        model.apply(kaiming_init_weights)
-        logging.info("Applied Kaiming initialization to the model.")
+        # Initialize model from scratch
+        model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
+        if initialized_from_scratch:
+            # Apply Kaiming initialization
+            model.apply(kaiming_init_weights)
+            logging.info("Initialized model from scratch and applied Kaiming initialization.")
         # Prepare optimizer
         optimizer = prepare_optimizer(model)
         # Prepare data
@@ -74,17 +87,20 @@ def main():
         if not args.update:
             raise ValueError("You must provide the --update argument with the Hugging Face dataset URL when in 'update' mode.")
         # Initialize model
-        model = initialize_model(args, device)
-        # Load existing model weights
-        model = load_model_weights(model, 'model/model_weights.pth', device)
-        logging.info("Loaded pre-trained model weights for updating.")
+        try:
+            model, _ = initialize_model(args, device, init_from_scratch=False)
+            logging.info("Loaded pre-trained model for updating.")
+        except RuntimeError as e:
+            logging.error(str(e))
+            print("Error: Could not load model for updating.")
+            return
         # Prepare optimizer
         optimizer = prepare_optimizer(model)
         # Prepare data
         train_dataloader, accumulation_steps = prepare_data(args, tokenizer)
-        # Initialize SI
+        # Initialize SI - if --use_si is True
         si = initialize_si(model, args)
-        # Initialize replay buffer
+        # Initialize replay buffer - if --use_si is True
         replay_buffer = initialize_replay_buffer(args)
         # Update the model
         logging.info("Starting updating...")
@@ -104,14 +120,18 @@ def main():
 
     elif args.mode == 'run':
         # Initialize model
-        model = initialize_model(args, device)
-        model = load_model_weights(model, 'model/model_weights.pth', device)
-        logging.info("Loaded model weights for inference.")
+        try:
+            model, _ = initialize_model(args, device, init_from_scratch=False)
+            logging.info("Model is ready for inference.")
+        except RuntimeError as e:
+            logging.error(str(e))
+            print("Error: Could not load model for inference.")
+            return
 
         if args.test:
             # Evaluate on the test set
             df = get_data()
-            df = df[df['weighted_avg_720_hrs'] > 0]
+            df = df[df['weighted_avg_720_hrs'] > 0] # checking if market data is valid
             _, test_df = train_test_split(df, test_size=0.15, random_state=42)
             test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=16, shuffle=False)
             logging.info(f"Prepared DataLoader with {len(test_dataloader.dataset)} test samples.")
@@ -133,7 +153,13 @@ def main():
         else:
             if not args.input_text:
                 raise ValueError("You must provide input text when mode is 'run' without --test")
-            encoding = tokenizer(args.input_text, truncation=True, padding='max_length', max_length=block_size, return_tensors='pt').to(device)
+            encoding = tokenizer(
+                args.input_text,
+                truncation=True,
+                padding='max_length',
+                max_length=block_size,
+                return_tensors='pt'
+            ).to(device)
             input_ids = encoding["input_ids"]
             # Inference
             model.eval()
@@ -144,9 +170,13 @@ def main():
 
     elif args.mode == 'test_forgetting':
         # Initialize model
-        model = initialize_model(args, device)
-        model = load_model_weights(model, 'model/model_weights.pth', device)
-        logging.info("Loaded model weights for testing forgetting.")
+        try:
+            model, _ = initialize_model(args, device, init_from_scratch=False)
+            logging.info("Loaded model weights for testing forgetting.")
+        except RuntimeError as e:
+            logging.error(str(e))
+            print("Error: Could not load model for testing forgetting.")
+            return
         # Test for forgetting
         test_results = test_forgetting(model, device)
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
