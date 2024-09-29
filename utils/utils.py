@@ -169,18 +169,6 @@ def load_model_weights(model, filepath, device):
     print(f"Model loaded from {filepath}.")
     return model
 
-def initialize_si(model, si_path, lambda_si):
-    """
-    Initialize Synaptic Intelligence (SI) and load its state if it exists.
-    """
-    si = SynapticIntelligence(model, lambda_si=lambda_si)
-    if os.path.exists(si_path):
-        si.load_state(si_path)
-        print(f"SI state loaded from {si_path}.")
-    else:
-        print("No existing SI state found. Starting fresh.")
-    return si
-
 def prepare_tasks(k=3):
     """
     Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
@@ -208,3 +196,117 @@ def prepare_tasks(k=3):
         tasks.append(dataloader)
 
     return tasks
+
+def initialize_model(args, device):
+    """
+    Initializes the model either from Hugging Face or locally.
+    """
+    if args.model_repo_id:
+        # Load the model from Hugging Face
+        logging.info(f"Loading model from Hugging Face repository '{args.model_repo_id}'.")
+        model = get_model_from_hf(args.model_repo_id, device)
+    else:
+        # Initialize the model locally
+        model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name)
+        model = model.to(device)
+    # Move model to device before wrapping with DataParallel
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        logging.info(f"Using {torch.cuda.device_count()} GPUs for training.")
+    return model
+
+def prepare_optimizer(model):
+    """
+    Prepares the optimizer with layer-wise learning rate decay.
+    """
+    param_groups = [
+        {'params': list(model.token_embedding_table.parameters()) + list(model.position_embedding_table.parameters()), 'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1))},
+        {'params': model.regression_head.parameters(), 'lr': learning_rate}
+    ] + [
+        {'params': block.parameters(), 'lr': learning_rate * (LR_DECAY ** (len(model.blocks) - i))}
+        for i, block in enumerate(model.blocks)
+    ]
+    optimizer = torch.optim.AdamW(param_groups)
+    logging.info("Initialized AdamW optimizer with layer-wise learning rate decay.")
+    return optimizer
+
+def prepare_data(args, tokenizer):
+    """
+    Prepares the data for training or updating.
+    """
+    if args.mode == 'train':
+        # Load data and create DataLoader for initial training
+        df = get_data()
+        df = df[df['weighted_avg_720_hrs'] > 0]
+        train_df, test_df = train_test_split(df, test_size=0.15, random_state=42)
+        actual_batch_size = 16  # Adjust based on resources
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size)
+        logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
+    elif args.mode == 'update':
+        # Load new data from Hugging Face URL
+        new_data_url = args.update
+        logging.info(f"Fetching new data from Hugging Face URL: {new_data_url}")
+        df_new = get_new_data(new_data_url)
+        logging.info(f"Fetched {len(df_new)} new data samples.")
+        df_new = df_new[df_new['weighted_avg_720_hrs'] > 0]
+        actual_batch_size = min(16, len(df_new))  # Adjust based on data size
+        train_dataloader = prepare_dataloader(df_new, tokenizer, batch_size=actual_batch_size)
+        logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} new training samples.")
+    else:
+        return None, None
+
+    # Determine accumulation_steps
+    desired_effective_batch_size = 16  # Adjust as needed
+    accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
+    logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
+    return train_dataloader, accumulation_steps
+
+def initialize_si(model, args):
+    """
+    Initializes Synaptic Intelligence (SI) if specified.
+    """
+    si = None
+    if args.use_si:
+        si = SynapticIntelligence(model, lambda_si=LAMBDA_SI)
+        if args.mode == 'update':
+            si_state_path = 'model/si_state.pth'
+            if os.path.exists(si_state_path):
+                si.load_state(si_state_path)
+                logging.info(f"Loaded Synaptic Intelligence (SI) state from '{si_state_path}'.")
+            else:
+                logging.info("No existing SI state found. Starting fresh SI.")
+        else:
+            logging.info("Initialized Synaptic Intelligence (SI) for initial training.")
+    return si
+
+def initialize_replay_buffer(args):
+    """
+    Initializes or loads the replay buffer if specified.
+    """
+    replay_buffer = None
+    if args.use_replay_buffer:
+        replay_buffer_capacity = 10000
+        replay_buffer = MemoryReplayBuffer(capacity=replay_buffer_capacity)
+        logging.info(f"Initialized Memory Replay Buffer with capacity {replay_buffer_capacity}.")
+        if args.mode == 'update':
+            replay_buffer_path = 'model/replay_buffer.pth'
+            if os.path.exists(replay_buffer_path):
+                replay_buffer.load(replay_buffer_path)
+                logging.info(f"Loaded Memory Replay Buffer from '{replay_buffer_path}'.")
+            else:
+                logging.info("No existing Memory Replay Buffer found. Starting fresh.")
+    return replay_buffer
+
+def save_model_and_states(model, si, replay_buffer, args):
+    """
+    Saves the model weights, SI state, and replay buffer.
+    """
+    os.makedirs('model', exist_ok=True)
+    torch.save(model.state_dict(), 'model/model_weights.pth')
+    logging.info("Model weights saved to 'model/model_weights.pth'.")
+    if args.use_si and si is not None:
+        si.save_state('model/si_state.pth')
+        logging.info("Synaptic Intelligence (SI) state saved to 'model/si_state.pth'.")
+    if args.use_replay_buffer and replay_buffer is not None:
+        replay_buffer.save('model/replay_buffer.pth')
+        logging.info("Memory Replay Buffer saved to 'model/replay_buffer.pth'.")
