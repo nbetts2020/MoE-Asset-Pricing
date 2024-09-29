@@ -22,6 +22,8 @@ from huggingface_hub import hf_hub_download
 
 import logging
 
+import inspect
+
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
@@ -55,6 +57,16 @@ def load_model_weights(model, weights_path, device):
     return model
 
 def get_model_from_hf(model_repo_id, device):
+    """
+    Downloads the model configuration and weights from Hugging Face Hub and loads them into the SparseMoELanguageModel.
+
+    Args:
+        model_repo_id (str): The repository ID on Hugging Face Hub (e.g., "username/repo-name").
+        device (torch.device): The device to map the model weights.
+
+    Returns:
+        SparseMoELanguageModel: The model loaded with weights from Hugging Face.
+    """
     logging.info(f"Downloading 'config.json' from Hugging Face repository '{model_repo_id}'.")
     try:
         config_path = hf_hub_download(repo_id=model_repo_id, filename="config.json")
@@ -80,9 +92,20 @@ def get_model_from_hf(model_repo_id, device):
         logging.error(f"Failed to load configuration from '{config_path}': {e}")
         raise e
 
+    # Filter the configuration to include only expected parameters
+    expected_args = inspect.getfullargspec(SparseMoELanguageModel.__init__).args
+    # Remove 'self' from the list
+    if 'self' in expected_args:
+        expected_args.remove('self')
+    logging.info(f"Expected arguments for SparseMoELanguageModel: {expected_args}")
+
+    # Filter config
+    model_config = {k: config[k] for k in expected_args if k in config}
+    logging.info(f"Filtered model configuration: {model_config}")
+
     # Initialize the model with the configuration
     try:
-        model = SparseMoELanguageModel(**config)
+        model = SparseMoELanguageModel(**model_config)
         logging.info("Initialized SparseMoELanguageModel with configuration.")
     except Exception as e:
         logging.error(f"Failed to initialize SparseMoELanguageModel: {e}")
@@ -96,7 +119,7 @@ def get_model_from_hf(model_repo_id, device):
         logging.error(f"Failed to load model weights from '{weights_path}': {e}")
         raise e
 
-    # Move the model to the specified device
+    # Move the model to specified device
     model.to(device)
     logging.info(f"Model moved to device '{device}'.")
 
@@ -184,7 +207,7 @@ def prepare_tasks(k=3):
     """
     df = get_data()  # Load your data
     
-    # Get the unique sectors from the dataset
+    # Get unique sectors from the dataset
     unique_sectors = df['Sector'].unique()
     
     # Randomly sample k sectors from the unique sectors
@@ -200,23 +223,64 @@ def prepare_tasks(k=3):
 
     return tasks
 
-def initialize_model(args, device):
-    """
-    Initializes the model either from Hugging Face or locally.
-    """
-    if args.model_repo_id:
-        # Load the model from Hugging Face
-        logging.info(f"Loading model from Hugging Face repository '{args.model_repo_id}'.")
-        model = get_model_from_hf(args.model_repo_id, device)
-    else:
-        # Initialize the model locally
-        model = SparseMoELanguageModel(tokenizer_name=args.tokenizer_name)
+def initialize_model(args, device, init_from_scratch=False):
+
+    if init_from_scratch:
+        logging.info("Initializing model from scratch using configurations from utils/config.py.")
+        model_config = {
+            'n_embed': n_embed,
+            'n_head': n_head,
+            'n_layer': n_layer,
+            'block_size': block_size,
+            'dropout': dropout,
+            'num_experts': num_experts,
+            'top_k': top_k,
+            'tokenizer_name': args.tokenizer_name
+        }
+        model = SparseMoELanguageModel(**model_config)
         model = model.to(device)
-    # Move model to device before wrapping with DataParallel
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
-        logging.info(f"Using {torch.cuda.device_count()} GPUs for training.")
-    return model
+        initialized_from_scratch = True
+        return model, initialized_from_scratch
+    else:
+        model = None
+        initialized_from_scratch = False
+        if args.model:
+            # Attempt to load from Hugging Face
+            try:
+                logging.info(f"Attempting to load model from Hugging Face repository '{args.model}'.")
+                model = get_model_from_hf(args.model, device)
+                logging.info("Successfully loaded model from Hugging Face.")
+                return model, initialized_from_scratch
+            except Exception as e:
+                logging.warning(f"Failed to load model from Hugging Face: {e}")
+                logging.info("Attempting to load model from local 'model/model_weights.pth'.")
+        else:
+            logging.info("No Hugging Face model specified. Attempting to load model from local 'model/model_weights.pth'.")
+
+        # Attempt to load from local weights
+        try:
+            local_config_path = 'model/config.json'
+            if not os.path.exists(local_config_path):
+                raise FileNotFoundError(f"Local config file '{local_config_path}' not found.")
+            with open(local_config_path, 'r') as f:
+                config = json.load(f)
+            logging.info(f"Loaded local model configuration from '{local_config_path}'.")
+
+            expected_args = inspect.getfullargspec(SparseMoELanguageModel.__init__).args
+            if 'self' in expected_args:
+                expected_args.remove('self')
+            model_config = {k: config[k] for k in expected_args if k in config}
+            logging.info(f"Filtered model configuration: {model_config}")
+
+            model = SparseMoELanguageModel(**model_config)
+            model = model.to(device)
+            model = load_model_weights(model, 'model/model_weights.pth', device)
+            logging.info("Successfully loaded model from local 'model/model_weights.pth'.")
+            return model, initialized_from_scratch
+        except Exception as e:
+            logging.error(f"Failed to load model from local 'model/model_weights.pth': {e}")
+            logging.error("Could not load model from Hugging Face or local path.")
+            raise RuntimeError("Could not load model from Hugging Face or local path.")
 
 def prepare_optimizer(model):
     """
