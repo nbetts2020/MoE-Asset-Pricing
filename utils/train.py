@@ -14,8 +14,8 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
     logging.info("Starting training loop.")
 
     # Initialize dictionaries to track sector errors
-    sector_errors = {}  # cumulative errors per sector
-    sector_counts = {}  # counts per sector
+    sector_errors = {}  # Cumulative errors per sector
+    sector_counts = {}  # Counts per sector
 
     for epoch in range(epochs):
         logging.info(f"Start of Epoch {epoch + 1}/{epochs}")
@@ -30,10 +30,10 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
 
             # Determine new data limit and replay sample size based on replay buffer usage
             if replay_buffer is not None:
-                new_data_limit = 8  # fixed limit on new data samples per batch
+                new_data_limit = 8  # Fixed limit on new data samples per batch
                 replay_sample_size = BATCH_SIZE - new_data_limit
             else:
-                new_data_limit = BATCH_SIZE  # use entire batch for new data
+                new_data_limit = BATCH_SIZE  # Use entire batch for new data
                 replay_sample_size = 0
 
             # Prepare new data
@@ -81,16 +81,20 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                     si_loss = si.penalty()
                     loss += si_loss
 
-            scaler.scale(loss).backward()
-
             if si is not None:
-                si.update_omega(loss, batch_size=input_ids.size(0))
+                si.total_loss += loss.item() * input_ids.size(0)
+
+            scaler.scale(loss).backward()
 
             batch_count += 1
 
             if batch_count % accumulation_steps == 0 or (batch_idx == len(dataloader) - 1):
                 scaler.step(optimizer)
                 scaler.update()
+
+                if si is not None:
+                    si.update_omega()
+
                 optimizer.zero_grad()
 
             total_loss += loss.item()
