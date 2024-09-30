@@ -19,7 +19,7 @@ class SynapticIntelligence:
         self.previous_params = {}
         self.accumulated_gradients = {}
         self.total_path = 0.0
-        self.epsilon = 1e-8  # Small constant to prevent division by zero
+        self.epsilon = 1e-8  # to prevent division by zero
 
         # Initialize omega and theta_star
         for name, param in self.model.named_parameters():
