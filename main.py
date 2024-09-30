@@ -134,7 +134,7 @@ def main():
             df = get_data()
             df = df[df['weighted_avg_720_hrs'] > 0] # checking if market data is valid
             _, test_df = train_test_split(df, test_size=0.15, random_state=42)
-            test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=16, shuffle=False)
+            test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
             logging.info(f"Prepared DataLoader with {len(test_dataloader.dataset)} test samples.")
             predictions, actuals = [], []
             model.eval()
