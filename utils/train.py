@@ -6,14 +6,16 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import logging
 
+from utils.config import *
+
 def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulation_steps=1, replay_buffer=None):
     model.train()
     scaler = GradScaler()
     logging.info("Starting training loop.")
 
     # Initialize dictionaries to track sector errors
-    sector_errors = {}  # Cumulative errors per sector
-    sector_counts = {}  # Counts per sector
+    sector_errors = {}  # cumulative errors per sector
+    sector_counts = {}  # counts per sector
 
     for epoch in range(epochs):
         logging.info(f"Start of Epoch {epoch + 1}/{epochs}")
@@ -25,19 +27,22 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")):
-            # Limit new data per batch
-            new_data_limit = 8  # Fixed limit on new data samples per batch
-            batch_size = 16     # Total batch size
+
+            # Determine new data limit and replay sample size based on replay buffer usage
+            if replay_buffer is not None:
+                new_data_limit = 8  # fixed limit on new data samples per batch
+                replay_sample_size = BATCH_SIZE - new_data_limit
+            else:
+                new_data_limit = BATCH_SIZE  # use entire batch for new data
+                replay_sample_size = 0
 
             # Prepare new data
             new_input_ids = batch['input_ids'][:new_data_limit].to(device)
             new_labels = batch['labels'][:new_data_limit].to(device)
-            new_sectors = batch['sector'][:new_data_limit]  # Assuming 'sector' is included in batch
+            new_sectors = batch['sector'][:new_data_limit]
 
             # Sample from replay buffer to fill the rest of the batch
-            replay_sample_size = batch_size - new_input_ids.size(0)
-
-            if replay_buffer is not None and replay_sample_size > 0:
+            if replay_sample_size > 0 and replay_buffer is not None:
                 # Calculate average sector errors
                 if sector_counts:
                     average_sector_errors = {
@@ -58,10 +63,12 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                     labels = torch.cat([new_labels, replay_labels], dim=0)
                     sectors = list(new_sectors) + replay_sectors
                 else:
+                    # If replay buffer is empty, use only new data
                     input_ids = new_input_ids
                     labels = new_labels
                     sectors = new_sectors
             else:
+                # If replay buffer is not used or no samples to replay, use only new data
                 input_ids = new_input_ids
                 labels = new_labels
                 sectors = new_sectors
@@ -119,7 +126,7 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                 errors.append(batch_errors[i])
 
             # Add samples and errors to the replay buffer
-            if replay_buffer is not None:
+            if replay_buffer is not None and replay_sample_size > 0:
                 replay_buffer.add_examples(batch_samples, errors)
 
         if si is not None:
