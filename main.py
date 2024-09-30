@@ -41,6 +41,7 @@ def main():
     parser.add_argument('--use_si', action='store_true', help="Use Synaptic Intelligence during training or updating.")
     parser.add_argument('--use_replay_buffer', action='store_true', help="Use Memory Replay Buffer during training or updating.")
     parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
+    parser.add_argument('--replay_buffer_capacity', type=int, default=10000, help="Capacity of the Memory Replay Buffer.")
 
     args = parser.parse_args()
 
