@@ -64,9 +64,9 @@ def main():
         # Prepare data
         train_dataloader, accumulation_steps = prepare_data(args, tokenizer)
         # Initialize SI - if --use_si is True
-        si = initialize_si(model, args)
+        si = initialize_si(model, args) if args.use_si else None
         # Initialize replay buffer - if --use_replay_buffer is True
-        replay_buffer = initialize_replay_buffer(args)
+        replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
         # Train the model
         logging.info("Starting training...")
         train_model(
@@ -99,9 +99,9 @@ def main():
         # Prepare data
         train_dataloader, accumulation_steps = prepare_data(args, tokenizer)
         # Initialize SI - if --use_si is True
-        si = initialize_si(model, args)
+        si = initialize_si(model, args) if args.use_si else None
         # Initialize replay buffer - if --use_replay_buffer is True
-        replay_buffer = initialize_replay_buffer(args)
+        replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
         # Update the model
         logging.info("Starting updating...")
         train_model(
