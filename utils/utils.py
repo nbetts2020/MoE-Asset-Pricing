@@ -21,6 +21,7 @@ import json
 from huggingface_hub import hf_hub_download
 
 from utils.si import SynapticIntelligence
+from utils.memory_replay_buffer import MemoryReplayBuffer
 
 import logging
 
