@@ -56,6 +56,7 @@ def main():
     if args.mode == 'train':
         # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
+        print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
         if initialized_from_scratch:
             # Apply Kaiming initialization
             model.apply(kaiming_init_weights)
@@ -91,6 +92,7 @@ def main():
         try:
             model, _ = initialize_model(args, device, init_from_scratch=False)
             logging.info("Loaded pre-trained model for updating.")
+            print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
         except RuntimeError as e:
             logging.error(str(e))
             print("Error: Could not load model for updating.")
@@ -124,6 +126,7 @@ def main():
         try:
             model, _ = initialize_model(args, device, init_from_scratch=False)
             logging.info("Model is ready for inference.")
+            print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
         except RuntimeError as e:
             logging.error(str(e))
             print("Error: Could not load model for inference.")
@@ -174,6 +177,7 @@ def main():
         try:
             model, _ = initialize_model(args, device, init_from_scratch=False)
             logging.info("Loaded model weights for testing forgetting.")
+            print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
         except RuntimeError as e:
             logging.error(str(e))
             print("Error: Could not load model for testing forgetting.")
