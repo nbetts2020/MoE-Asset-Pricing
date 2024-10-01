@@ -20,6 +20,8 @@ from transformers import AutoTokenizer
 import json
 from huggingface_hub import hf_hub_download
 
+from utils.si import SynapticIntelligence
+
 import logging
 
 import inspect
