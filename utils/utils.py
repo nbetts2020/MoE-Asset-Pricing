@@ -67,6 +67,11 @@ def get_model_from_hf(model_repo_id, device):
     Returns:
         SparseMoELanguageModel: The model loaded with weights from Hugging Face.
     """
+    load_dotenv('/content/MoE-Asset-Pricing/.env')
+    hf_token = os.getenv('HF_TOKEN')
+
+    login(hf_token)
+    
     logging.info(f"Downloading 'config.json' from Hugging Face repository '{model_repo_id}'.")
     try:
         config_path = hf_hub_download(repo_id=model_repo_id, filename="config.json")
