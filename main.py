@@ -42,6 +42,7 @@ def main():
     parser.add_argument('--use_replay_buffer', action='store_true', help="Use Memory Replay Buffer during training or updating.")
     parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
     parser.add_argument('--replay_buffer_capacity', type=int, default=10000, help="Capacity of the Memory Replay Buffer.")
+    parser.add_argument('--test_data', type=str, help="Path or Hugging Face dataset ID for the test set.", default=None)
 
     args = parser.parse_args()
 
@@ -69,6 +70,13 @@ def main():
         si = initialize_si(model, args) if args.use_si else None
         # Initialize replay buffer - if --use_replay_buffer is True
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
+        if args.test_data:
+            test_df = get_data(args.test_data)
+            test_df = test_df[test_df['weighted_avg_720_hrs'] > 0]  # Filter valid market data
+            test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
+            logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
+        else:
+            test_dataloader = None
         # Train the model
         logging.info("Starting training...")
         train_model(
@@ -79,7 +87,8 @@ def main():
             train_dataloader,
             si=si,
             accumulation_steps=accumulation_steps,
-            replay_buffer=replay_buffer
+            replay_buffer=replay_buffer,
+            test_dataloader=test_dataloader
         )
         logging.info("Training completed.")
         # Save model and states
@@ -105,6 +114,13 @@ def main():
         si = initialize_si(model, args) if args.use_si else None
         # Initialize replay buffer - if --use_replay_buffer is True
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
+        if args.test_data:
+            test_df = get_data(args.test_data)
+            test_df = test_df[test_df['weighted_avg_720_hrs'] > 0]  # Filter valid market data
+            test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
+            logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
+        else:
+            test_dataloader = None
         # Update the model
         logging.info("Starting updating...")
         train_model(
@@ -115,7 +131,8 @@ def main():
             train_dataloader,
             si=si,
             accumulation_steps=accumulation_steps,
-            replay_buffer=replay_buffer
+            replay_buffer=replay_buffer,
+            test_dataloader=test_dataloader
         )
         logging.info("Updating completed.")
         # Save model and states
