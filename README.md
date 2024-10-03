@@ -133,22 +133,22 @@ Elastic Weight Consolidation (EWC) estimates the importance of each parameter by
 
 1. **Compute Fisher Information**:
     - Calculate the Fisher Information $F_i$ for each parameter $\theta_i$:
-    \[
-    F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]
-    \]
+
+   $F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]$
+    
     - This quantifies how much the probability of the correct prediction changes with small variations in $\theta_i$.
 
-2. **Regularization Term**:
+3. **Regularization Term**:
     - Incorporate the Fisher Information into the loss function to penalize significant changes to important parameters:
     \[
     \mathcal{L}_{\text{total}} = \mathcal{L}_B(\theta) + \sum_{i} \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2
     \]
     - Here, $\mathcal{L}_B(\theta)$ is the loss for Task B, $\lambda$ controls the regularization strength, and $\theta_{A,i}^*$ are the parameter values after Task A.
 
-3. **Parameter Update**:
+4. **Parameter Update**:
     - During training on Task B, parameters with higher $F_i$ receive larger penalties for changes, thereby protecting essential knowledge from Task A.
 
-4. **Integration with Training Loop**:
+5. **Integration with Training Loop**:
     - The EWC regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that are far more aware of the importance of each parameter.
 
 \[
