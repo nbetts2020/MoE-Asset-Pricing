@@ -43,8 +43,12 @@ def main():
     parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
     parser.add_argument('--replay_buffer_capacity', type=int, default=10000, help="Capacity of the Memory Replay Buffer.")
     parser.add_argument('--percent_data', type=float, default=100.0, help="Percentage of data to use (0 < percent_data <= 100).")
+    parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
 
     args = parser.parse_args()
+
+    if not (0 < args.percent_data <= 100):
+        raise ValueError("Invalid value for --percent_data. It must be between 0 and 100.")
 
     torch.manual_seed(1337)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,7 +88,7 @@ def main():
         )
         logging.info("Training completed.")
     
-        if update_dataloader:
+        if args.update and update_dataloader:
             # Update the model with update data
             logging.info("Starting model update with update data...")
             train_model(
