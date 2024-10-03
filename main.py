@@ -26,6 +26,9 @@ from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+import numpy as np
+import random
+
 from utils.memory_replay_buffer import MemoryReplayBuffer
 
 # Configure logging
@@ -46,7 +49,7 @@ def main():
     parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
     parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
 
-    args = parser.parse_args
+    args = parser.parse_args()
 
     random_seed = args.random_seed
     torch.manual_seed(random_seed)
