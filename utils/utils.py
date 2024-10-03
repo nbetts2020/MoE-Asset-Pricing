@@ -315,36 +315,51 @@ def prepare_data(args, tokenizer):
     """
     Prepares the data for training or updating.
     """
-    percent_data = args.percent_data  # Get the percentage of data to use
+    percent_data = args.percent_data  # get percentage of data to use
     df = get_data(percent_data=percent_data)
+    print(len(df), "aahhhh")
     df = df.sort_values('Date')  # Ensure data is sorted by date
 
-    # Set random seed
     random_seed = args.random_seed
 
     if args.mode == 'train':
         if args.update:
-            # Update scenario: split into train, update, and test
-            total_samples = len(df)
-            train_size = int(0.6 * total_samples)
-            update_size = int(0.2 * total_samples)
-            test_size = total_samples - train_size - update_size
+            if isinstance(args.update, str):
+                # Update with new data from provided dataset URL
+                update_df = get_new_data(args.update)
+                logging.info(f"Loaded new update data from {args.update}")
+                # Split df into training and testing sets
+                train_df, test_df = train_test_split(
+                    df,
+                    test_size=0.1,
+                    random_state=random_seed,
+                    shuffle=True
+                )
+                logging.info(f"Data split into 90% train, 10% test.")
+            else:
+                # Update with existing data (80% train, 10% update, 10% test)
+                total_samples = len(df)
+                train_size = int(0.8 * total_samples)
+                update_size = int(0.1 * total_samples)
+                test_size = total_samples - train_size - update_size
 
-            train_df = df.iloc[:train_size]
-            update_df = df.iloc[train_size:train_size + update_size]
-            test_df = df.iloc[train_size + update_size:]
+                train_df = df.iloc[:train_size]
+                update_df = df.iloc[train_size:train_size + update_size]
+                test_df = df.iloc[train_size + update_size:]
+                logging.info(f"Data split into 80% train, 10% update, 10% test.")
         else:
-            # Normal training run: split into train and test
+            # Baseline: split into 90% train and 10% test
             train_df, test_df = train_test_split(
                 df,
-                test_size=0.2,
+                test_size=0.1,
                 random_state=random_seed,
                 shuffle=True
             )
-            update_df = None  # no update data in normal training run
+            update_df = None  # No update data in baseline
+            logging.info(f"Data split into 90% train, 10% test.")
 
         actual_batch_size = BATCH_SIZE
-        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size)
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size, shuffle=True)
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
         # Prepare test DataLoader
@@ -352,20 +367,21 @@ def prepare_data(args, tokenizer):
         logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
 
         # Prepare update DataLoader if in update mode
-        if update_df is not None:
-            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=actual_batch_size)
-            logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
+        if args.update and update_df is not None:
+            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=actual_batch_size, shuffle=True)
+            logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} update samples.")
         else:
             update_dataloader = None
 
         # Determine accumulation_steps
-        desired_effective_batch_size = 16  # Adjust as needed
+        desired_effective_batch_size = BATCH_SIZE
         accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
         logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
 
         return train_dataloader, test_dataloader, update_dataloader, accumulation_steps
 
     else:
+        # Other modes can be handled similarly
         return None, None, None, None
 
 def initialize_si(model, args):
