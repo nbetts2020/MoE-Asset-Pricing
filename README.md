@@ -111,7 +111,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-### Synaptic Intelligence
+### Synaptic Intelligence[^1][^2]
 
 Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
 
@@ -153,7 +153,7 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 
 The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
 
-### Memory Replay Buffer
+### Memory Replay Buffer^([1]()
 
 Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
@@ -231,3 +231,8 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 
 # Coming Soon
  - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as well.
+
+# Citations
+
+[^1]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
+[^2]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
