@@ -40,7 +40,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 **FlashAttention 2**[^2][^3]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
-**Online Learning**: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Fisher Information Regularization, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
+**Online Learning**[^4][^5]: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Fisher Information Regularization, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
 
 ## Model Architecture
 
@@ -67,10 +67,10 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 - **Tokenizer:** GPT-2
 
 - **Techniques Used**:
-  - **Gradient Checkpointing**: Reduces memory usage by recomputing intermediate activations during the backward pass.
+  - **Gradient Checkpointing**[^6][^7]: Reduces memory usage by recomputing intermediate activations during the backward pass.
   - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
   - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
-  - **Layer-wise Learning Rate Decay (LLRD)**: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
+  - **Layer-wise Learning Rate Decay (LLRD)**[^8]: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
 
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
 
@@ -111,7 +111,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-### Synaptic Intelligence[^6][^7]
+### Synaptic Intelligence[^9][^10]
 
 Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
 
@@ -153,7 +153,7 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 
 The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
 
-### Memory Replay Buffer[^7][^8][^9]
+### Memory Replay Buffer[^10][^11][^12]
 
 Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
@@ -239,7 +239,10 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 [^3]: Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022, May 27). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. arXiv.org. https://arxiv.org/abs/2205.14135
 [^4]: Hoi, S. C. H., Sahoo, D., Lu, J., & Zhao, P. (2018, February 8). Online Learning: A Comprehensive Survey. arXiv.org. https://arxiv.org/abs/1802.02871
 [^5]: Parisi, G. I., Kemker, R., Part, J. L., Kanan, C., & Wermter, S. (2019). Continual Lifelong Learning with Neural Networks: A Review. Neural Networks, 113, 54–71. https://doi.org/10.1016/j.neunet.2019.01.012
-[^6]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
-[^7]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
-[^8]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
-[^9]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
+[^6]: Griewank, A., & Walther, A. (2000). Algorithm 799: revolve. ACM Transactions on Mathematical Software, 26(1), 19–45. https://doi.org/10.1145/347837.347846
+[^7]: You, Y., Gitman, I., & Ginsburg, B. (2017, August 13). Large Batch Training of Convolutional Networks. arXiv.org. https://arxiv.org/abs/1708.03888
+[^8]: Chen, T., Xu, B., Zhang, C., & Guestrin, C. (2016, April 21). Training Deep Nets with Sublinear Memory Cost. arXiv.org. https://arxiv.org/abs/1604.06174
+[^9]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
+[^10]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
+[^11]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
+[^12]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
