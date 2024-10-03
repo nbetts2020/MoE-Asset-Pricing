@@ -143,7 +143,7 @@ Elastic Weight Consolidation (EWC) estimates the importance of each parameter by
   
       ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}%20=%20\mathcal{L}_B(\theta)%20+%20\sum_{i}%20\frac{\lambda}{2}%20F_i%20(\theta_i%20-%20\theta_{A,i}^*)^2)
        
-    - Here, $\mathcal{L}_B(\theta)$ is the loss for Task B, $\lambda$ controls the regularization strength, and $\theta_{A,i}^*$ are the parameter values after Task A.
+    - Here, $$\mathcal{L}_B(\theta)$$ is the loss for Task B, $\lambda$ controls the regularization strength, and $\theta_{A,i}^*$ are the parameter values after Task A.
 
 3. **Parameter Update**:
     - During training on Task B, parameters with higher $F_i$ receive larger penalties for changes, thereby protecting essential knowledge from Task A.
