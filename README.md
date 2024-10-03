@@ -151,9 +151,7 @@ Elastic Weight Consolidation (EWC) estimates the importance of each parameter by
 4. **Integration with Training Loop**:
     - The EWC regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that are far more aware of the importance of each parameter.
 
-
 $L(\theta) = L_B(\theta) + \sum_i \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2$
-
 
 - $\lambda$: Regularization strength
 - $\theta_{A,i}^*$: Optimal parameter values after Task A
