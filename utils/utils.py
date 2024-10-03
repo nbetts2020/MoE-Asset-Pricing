@@ -31,15 +31,20 @@ def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
 
-def get_data():
+def get_data(percent_data=100.0):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
 
     login(hf_token)
-    dataset = load_dataset("nbettencourt/SC454k-valid")
+    dataset = load_dataset("nbettencourt/SC454k")
     df = dataset['test'].to_pandas()
-    return df#.head(1024)
-
+    
+    total_samples = len(df)
+    num_samples = int((percent_data / 100.0) * total_samples)
+    df = df.head(num_samples)
+    
+    return df
+    
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
