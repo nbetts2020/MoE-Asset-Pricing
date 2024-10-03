@@ -125,28 +125,28 @@ Adapting to new data while preserving important past knowledge.
 
 Its namesake is derived by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-### Elastic Weight Consolidation (EWC)
+### Elastic Weight Consolidation
 
 Elastic Weight Consolidation (EWC) estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. In the context of sequential tasks, such as Task A (old) and Task B (new), EWC identifies weights important to Task A and penalizes their updates during training on Task B. This approach aims to stay within the low error region for Task A while learning Task B.
 
 **How it Works**:
 
 1. **Compute Fisher Information**:
-    - Calculate the Fisher Information \( F_i \) for each parameter \( \theta_i \):
+    - Calculate the Fisher Information $F_i$ for each parameter $\theta_i$:
     \[
     F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]
     \]
-    - This quantifies how much the probability of the correct prediction changes with small variations in \( \theta_i \).
+    - This quantifies how much the probability of the correct prediction changes with small variations in $\theta_i$.
 
 2. **Regularization Term**:
     - Incorporate the Fisher Information into the loss function to penalize significant changes to important parameters:
     \[
     \mathcal{L}_{\text{total}} = \mathcal{L}_B(\theta) + \sum_{i} \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2
     \]
-    - Here, \( \mathcal{L}_B(\theta) \) is the loss for Task B, \( \lambda \) controls the regularization strength, and \( \theta_{A,i}^* \) are the parameter values after Task A.
+    - Here, $\mathcal{L}_B(\theta)$ is the loss for Task B, $\lambda$ controls the regularization strength, and $\theta_{A,i}^*$ are the parameter values after Task A.
 
 3. **Parameter Update**:
-    - During training on Task B, parameters with higher \( F_i \) receive larger penalties for changes, thereby protecting essential knowledge from Task A.
+    - During training on Task B, parameters with higher $F_i$ receive larger penalties for changes, thereby protecting essential knowledge from Task A.
 
 4. **Integration with Training Loop**:
     - The EWC regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that are far more aware of the importance of each parameter.
@@ -155,9 +155,9 @@ Elastic Weight Consolidation (EWC) estimates the importance of each parameter by
 L(\theta) = L_B(\theta) + \sum_i \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2
 \]
 
-- \( \lambda \): Regularization strength
-- \( \theta_{A,i}^* \): Optimal parameter values after Task A
-- \( F_i \): Fisher Information for parameter \( \theta_i \)
+- $\lambda$: Regularization strength
+- $\theta_{A,i}^*$: Optimal parameter values after Task A
+- $F_i$: Fisher Information for parameter $\theta_i$
 
 This method borrows from a Bayesian learning perspective, where EWC leverages the Fisher Information Matrix to regularize the learning of new tasks while retaining important information from previous tasks. By prioritizing the preservation of critical parameters, EWC ensures that the model maintains its performance on older data while effectively adapting to new information.
 
