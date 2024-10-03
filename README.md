@@ -40,7 +40,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 **FlashAttention 2**[^2][^3]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
-**Online Learning**[^4][^5]: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Fisher Information Regularization, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
+**Online Learning**[^4][^5]: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Elastic Weight Consolidation, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
 
 ## Model Architecture
 
@@ -69,7 +69,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 - **Techniques Used**:
   - **Gradient Checkpointing**[^6][^7]: Reduces memory usage by recomputing intermediate activations during the backward pass.
   - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
-  - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
+  - **FlashAttention 2**[^2]: Efficient attention mechanism for handling long sequences.
   - **Layer-wise Learning Rate Decay (LLRD)**[^8]: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
 
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
@@ -80,7 +80,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 Online Learning, a methodology in which sequentially available data is used to update the predictor (the weights of a model) for future data at each step, has been an area of focus underrepresented in asset pricing, much less in the context of small cap stocks. Ergonomically, it caters well to the case wherein the data itself is generated as a function of time, such as a stock price. Yet, it doesn't come without its challenges, notably *catastrophic forgetting*. Catastrophic forgetting is a phenomenon in which neural networks, when paired with a form of continuous learning (such as online learning), become prone to forget how to perform older tasks as new tasks are learned. Biologically, humans generally do not suffer from the same predicament. The way we update our biological neural net doesn't necessarily override the neurons that are responsible for holding together old memories that may be useful in performing a task. Instead, the brain integrates new information by strengthening existing neural pathways and forming new connections, ensuring that old memories remain intact and accessible. This process, known as 'synaptic plasticity', allows for the retention and incorporation of both old and new information efficiently. Many algorithms attempt to replicate this special kind of plasticity-stability balance in ensuring consistency in learned prediction.
 
-Regularization of a model's parameters is one of the most commonly used strategies to mitigate catastrophic forgetting. By penalizing large updates to critical parameters during training, regularization helps ensure that the model retains its previously acquired knowledge while adapting to new information. Methods such as L2 regularization, Synaptic Intelligence, and Fisher Information Regularization, among others, constrain parameter updates in an effort to prevent drastic shifts in learned weights, albeit in different ways. Likewise, though more focused on the parameters of the gating network rather than the model's weights, Expert Routing Regularization is another form of regularization that adds a further layer of control by encouraging a more balanced selection of experts. This ensures that no expert becomes overly dominant or underutilized during training - both signs of overfitting and generalization loss. More creative approaches, such as the Memory Replay Buffer, introduce a complementary mechanism. Instead of relying solely on constraining parameter updates, replay buffers store key historical data samples. During training, the model can revisit these past data points alongside new information, akin to how humans recall and integrate past experiences while learning something new. While the literature on addressing catastrophic forgetting is certainly not scarce, there's no clear consensus on the optimal approach. Thus, the following five approaches have been implemented to test their efficacy:
+Regularization of a model's parameters is one of the most commonly used strategies to mitigate catastrophic forgetting. By penalizing large updates to critical parameters during training, regularization helps ensure that the model retains its previously acquired knowledge while adapting to new information. Methods such as L2 regularization, Synaptic Intelligence, and Elastic Weight Consolidation, among others, constrain parameter updates in an effort to prevent drastic shifts in learned weights, albeit in different ways. Likewise, though more focused on the parameters of the gating network rather than the model's weights, Expert Routing Regularization is another form of regularization that adds a further layer of control by encouraging a more balanced selection of experts. This ensures that no expert becomes overly dominant or underutilized during training - both signs of overfitting and generalization loss. More creative approaches, such as the Memory Replay Buffer, introduce a complementary mechanism. Instead of relying solely on constraining parameter updates, replay buffers store key historical data samples. During training, the model can revisit these past data points alongside new information, akin to how humans recall and integrate past experiences while learning something new. While the literature on addressing catastrophic forgetting is certainly not scarce, there's no clear consensus on the optimal approach. Thus, the following five approaches have been implemented to test their efficacy:
 
 ### Continual Learning with Regularization
 
@@ -125,33 +125,41 @@ Adapting to new data while preserving important past knowledge.
 
 Its namesake is derived by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-### Fisher Information Regularization
+### Elastic Weight Consolidation (EWC)
 
-*Coming Soon*. Fisher Information Regularization estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. By penalizing updates to parameters with high Fisher Information, the model preserves critical knowledge from previous tasks.
+Elastic Weight Consolidation (EWC) estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. In the context of sequential tasks, such as Task A (old) and Task B (new), EWC identifies weights important to Task A and penalizes their updates during training on Task B. This approach aims to stay within the low error region for Task A while learning Task B.
 
 **How it Works**:
 
 1. **Compute Fisher Information**:
-    - Calculate the Fisher Information $F_i$ for each parameter $\theta_i$:
-    
-      $F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]$
-    
-    - This measures how much the probability of the correct prediction changes with small variations in $\theta_i$.
+    - Calculate the Fisher Information \( F_i \) for each parameter \( \theta_i \):
+    \[
+    F_i = \mathbb{E}\left[ \left( \frac{\partial \log p(y | x, \theta)}{\partial \theta_i} \right)^2 \right]
+    \]
+    - This quantifies how much the probability of the correct prediction changes with small variations in \( \theta_i \).
 
 2. **Regularization Term**:
     - Incorporate the Fisher Information into the loss function to penalize significant changes to important parameters:
-    
-      ![Equation](https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}}=\mathcal{L}_{\text{task}}+\lambda\sum_{i}F_i(\theta_i-\theta_i^{\text{old}})^2)
-    
-    - Here, $\mathcal{L}_{\text{task}}$ is the original loss, $\lambda$ controls the strength of regularization, and $\theta_i^{\text{old}}$ represents the parameter values from previous tasks.
+    \[
+    \mathcal{L}_{\text{total}} = \mathcal{L}_B(\theta) + \sum_{i} \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2
+    \]
+    - Here, \( \mathcal{L}_B(\theta) \) is the loss for Task B, \( \lambda \) controls the regularization strength, and \( \theta_{A,i}^* \) are the parameter values after Task A.
 
 3. **Parameter Update**:
-    - During training, parameters with higher $F_i$ values receive larger penalties for changes, discouraging significant updates and thus protecting essential knowledge.
+    - During training on Task B, parameters with higher \( F_i \) receive larger penalties for changes, thereby protecting essential knowledge from Task A.
 
 4. **Integration with Training Loop**:
-    - The Fisher Information regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that respect the importance of each parameter.
+    - The EWC regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that are far more aware of the importance of each parameter.
 
-The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
+\[
+L(\theta) = L_B(\theta) + \sum_i \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2
+\]
+
+- \( \lambda \): Regularization strength
+- \( \theta_{A,i}^* \): Optimal parameter values after Task A
+- \( F_i \): Fisher Information for parameter \( \theta_i \)
+
+This method borrows from a Bayesian learning perspective, where EWC leverages the Fisher Information Matrix to regularize the learning of new tasks while retaining important information from previous tasks. By prioritizing the preservation of critical parameters, EWC ensures that the model maintains its performance on older data while effectively adapting to new information.
 
 ### Memory Replay Buffer[^10][^11][^12]
 
@@ -228,9 +236,6 @@ Where:
 The loss for a task is recalculated after training on each subsequent task to detect any increases in error, which would indicate forgetting. This looped evaluation provides insight into how well the model retains knowledge from previous tasks after learning new ones.
 
 By summing losses across all tasks, how the total error changes can be tracked, which helps quantify the extent of catastrophic forgetting. The goal is to minimize the increase in the total loss across all previous tasks as new tasks are introduced.
-
-# Coming Soon
- - **Online Learning**: As new data is always prevalent, would be beneficial to have a model that can update it's parameters 'on the fly' - planning to do some testing on how to address 'catastrophic forgetting', as well.
 
 # Citations
 
