@@ -32,13 +32,13 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
 ## Key Features
 
-**Sparse Mixture-of-Experts (MoE) Architecture**: An architecture in which $k$ experts are divvied up to solve a task, a popular technique as of recent, boasting similar performance yet less compute compared to their monolithic counterparts. To illustrate why this might be useful, let's think about the case of next token prediction. When handing the prompt “Tell me about President Eisenhower’s first inaugural address” to an LLM, little to no activation is present amongst the majority of the model’s neurons. In this instance, the model will not activate neurons tailored for subjects that are irrelevant towards the prompt. To name a few, neurons focused on technical computing, abstract mathematical theories, and deep scientific concepts, among many others, will stay inactive as their expertise holds, at most, a tangential connection with the prompt. This is, quite frankly, extremely inefficient. When dealing with a task that's already computationally expensive and faced with a shortage of GPUs, this inefficiency only compounds the issues. Thus, MoEs attempt to curtail this inefficiency by creating a number of models that each specialize in a certain task.
+**Sparse Mixture-of-Experts (MoE) Architecture**[^1]: An architecture in which $k$ experts are divvied up to solve a task, a popular technique as of recent, boasting similar performance yet less compute compared to their monolithic counterparts. To illustrate why this might be useful, let's think about the case of next token prediction. When handing the prompt “Tell me about President Eisenhower’s first inaugural address” to an LLM, little to no activation is present amongst the majority of the model’s neurons. In this instance, the model will not activate neurons tailored for subjects that are irrelevant towards the prompt. To name a few, neurons focused on technical computing, abstract mathematical theories, and deep scientific concepts, among many others, will stay inactive as their expertise holds, at most, a tangential connection with the prompt. This is, quite frankly, extremely inefficient. When dealing with a task that's already computationally expensive and faced with a shortage of GPUs, this inefficiency only compounds the issues. Thus, MoEs attempt to curtail this inefficiency by creating a number of models that each specialize in a certain task.
 
 **16k Context Window**: A relatively large context window was chosen to ensure the model has access to as much relevant information as possible. For a given input, the current article, along with its metadata (title, publication, author, etc.), are included in the context. Additionally, the previous 10 articles related to the stock are provided. Building on this further, stock prices from 96 hours, 48 hours, and 24 hours prior to the article's release, as well as the price at the time of the article's release, are included. This comprehensive data allows the model to consider both historical articles and market trends when making predictions.
 
 **Custom Training Pipeline:** Optimized for training on NVIDIA A100 GPUs, employing techniques like mixed precision and gradient checkpointing for efficient resource utilization.
 
-**FlashAttention 2**: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
+**FlashAttention 2**[^2][^3]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
 **Online Learning**: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Fisher Information Regularization, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
 
@@ -76,7 +76,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 
  Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - taken from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
 
-## Online Learning/Catastrophic Forgetting
+## Online Learning/Catastrophic Forgetting[^4][^5]
 
 Online Learning, a methodology in which sequentially available data is used to update the predictor (the weights of a model) for future data at each step, has been an area of focus underrepresented in asset pricing, much less in the context of small cap stocks. Ergonomically, it caters well to the case wherein the data itself is generated as a function of time, such as a stock price. Yet, it doesn't come without its challenges, notably *catastrophic forgetting*. Catastrophic forgetting is a phenomenon in which neural networks, when paired with a form of continuous learning (such as online learning), become prone to forget how to perform older tasks as new tasks are learned. Biologically, humans generally do not suffer from the same predicament. The way we update our biological neural net doesn't necessarily override the neurons that are responsible for holding together old memories that may be useful in performing a task. Instead, the brain integrates new information by strengthening existing neural pathways and forming new connections, ensuring that old memories remain intact and accessible. This process, known as 'synaptic plasticity', allows for the retention and incorporation of both old and new information efficiently. Many algorithms attempt to replicate this special kind of plasticity-stability balance in ensuring consistency in learned prediction.
 
@@ -111,7 +111,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-### Synaptic Intelligence[^1][^2]
+### Synaptic Intelligence[^6][^7]
 
 Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
 
@@ -153,7 +153,7 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 
 The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
 
-### Memory Replay Buffer[^2][^3][^4]
+### Memory Replay Buffer[^7][^8][^9]
 
 Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
@@ -234,7 +234,12 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 
 # Citations
 
-[^1]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
-[^2]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
-[^3]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
-[^4]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
+[^1]: Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017, January 23). Outrageously Large Neural Networks: the Sparsely-Gated Mixture-of-Experts Layer. arXiv.org. https://arxiv.org/abs/1701.06538
+[^2]: Dao, T. (2023, July 17). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. arXiv.org. https://arxiv.org/abs/2307.08691
+[^3]: Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022, May 27). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. arXiv.org. https://arxiv.org/abs/2205.14135
+[^4]: Hoi, S. C. H., Sahoo, D., Lu, J., & Zhao, P. (2018, February 8). Online Learning: A Comprehensive Survey. arXiv.org. https://arxiv.org/abs/1802.02871
+[^5]: Parisi, G. I., Kemker, R., Part, J. L., Kanan, C., & Wermter, S. (2019). Continual Lifelong Learning with Neural Networks: A Review. Neural Networks, 113, 54–71. https://doi.org/10.1016/j.neunet.2019.01.012
+[^6]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
+[^7]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
+[^8]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
+[^9]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
