@@ -317,8 +317,10 @@ def prepare_data(args, tokenizer):
     """
     percent_data = args.percent_data  # Get the percentage of data to use
     df = get_data(percent_data=percent_data)
-    df = df[df['weighted_avg_720_hrs'] > 0]
     df = df.sort_values('Date')  # Ensure data is sorted by date
+
+    # Set random seed
+    random_seed = args.random_seed
 
     if args.mode == 'train':
         if args.update:
@@ -333,8 +335,13 @@ def prepare_data(args, tokenizer):
             test_df = df.iloc[train_size + update_size:]
         else:
             # Normal training run: split into train and test
-            train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-            update_df = None  # No update data in normal training run
+            train_df, test_df = train_test_split(
+                df,
+                test_size=0.2,
+                random_state=random_seed,
+                shuffle=True
+            )
+            update_df = None  # no update data in normal training run
 
         actual_batch_size = BATCH_SIZE
         train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size)
