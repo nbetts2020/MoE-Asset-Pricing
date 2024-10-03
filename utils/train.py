@@ -8,7 +8,7 @@ import logging
 
 from utils.config import *
 
-def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulation_steps=1, replay_buffer=None):
+def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulation_steps=1, replay_buffer=None, test_dataloader=None):
     model.train()
     scaler = GradScaler()
     logging.info("Starting training loop.")
@@ -143,4 +143,32 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
 
         logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2 Score: {r2:.4f}")
 
+        # Evaluate on test set if provided
+        if test_dataloader is not None:
+            test_mse, test_r2 = evaluate_model(model, test_dataloader, device)
+            logging.info(f"Test Set Evaluation - MSE: {test_mse:.4f}, R2 Score: {test_r2:.4f}")
+
     logging.info("Training loop completed.")
+
+def evaluate_model(model, test_dataloader, device):
+    model.eval()
+    predictions = []
+    actuals = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader, desc="Evaluating on Test Set"):
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+
+            with torch.cuda.amp.autocast():
+                outputs, _ = model(input_ids=input_ids)
+
+            predictions.extend(outputs.detach().cpu().numpy())
+            actuals.extend(labels.cpu().numpy())
+
+    mse = mean_squared_error(actuals, predictions)
+    r2 = r2_score(actuals, predictions)
+
+    model.train()  # Set the model back to train mode after evaluation
+
+    return mse, r2
