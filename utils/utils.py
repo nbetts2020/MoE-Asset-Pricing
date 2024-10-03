@@ -314,32 +314,51 @@ def prepare_data(args, tokenizer):
     """
     Prepares the data for training or updating.
     """
+    percent_data = args.percent_data  # Get the percentage of data to use
+    df = get_data(percent_data=percent_data)
+    df = df[df['weighted_avg_720_hrs'] > 0]
+    df = df.sort_values('Date')  # Ensure data is sorted by date
+
     if args.mode == 'train':
-        # Load data and create DataLoader for initial training
-        df = get_data()
-        df = df[df['weighted_avg_720_hrs'] > 0]
-        train_df, test_df = train_test_split(df, test_size=0.15, random_state=42)
-        actual_batch_size = 16  # Adjust based on resources
+        if args.update:
+            # Update scenario: split into train, update, and test
+            total_samples = len(df)
+            train_size = int(0.6 * total_samples)
+            update_size = int(0.2 * total_samples)
+            test_size = total_samples - train_size - update_size
+
+            train_df = df.iloc[:train_size]
+            update_df = df.iloc[train_size:train_size + update_size]
+            test_df = df.iloc[train_size + update_size:]
+        else:
+            # Normal training run: split into train and test
+            train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+            update_df = None  # No update data in normal training run
+
+        actual_batch_size = BATCH_SIZE
         train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size)
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
-    elif args.mode == 'update':
-        # Load new data from Hugging Face URL
-        new_data_url = args.update
-        logging.info(f"Fetching new data from Hugging Face URL: {new_data_url}")
-        df_new = get_new_data(new_data_url)
-        logging.info(f"Fetched {len(df_new)} new data samples.")
-        df_new = df_new[df_new['weighted_avg_720_hrs'] > 0]
-        actual_batch_size = min(16, len(df_new))  # Adjust based on data size
-        train_dataloader = prepare_dataloader(df_new, tokenizer, batch_size=actual_batch_size)
-        logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} new training samples.")
-    else:
-        return None, None
 
-    # Determine accumulation_steps
-    desired_effective_batch_size = 16  # Adjust as needed
-    accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
-    logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
-    return train_dataloader, accumulation_steps
+        # Prepare test DataLoader
+        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
+        logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
+
+        # Prepare update DataLoader if in update mode
+        if update_df is not None:
+            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=actual_batch_size)
+            logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
+        else:
+            update_dataloader = None
+
+        # Determine accumulation_steps
+        desired_effective_batch_size = 16  # Adjust as needed
+        accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
+        logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
+
+        return train_dataloader, test_dataloader, update_dataloader, accumulation_steps
+
+    else:
+        return None, None, None, None
 
 def initialize_si(model, args):
     """
