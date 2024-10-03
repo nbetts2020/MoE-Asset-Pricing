@@ -153,7 +153,7 @@ Its namesake is derived by how the brain manages learning. Synapses, the connect
 
 The approach prioritizes preserving critical knowledge, ensuring that parameters conducive for previous tasks are less likely to be altered, thus maintaining performance on older data.
 
-### Memory Replay Buffer^([1]()
+### Memory Replay Buffer[^2][^3][^4]
 
 Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
@@ -236,3 +236,5 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 
 [^1]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
 [^2]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
+[^3]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
+[^4]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
