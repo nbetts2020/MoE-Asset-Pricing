@@ -145,8 +145,11 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
 
         # Evaluate on test set if provided
         if test_dataloader is not None:
-            test_mse, test_r2 = evaluate_model(model, test_dataloader, device)
-            logging.info(f"Test Set Evaluation - MSE: {test_mse:.4f}, R2 Score: {test_r2:.4f}")
+            test_mse, test_r2, sector_metrics = evaluate_model(model, test_dataloader, device)
+            logging.info(f"Test Set Evaluation - MSE: {test_mse:.4f}, R² Score: {test_r2:.4f}")
+            logging.info("Per-Sector Metrics:")
+            for sector, metrics in sector_metrics.items():
+                logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
 
     logging.info("Training loop completed.")
 
@@ -154,21 +157,41 @@ def evaluate_model(model, test_dataloader, device):
     model.eval()
     predictions = []
     actuals = []
+    sectors = []
 
     with torch.no_grad():
         for batch in tqdm(test_dataloader, desc="Evaluating on Test Set"):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
+            batch_sectors = batch['sector']
 
             with torch.cuda.amp.autocast():
                 outputs, _ = model(input_ids=input_ids)
 
             predictions.extend(outputs.detach().cpu().numpy())
             actuals.extend(labels.cpu().numpy())
+            sectors.extend(batch_sectors)  # Collect sectors
 
+    # Compute overall metrics
     mse = mean_squared_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
 
+    # Compute per-sector metrics
+    sector_metrics = {}
+    unique_sectors = set(sectors)
+    for sector in unique_sectors:
+        sector_indices = [i for i, s in enumerate(sectors) if s == sector]
+        sector_actuals = [actuals[i] for i in sector_indices]
+        sector_predictions = [predictions[i] for i in sector_indices]
+
+        sector_mse = mean_squared_error(sector_actuals, sector_predictions)
+        sector_r2 = r2_score(sector_actuals, sector_predictions)
+
+        sector_metrics[sector] = {
+            'mse': sector_mse,
+            'r2': sector_r2
+        }
+
     model.train()  # Set the model back to train mode after evaluation
 
-    return mse, r2
+    return mse, r2, sector_metrics
