@@ -44,8 +44,16 @@ def main():
     parser.add_argument('--replay_buffer_capacity', type=int, default=10000, help="Capacity of the Memory Replay Buffer.")
     parser.add_argument('--percent_data', type=float, default=100.0, help="Percentage of data to use (0 < percent_data <= 100).")
     parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
+    parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
 
-    args = parser.parse_args()
+    args = parser.parse_args
+
+    random_seed = args.random_seed
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+    torch.cuda.manual_seed_all(random_seed)
+    logging.info(f"Using random seed: {random_seed}")
 
     if not (0 < args.percent_data <= 100):
         raise ValueError("Invalid value for --percent_data. It must be between 0 and 100.")
