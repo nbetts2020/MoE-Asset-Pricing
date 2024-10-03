@@ -40,7 +40,7 @@ def main():
     parser.add_argument('input_text', type=str, nargs='?', help="Input article text (required if mode is 'run' without --test)", default=None)
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
-    parser.add_argument('--update', type=str, help="Hugging Face dataset URL for updating the model.", default=None)
+    parser.add_argument('--update', nargs='?', const=True, default=False, help="Include this flag to perform an update. Optionally provide a dataset URL for new data.")
     parser.add_argument('--use_si', action='store_true', help="Use Synaptic Intelligence during training or updating.")
     parser.add_argument('--use_replay_buffer', action='store_true', help="Use Memory Replay Buffer during training or updating.")
     parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
