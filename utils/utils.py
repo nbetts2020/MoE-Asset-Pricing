@@ -272,7 +272,7 @@ def initialize_model(args, device, init_from_scratch=False):
 
         # Attempt to load from local weights
         try:
-            local_config_path = 'model/config.json'
+            local_config_path = os.path.join(args.save_dir, 'config.json')
             if not os.path.exists(local_config_path):
                 raise FileNotFoundError(f"Local config file '{local_config_path}' not found.")
             with open(local_config_path, 'r') as f:
@@ -287,11 +287,12 @@ def initialize_model(args, device, init_from_scratch=False):
 
             model = SparseMoELanguageModel(**model_config)
             model = model.to(device)
-            model = load_model_weights(model, 'model/model_weights.pth', device)
-            logging.info("Successfully loaded model from local 'model/model_weights.pth'.")
+            model_weights_path = os.path.join(args.save_dir, 'model_weights.pth')
+            model = load_model_weights(model, model_weights_path, device)
+            logging.info(f"Successfully loaded model from local '{model_weights_path}'.")
             return model, initialized_from_scratch
         except Exception as e:
-            logging.error(f"Failed to load model from local 'model/model_weights.pth': {e}")
+            logging.error(f"Failed to load model from local '{local_config_path}': {e}")
             logging.error("Could not load model from Hugging Face or local path.")
             raise RuntimeError("Could not load model from Hugging Face or local path.")
 
@@ -398,14 +399,14 @@ def initialize_replay_buffer(args):
 
 def save_model_and_states(model, si, replay_buffer, args):
     """
-    Saves the model weights, SI state, and replay buffer.
+    Saves the model weights, SI state, and replay buffer to the specified save directory.
     """
-    os.makedirs('model', exist_ok=True)
-    torch.save(model.state_dict(), 'model/model_weights.pth')
-    logging.info("Model weights saved to 'model/model_weights.pth'.")
+    os.makedirs(args.save_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(args.save_dir, 'model_weights.pth'))
+    logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
     if args.use_si and si is not None:
-        si.save_state('model/si_state.pth')
-        logging.info("Synaptic Intelligence (SI) state saved to 'model/si_state.pth'.")
+        si.save_state(os.path.join(args.save_dir, 'si_state.pth'))
+        logging.info(f"Synaptic Intelligence (SI) state saved to '{os.path.join(args.save_dir, 'si_state.pth')}'.")
     if args.use_replay_buffer and replay_buffer is not None:
-        replay_buffer.save('model/replay_buffer.pth')
-        logging.info("Memory Replay Buffer saved to 'model/replay_buffer.pth'.")
+        replay_buffer.save(os.path.join(args.save_dir, 'replay_buffer.pth'))
+        logging.info(f"Memory Replay Buffer saved to '{os.path.join(args.save_dir, 'replay_buffer.pth')}'.")
