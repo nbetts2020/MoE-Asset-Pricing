@@ -193,10 +193,10 @@ def process_data(df, tokenizer):
 
     return articles, prices, sectors
 
-def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE):
+def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE, shuffle=True):
     articles, prices, sectors = process_data(df, tokenizer)
     dataset = ArticlePriceDataset(articles, prices, sectors, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     return dataloader
 
 def load_model_weights(model, filepath, device):
