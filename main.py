@@ -171,10 +171,13 @@ def main():
                     predictions.extend(outputs.cpu().numpy())
                     actuals.extend(labels.cpu().numpy())
             from sklearn.metrics import mean_absolute_error, r2_score
-            mae = mean_absolute_error(actuals, predictions)
-            r2 = r2_score(actuals, predictions)
-            print(f"Test MAE: {mae:.4f}, R2 Score: {r2:.4f}")
-            logging.info(f"Test MAE: {mae:.4f}, R2 Score: {r2:.4f}")
+            mse, r2, sector_metrics = evaluate_model(model, test_dataloader, device)
+            print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+            logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+            print("Per-Sector Metrics:")
+            for sector, metrics in sector_metrics.items():
+                print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
+                logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
         else:
             if not args.input_text:
                 raise ValueError("You must provide input text when mode is 'run' without --test")
