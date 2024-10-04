@@ -48,6 +48,8 @@ def main():
     parser.add_argument('--percent_data', type=float, default=100.0, help="Percentage of data to use (0 < percent_data <= 100).")
     parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
     parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument('--num_tasks', type=int, default=3, help="Number of tasks (sectors) to use in catastrophic forgetting testing.")
+
 
     args = parser.parse_args()
 
