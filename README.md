@@ -69,7 +69,7 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 - **Techniques Used**:
   - **Gradient Checkpointing**[^9][^10]: Reduces memory usage by recomputing intermediate activations during the backward pass.
   - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
-  - **FlashAttention 2**[^5]: Efficient attention mechanism for handling long sequences.
+  - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
   - **Layer-wise Learning Rate Decay (LLRD)**[^11]: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
 
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
