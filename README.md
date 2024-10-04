@@ -28,19 +28,19 @@ SC454k is a dataset of roughly 454k news articles and press releases related to 
 
 Scraping the non-pricing aspects of this dataset was conducted across 10 EC2 t2.large instances across two parts: scraping links, then the content of these links. Puppeteer, a headless Chrome browser in JavaScript, was used for lightweight, quick scraping. Data was subsequently cleaned with a combination of PySpark and NumPy. Pairing this with market data was made available through Wharton Research Data Services and their extensive collection of financial datasets. One collection of these datasets is the Trade and Quote Millisecond dataset (TAQ/MSEC), consisting of millisecond level access to the tick-by-tick trade and quote data of all activity within the U.S. National Market System. The process of pairing this pricing data with the timestamped news article/press release data through their API was magnitudes more tricky than meets the eye. The issue comes down to one thing: latency. The granularity of the API call can only be day-level, meaning a simple call to get the pricing data for say Apr. 3, 2020 will return around 10-15 thousand records of data, and because multiple prices are being retrieved for each news article/press release (I'm grabbing the price of the stock 4 days before, 2 days before, all the way to 30 days after with more granularity in between, totaling 18 different prices across 10 unique days), this is a large amount of data to pair, even with highly-optimized C++ code. Thus, the pairing algorithm went through a number of iterations to optimize efficiency such as promoting a more indexed-based approach to finding dates, a stringent approach to clearing out unused memory, and customized bash scripts for easy deployment of multiple EC2 instances. Ultimately, totaling around 1400 hours of compute across 41 (yes, 41) m7g.medium instances. Any values where no market data was available is denoted with a null value. The number of rows with complete market data totals just above 440k.
 
-Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial News Dataset in Time Series](https://arxiv.org/abs/2402.06698).
+Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial News Dataset in Time Series"[^4].
 
 ## Key Features
 
-**Sparse Mixture-of-Experts (MoE) Architecture**[^4]: An architecture in which $k$ experts are divvied up to solve a task, a popular technique as of recent, boasting similar performance yet less compute compared to their monolithic counterparts. To illustrate why this might be useful, let's think about the case of next token prediction. When handing the prompt “Tell me about President Eisenhower’s first inaugural address” to an LLM, little to no activation is present amongst the majority of the model’s neurons. In this instance, the model will not activate neurons tailored for subjects that are irrelevant towards the prompt. To name a few, neurons focused on technical computing, abstract mathematical theories, and deep scientific concepts, among many others, will stay inactive as their expertise holds, at most, a tangential connection with the prompt. This is, quite frankly, extremely inefficient. When dealing with a task that's already computationally expensive and faced with a shortage of GPUs, this inefficiency only compounds the issues. Thus, MoEs attempt to curtail this inefficiency by creating a number of models that each specialize in a certain task.
+**Sparse Mixture-of-Experts (MoE) Architecture**[^5]: An architecture in which $k$ experts are divvied up to solve a task, a popular technique as of recent, boasting similar performance yet less compute compared to their monolithic counterparts. To illustrate why this might be useful, let's think about the case of next token prediction. When handing the prompt “Tell me about President Eisenhower’s first inaugural address” to an LLM, little to no activation is present amongst the majority of the model’s neurons. In this instance, the model will not activate neurons tailored for subjects that are irrelevant towards the prompt. To name a few, neurons focused on technical computing, abstract mathematical theories, and deep scientific concepts, among many others, will stay inactive as their expertise holds, at most, a tangential connection with the prompt. This is, quite frankly, extremely inefficient. When dealing with a task that's already computationally expensive and faced with a shortage of GPUs, this inefficiency only compounds the issues. Thus, MoEs attempt to curtail this inefficiency by creating a number of models that each specialize in a certain task.
 
 **16k Context Window**: A relatively large context window was chosen to ensure the model has access to as much relevant information as possible. For a given input, the current article, along with its metadata (title, publication, author, etc.), are included in the context. Additionally, the previous 10 articles related to the stock are provided. Building on this further, stock prices from 96 hours, 48 hours, and 24 hours prior to the article's release, as well as the price at the time of the article's release, are included. This comprehensive data allows the model to consider both historical articles and market trends when making predictions.
 
 **Custom Training Pipeline:** Optimized for training on NVIDIA A100 GPUs, employing techniques like mixed precision and gradient checkpointing for efficient resource utilization.
 
-**FlashAttention 2**[^5][^6]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
+**FlashAttention 2**[^6][^7]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
-**Online Learning**[^7][^8]: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Elastic Weight Consolidation, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
+**Online Learning**[^8][^9]: Designed to continuously adapt to new data streams, ensuring the model remains up-to-date with the latest market trends and information. By leveraging techniques such as Synaptic Intelligence, Memory Replay Buffers, Elastic Weight Consolidation, and others, the model effectively mitigates catastrophic forgetting, maintaining its predictive accuracy over time while incorporating new insights.
 
 ## Model Architecture
 
@@ -67,22 +67,22 @@ Inspiration for this dataset was taken from [FNSPID: A Comprehensive Financial N
 - **Tokenizer:** GPT-2
 
 - **Techniques Used**:
-  - **Gradient Checkpointing**[^9][^10]: Reduces memory usage by recomputing intermediate activations during the backward pass.
+  - **Gradient Checkpointing**[^10][^11]: Reduces memory usage by recomputing intermediate activations during the backward pass.
   - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
   - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
-  - **Layer-wise Learning Rate Decay (LLRD)**[^11]: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
+  - **Layer-wise Learning Rate Decay (LLRD)**[^12]: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
 
  As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
 
  Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - taken from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
 
-## Online Learning/Catastrophic Forgetting[^7][^8]
+## Online Learning/Catastrophic Forgetting[^8][^9]
 
 Online Learning, a methodology in which sequentially available data is used to update the predictor (the weights of a model) for future data at each step, has been an area of focus underrepresented in asset pricing, much less in the context of small cap stocks. Ergonomically, it caters well to the case wherein the data itself is generated as a function of time, such as a stock price. Yet, it doesn't come without its challenges, notably *catastrophic forgetting*. Catastrophic forgetting is a phenomenon in which neural networks, when paired with a form of continuous learning (such as online learning), become prone to forget how to perform older tasks as new tasks are learned. Biologically, humans generally do not suffer from the same predicament. The way we update our biological neural net doesn't necessarily override the neurons that are responsible for holding together old memories that may be useful in performing a task. Instead, the brain integrates new information by strengthening existing neural pathways and forming new connections, ensuring that old memories remain intact and accessible. This process, known as 'synaptic plasticity', allows for the retention and incorporation of both old and new information efficiently. Many algorithms attempt to replicate this special kind of plasticity-stability balance in ensuring consistency in learned prediction.
 
 Regularization of a model's parameters is one of the most commonly used strategies to mitigate catastrophic forgetting. By penalizing large updates to critical parameters during training, regularization helps ensure that the model retains its previously acquired knowledge while adapting to new information. Methods such as L2 regularization, Synaptic Intelligence, and Elastic Weight Consolidation, among others, constrain parameter updates in an effort to prevent drastic shifts in learned weights, albeit in different ways. Likewise, though more focused on the parameters of the gating network rather than the model's weights, Expert Routing Regularization is another form of regularization that adds a further layer of control by encouraging a more balanced selection of experts. This ensures that no expert becomes overly dominant or underutilized during training - both signs of overfitting and generalization loss. More creative approaches, such as the Memory Replay Buffer, introduce a complementary mechanism. Instead of relying solely on constraining parameter updates, replay buffers store key historical data samples. During training, the model can revisit these past data points alongside new information, akin to how humans recall and integrate past experiences while learning something new. While the literature on addressing catastrophic forgetting is certainly not scarce, there's no clear consensus on the optimal approach. Thus, the following five approaches have been implemented to test their efficacy:
 
-### Continual Learning with Regularization[^12][^13][^14]
+### Continual Learning with Regularization[^13][^14][^15]
 
 *Coming Soon*. L2 regularization, while differing from other regularization approaches here due to its lack of task-specificity, provides a more general approach to stabilizing essential weights during updates. Continuing from the idea of regularization, Continual Learning with Regularization via L2 regularization aims to stabilize the model's parameters by penalizing large weight updates, thereby encouraging smoother transitions during updates. Unlike other task-specific methods, a penalty is applied across all parameters, regardless of their relevance to past tasks. This makes it a more general form of regularization, helping the model resist drastic weight changes during updates without specifically focusing on critical parameters.
 
@@ -97,7 +97,7 @@ Where:
 
 This regularization discourages large parameter values, ensuring the model maintains smoother gradients when adjusting to new data. Though not task-specific, its significance lies in its simplicity and ability to be a baseline, guiding reference to other regularization methods.
 
-### Expert Routing Regularization[^15][^16]
+### Expert Routing Regularization[^16][^17]
 
 *Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting a balanced load across experts, various approaches to regularizing the expert routing mechanism include:
 
@@ -111,7 +111,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-### Synaptic Intelligence[^14][^17]
+### Synaptic Intelligence[^15][^18]
 
 Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
 
@@ -125,7 +125,7 @@ Adapting to new data while preserving important past knowledge.
 
 Its namesake is derived by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-### Elastic Weight Consolidation[^13][^14]
+### Elastic Weight Consolidation[^14][^15]
 
 Elastic Weight Consolidation (EWC) estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. In the context of sequential tasks, such as Task A (old) and Task B (new), EWC identifies weights important to Task A and penalizes their updates during training on Task B. This approach aims to stay within the low error region for Task A while learning Task B.
 
@@ -162,7 +162,7 @@ $L(\theta) = L_B(\theta) + \sum_i \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}
 
 This method borrows from a Bayesian learning perspective, where EWC leverages the Fisher Information Matrix to regularize the learning of new tasks while retaining important information from previous tasks. By prioritizing the preservation of critical parameters, EWC ensures that the model maintains its performance on older data while effectively adapting to new information.
 
-### Memory Replay Buffer[^14][^18][^19]
+### Memory Replay Buffer[^15][^19][^20]
 
 Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
@@ -243,19 +243,20 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 [^1]: Chen, L., Pelger, M., & Zhu, J. (2019, March 11). Deep Learning in Asset Pricing. arXiv.org. https://arxiv.org/abs/1904.00745
 [^2]: Fan, J., Ke, Z. T., Liao, Y., & Neuhierl, A. (2022). Structural Deep Learning in Conditional Asset Pricing. SSRN Electronic Journal. https://doi.org/10.2139/ssrn.4117882
 [^3]: nbettencourt/SC454k · Datasets at Hugging Face. (n.d.). https://huggingface.co/datasets/nbettencourt/SC454k
-[^4]: Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017, January 23). Outrageously Large Neural Networks: the Sparsely-Gated Mixture-of-Experts Layer. arXiv.org. https://arxiv.org/abs/1701.06538
-[^5]: Dao, T. (2023, July 17). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. arXiv.org. https://arxiv.org/abs/2307.08691
-[^6]: Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022, May 27). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. arXiv.org. https://arxiv.org/abs/2205.14135
-[^7]: Hoi, S. C. H., Sahoo, D., Lu, J., & Zhao, P. (2018, February 8). Online Learning: A Comprehensive Survey. arXiv.org. https://arxiv.org/abs/1802.02871
-[^8]: Parisi, G. I., Kemker, R., Part, J. L., Kanan, C., & Wermter, S. (2019). Continual Lifelong Learning with Neural Networks: A Review. Neural Networks, 113, 54–71. https://doi.org/10.1016/j.neunet.2019.01.012
-[^9]: Griewank, A., & Walther, A. (2000). Algorithm 799: revolve. ACM Transactions on Mathematical Software, 26(1), 19–45. https://doi.org/10.1145/347837.347846
-[^10]: You, Y., Gitman, I., & Ginsburg, B. (2017, August 13). Large Batch Training of Convolutional Networks. arXiv.org. https://arxiv.org/abs/1708.03888
-[^11]: Chen, T., Xu, B., Zhang, C., & Guestrin, C. (2016, April 21). Training Deep Nets with Sublinear Memory Cost. arXiv.org. https://arxiv.org/abs/1604.06174
-[^12]: Zhao, X., Wang, H., Huang, W., & Lin, W. (2024, June 10). A Statistical Theory of Regularization-Based Continual Learning. arXiv.org. https://arxiv.org/abs/2406.06213
-[^13]: Kirkpatrick, James, et al. "Overcoming Catastrophic Forgetting in Neural Networks." 2017. arXiv, https://arxiv.org/pdf/1612.00796
-[^14]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
-[^15]: Lewis, M., Bhosale, S., Dettmers, T., Goyal, N., & Zettlemoyer, L. (2021, March 30). BASE Layers: Simplifying Training of Large, Sparse Models. arXiv.org. https://arxiv.org/abs/2103.16716
-[^16]: Fedus, W., Zoph, B., & Shazeer, N. (2021, January 11). Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity. arXiv.org. https://arxiv.org/abs/2101.03961
-[^17]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
-[^18]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
-[^19]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
+[^4]: Dong, Z., Fan, X., & Peng, Z. (2024, February 9). FNSPID: A Comprehensive Financial News Dataset in Time Series. arXiv.org. https://arxiv.org/abs/2402.06698
+[^5]: Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017, January 23). Outrageously Large Neural Networks: the Sparsely-Gated Mixture-of-Experts Layer. arXiv.org. https://arxiv.org/abs/1701.06538
+[^6]: Dao, T. (2023, July 17). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. arXiv.org. https://arxiv.org/abs/2307.08691
+[^7]: Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022, May 27). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. arXiv.org. https://arxiv.org/abs/2205.14135
+[^8]: Hoi, S. C. H., Sahoo, D., Lu, J., & Zhao, P. (2018, February 8). Online Learning: A Comprehensive Survey. arXiv.org. https://arxiv.org/abs/1802.02871
+[^9]: Parisi, G. I., Kemker, R., Part, J. L., Kanan, C., & Wermter, S. (2019). Continual Lifelong Learning with Neural Networks: A Review. Neural Networks, 113, 54–71. https://doi.org/10.1016/j.neunet.2019.01.012
+[^10]: Griewank, A., & Walther, A. (2000). Algorithm 799: revolve. ACM Transactions on Mathematical Software, 26(1), 19–45. https://doi.org/10.1145/347837.347846
+[^11]: You, Y., Gitman, I., & Ginsburg, B. (2017, August 13). Large Batch Training of Convolutional Networks. arXiv.org. https://arxiv.org/abs/1708.03888
+[^12]: Chen, T., Xu, B., Zhang, C., & Guestrin, C. (2016, April 21). Training Deep Nets with Sublinear Memory Cost. arXiv.org. https://arxiv.org/abs/1604.06174
+[^13]: Zhao, X., Wang, H., Huang, W., & Lin, W. (2024, June 10). A Statistical Theory of Regularization-Based Continual Learning. arXiv.org. https://arxiv.org/abs/2406.06213
+[^14]: Kirkpatrick, James, et al. "Overcoming Catastrophic Forgetting in Neural Networks." 2017. arXiv, https://arxiv.org/pdf/1612.00796
+[^15]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
+[^16]: Lewis, M., Bhosale, S., Dettmers, T., Goyal, N., & Zettlemoyer, L. (2021, March 30). BASE Layers: Simplifying Training of Large, Sparse Models. arXiv.org. https://arxiv.org/abs/2103.16716
+[^17]: Fedus, W., Zoph, B., & Shazeer, N. (2021, January 11). Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity. arXiv.org. https://arxiv.org/abs/2101.03961
+[^18]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
+[^19]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
+[^20]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
