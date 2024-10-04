@@ -50,7 +50,6 @@ def main():
     parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument('--num_tasks', type=int, default=3, help="Number of tasks (sectors) to use in catastrophic forgetting testing.")
 
-
     args = parser.parse_args()
 
     random_seed = args.random_seed
@@ -210,19 +209,31 @@ def main():
             print(f"Predicted Price: {prediction.item()}")
 
     elif args.mode == 'test_forgetting':
-        # Initialize model
-        try:
-            model, _ = initialize_model(args, device, init_from_scratch=False)
-            logging.info("Loaded model weights for testing forgetting.")
-            print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
-        except RuntimeError as e:
-            logging.error(str(e))
-            print("Error: Could not load model for testing forgetting.")
-            return
+        model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
+        logging.info("Initialized model for catastrophic forgetting testing.")
+        print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
+    
+        # Prepare optimizer
+        optimizer = prepare_optimizer(model)
+    
+        # Initialize SI if required
+        si = initialize_si(model, args) if args.use_si else None
+    
         # Test for forgetting
-        test_results = test_forgetting(model, device)
+        test_results = test_forgetting(
+            model=model,
+            optimizer=optimizer,
+            epochs=EPOCHS,
+            device=device,
+            tokenizer=tokenizer,
+            args=args,  # Pass the entire args object
+            si=si
+        )
+    
+        # Log and save the results
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
-
+        with open(os.path.join(args.save_dir, 'test_forgetting_results.json'), 'w') as f:
+            json.dump(test_results, f, indent=4)
     else:
         raise ValueError("Invalid mode selected. Choose from 'train', 'run', 'update', or 'test_forgetting'.")
 
