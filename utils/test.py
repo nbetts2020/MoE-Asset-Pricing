@@ -2,42 +2,111 @@
 
 import torch
 from sklearn.metrics import mean_squared_error, r2_score
+from utils.utils import get_data, prepare_dataloader
+from sklearn.model_selection import train_test_split
+import random
+import json  # for saving results
 
-def test_forgetting(model, tasks, optimizer, epochs, device, si=None):
+def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
     """
     Test the model for catastrophic forgetting across multiple tasks.
 
     Args:
         model (nn.Module): The model to test.
-        tasks (list of DataLoader): List of tasks (DataLoaders for each task).
         optimizer (torch.optim.Optimizer): Optimizer for training.
         epochs (int): Number of epochs for training each task.
         device (torch.device): Device (CPU or GPU).
-        si (SynapticIntelligence): Synaptic Intelligence object for regularization (optional).
+        tokenizer: Tokenizer for data preparation.
+        args: Argument parser object containing command-line arguments.
+        si (SynapticIntelligence): SI object for regularization (optional).
 
     Returns:
-        results (dict): Dictionary of performance metrics for each task across all stages of training.
+        results (dict): Performance metrics for each task across all stages.
     """
-    model.train()
     results = {}
+    model.train()
 
-    for i, task_dataloader in enumerate(tasks):
-        # Train on current task
-        print(f"Training on Task {i + 1}")
-        train_model(model, optimizer, epochs, device, task_dataloader, si=si)
+    # Set the random seed for reproducibility
+    random_seed = args.random_seed
+    random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+    torch.cuda.manual_seed_all(random_seed)
 
-        # After training on each task, evaluate on all tasks seen so far
-        for j, previous_task_dataloader in enumerate(tasks[:i + 1]):
-            print(f"Evaluating on Task {j + 1} after training on Task {i + 1}")
-            predictions, actuals = evaluate_task(model, previous_task_dataloader, device)
+    # Load data
+    df = get_data()
+    df = df[df['weighted_avg_720_hrs'] > 0]  # Ensure valid market data
+
+    # Select sectors with more than 1000 samples
+    sector_counts = df['Sector'].value_counts()
+    eligible_sectors = sector_counts[sector_counts >= 1000].index.tolist()
+
+    if len(eligible_sectors) < args.num_tasks:
+        raise ValueError(f"Not enough sectors with at least 1000 samples. Found {len(eligible_sectors)}, but num_tasks={args.num_tasks}")
+
+    # Randomly select k sectors
+    selected_sectors = random.sample(eligible_sectors, args.num_tasks)
+    print(f"Selected sectors: {selected_sectors}")
+    logging.info(f"Selected sectors: {selected_sectors}")
+
+    # Optional: Save the selected sectors to a file
+    sectors_file = os.path.join(args.save_dir, 'selected_sectors.json')
+    with open(sectors_file, 'w') as f:
+        json.dump(selected_sectors, f)
+    logging.info(f"Selected sectors saved to {sectors_file}")
+
+    tasks = []
+
+    # Prepare data loaders for each task
+    for sector in selected_sectors:
+        sector_df = df[df['Sector'] == sector]
+        train_df, test_df = train_test_split(sector_df, test_size=0.15, random_state=random_seed)
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True)
+        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
+        tasks.append({
+            'sector': sector,
+            'train_dataloader': train_dataloader,
+            'test_dataloader': test_dataloader
+        })
+
+    # Initialize SI if provided
+    if si:
+        si.initialize(model)
+
+    # Sequential Training and Evaluation
+    for i, task in enumerate(tasks):
+        sector = task['sector']
+        print(f"\nTraining on Task {i + 1}: Sector '{sector}'")
+        logging.info(f"Training on Task {i + 1}: Sector '{sector}'")
+        train_model(model, optimizer, epochs, device, task['train_dataloader'], si=si)
+
+        # Evaluate on all tasks seen so far
+        for j, prev_task in enumerate(tasks[:i + 1]):
+            prev_sector = prev_task['sector']
+            print(f"Evaluating on Task {j + 1}: Sector '{prev_sector}' after training on Task {i + 1}")
+            logging.info(f"Evaluating on Task {j + 1}: Sector '{prev_sector}' after training on Task {i + 1}")
+            predictions, actuals = evaluate_task(model, prev_task['test_dataloader'], device)
             mse = mean_squared_error(actuals, predictions)
             r2 = r2_score(actuals, predictions)
-            print(f"Task {j + 1} - MSE: {mse:.4f}, R2: {r2:.4f}")
+            print(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, R2: {r2:.4f}")
+            logging.info(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, R2: {r2:.4f}")
 
             # Store results
-            if f"Task_{j + 1}" not in results:
-                results[f"Task_{j + 1}"] = []
-            results[f"Task_{j + 1}"].append((mse, r2))
+            task_key = f"Task_{j + 1}_Sector_{prev_sector}"
+            if task_key not in results:
+                results[task_key] = []
+            results[task_key].append({
+                'trained_on_task': i + 1,
+                'mse': mse,
+                'r2': r2
+            })
+
+            # Optional: Print change in performance if not the first evaluation
+            if len(results[task_key]) > 1:
+                prev_mse = results[task_key][-2]['mse']
+                mse_change = mse - prev_mse
+                print(f"Change in MSE for Task {j + 1} (Sector '{prev_sector}') after training on Task {i + 1}: {mse_change:.4f}")
+                logging.info(f"Change in MSE for Task {j + 1} (Sector '{prev_sector}') after training on Task {i + 1}: {mse_change:.4f}")
 
     return results
 
