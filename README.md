@@ -97,7 +97,7 @@ Where:
 
 This regularization discourages large parameter values, ensuring the model maintains smoother gradients when adjusting to new data. Though not task-specific, its significance lies in its simplicity and ability to be a baseline, guiding reference to other regularization methods.
 
-### Expert Routing Regularization
+### Expert Routing Regularization[^9][^10]
 
 *Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting a balanced load across experts, various approaches to regularizing the expert routing mechanism include:
 
@@ -111,7 +111,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 where \$p_i$ is the probability of selecting expert $i$.
 
-### Synaptic Intelligence[^9][^10]
+### Synaptic Intelligence[^11][^12]
 
 Tracking the importance of each parameter during training, Synaptic Intelligence (SI) penalizes updates to critical parameters based on how much they contributed to previous tasks. The importance of each parameter, $\Omega_i$, is calculated using accumulated gradient information:
 
@@ -125,7 +125,7 @@ Adapting to new data while preserving important past knowledge.
 
 Its namesake is derived by how the brain manages learning. Synapses, the connections between neurons, strengthen or weaken over time based on the importance of memories or skills, a process known as *synaptic plasticity*. Similarly, SI helps the model prioritize and protect 'important' parameters from being overwritten, just as the brain retains key memories while still allowing us to learn new information.
 
-### Elastic Weight Consolidation
+### Elastic Weight Consolidation[^12][^13]
 
 Elastic Weight Consolidation (EWC) estimates the importance of each parameter by computing the Fisher Information Matrix, which measures the sensitivity of the model's predictions to changes in each parameter. In the context of sequential tasks, such as Task A (old) and Task B (new), EWC identifies weights important to Task A and penalizes their updates during training on Task B. This approach aims to stay within the low error region for Task A while learning Task B.
 
@@ -162,7 +162,7 @@ $L(\theta) = L_B(\theta) + \sum_i \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}
 
 This method borrows from a Bayesian learning perspective, where EWC leverages the Fisher Information Matrix to regularize the learning of new tasks while retaining important information from previous tasks. By prioritizing the preservation of critical parameters, EWC ensures that the model maintains its performance on older data while effectively adapting to new information.
 
-### Memory Replay Buffer[^10][^11][^12]
+### Memory Replay Buffer[^12][^14][^15]
 
 Differing from its 'regularization' counterparts, Memory Replay Buffers tackle catastrophic forgetting by revisiting historical data samples during training. The buffer stores a selection of past examples, and when new data is introduced, a mixture of old and new samples are replayed during the training process. This ensures that the model maintains performance on previous tasks while adapting to new information, much like how humans recall past experiences when learning something new.
 
@@ -248,7 +248,10 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 [^6]: Griewank, A., & Walther, A. (2000). Algorithm 799: revolve. ACM Transactions on Mathematical Software, 26(1), 19–45. https://doi.org/10.1145/347837.347846
 [^7]: You, Y., Gitman, I., & Ginsburg, B. (2017, August 13). Large Batch Training of Convolutional Networks. arXiv.org. https://arxiv.org/abs/1708.03888
 [^8]: Chen, T., Xu, B., Zhang, C., & Guestrin, C. (2016, April 21). Training Deep Nets with Sublinear Memory Cost. arXiv.org. https://arxiv.org/abs/1604.06174
-[^9]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
-[^10]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
-[^11]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
-[^12]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
+[^9]: Lewis, M., Bhosale, S., Dettmers, T., Goyal, N., & Zettlemoyer, L. (2021, March 30). BASE Layers: Simplifying Training of Large, Sparse Models. arXiv.org. https://arxiv.org/abs/2103.16716
+[^10]: Fedus, W., Zoph, B., & Shazeer, N. (2021, January 11). Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity. arXiv.org. https://arxiv.org/abs/2101.03961
+[^11]: Zenke, F., Poole, B., & Ganguli, S. (2017, March 13). Continual Learning Through Synaptic Intelligence. arXiv.org. https://arxiv.org/abs/1703.04200
+[^12]: Hand, Paul. "Continual Learning and Catastrophic Forgetting." 2020. YouTube, https://www.youtube.com/watch?v=vjaq03IYgSk
+[^13]: Kirkpatrick, James, et al. "Overcoming Catastrophic Forgetting in Neural Networks." 2017. arXiv, https://arxiv.org/pdf/1612.00796
+[^14]: Rolnick, D., Ahuja, A., Schwarz, J., Lillicrap, T. P., & Wayne, G. (2018, November 28). Experience Replay for Continual Learning. arXiv.org. https://arxiv.org/abs/1811.11682
+[^15]: Shin, Hanul, et al. "Continual Learning with Deep Generative Replay." 2017. arXiv, https://arxiv.org/pdf/1705.08690
