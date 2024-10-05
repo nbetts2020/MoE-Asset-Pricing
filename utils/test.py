@@ -1,7 +1,7 @@
 # utils/test.py
 
 import torch
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from utils.utils import get_data, prepare_dataloader
 from sklearn.model_selection import train_test_split
 import random
@@ -9,7 +9,6 @@ import json
 import logging
 from utils.train import train_model
 from utils.memory_replay_buffer import MemoryReplayBuffer
-
 from utils.config import *
 
 import numpy as np
@@ -76,20 +75,23 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             'test_dataloader': test_dataloader
         })
 
-    # Initialize SI if --use_si provided
+    # Initialize SI if provided
     if si:
         si.initialize(model)  # Initialize SI once before training
 
-    # Initialize replay buffer if --use_replay_buffer provided
+    # Initialize replay buffer if provided
     if replay_buffer:
         replay_buffer.initialize()
+
+    # Dictionary to store initial metrics for percentage change calculation
+    initial_metrics = {}
 
     # Sequential Training and Evaluation
     for i, task in enumerate(tasks):
         sector = task['sector']
         print(f"\nTraining on Task {i + 1}: Sector '{sector}'")
         logging.info(f"Training on Task {i + 1}: Sector '{sector}'")
-        
+
         # Train on current task
         train_model(
             model=model,
@@ -98,9 +100,9 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             device=device,
             dataloader=task['train_dataloader'],
             si=si,
-            accumulation_steps=1,
+            accumulation_steps=1,  # Adjust if needed
             replay_buffer=replay_buffer,
-            test_dataloader=None
+            test_dataloader=None  # Optionally provide test_dataloader
         )
 
         # Evaluate on all tasks seen so far
@@ -108,26 +110,69 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             prev_sector = prev_task['sector']
             print(f"Evaluating on Task {j + 1}: Sector '{prev_sector}' after training on Task {i + 1}")
             logging.info(f"Evaluating on Task {j + 1}: Sector '{prev_sector}' after training on Task {i + 1}")
-            mse, r2 = evaluate_task(model, prev_task['test_dataloader'], device)
-            print(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, R2: {r2:.4f}")
-            logging.info(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, R2: {r2:.4f}")
+            mse, rmse, mae, r2 = evaluate_task(model, prev_task['test_dataloader'], device)
+            print(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+            logging.info(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+
+            # Calculate percentage changes
+            task_key = f"Task_{j + 1}_Sector_{prev_sector}"
+            if task_key not in initial_metrics:
+                # Store initial metrics
+                initial_metrics[task_key] = {'mse': mse, 'rmse': rmse, 'mae': mae, 'r2': r2}
+
+            # Percentage change from initial metrics
+            initial_mse = initial_metrics[task_key]['mse']
+            initial_rmse = initial_metrics[task_key]['rmse']
+            initial_mae = initial_metrics[task_key]['mae']
+            initial_r2 = initial_metrics[task_key]['r2']
+
+            mse_pct_change = ((mse - initial_mse) / initial_mse) * 100 if initial_mse != 0 else 0
+            rmse_pct_change = ((rmse - initial_rmse) / initial_rmse) * 100 if initial_rmse != 0 else 0
+            mae_pct_change = ((mae - initial_mae) / initial_mae) * 100 if initial_mae != 0 else 0
+            r2_pct_change = ((r2 - initial_r2) / initial_r2) * 100 if initial_r2 != 0 else 0
 
             # Store results
-            task_key = f"Task_{j + 1}_Sector_{prev_sector}"
             if task_key not in results:
                 results[task_key] = []
             results[task_key].append({
                 'trained_on_task': i + 1,
                 'mse': mse,
-                'r2': r2
+                'rmse': rmse,
+                'mae': mae,
+                'r2': r2,
+                'mse_pct_change_from_initial': mse_pct_change,
+                'rmse_pct_change_from_initial': rmse_pct_change,
+                'mae_pct_change_from_initial': mae_pct_change,
+                'r2_pct_change_from_initial': r2_pct_change
             })
 
-            # Print change in performance if not the first evaluation
+            # Optional: Print percentage change from last iteration
             if len(results[task_key]) > 1:
-                prev_mse = results[task_key][-2]['mse']
-                mse_change = mse - prev_mse
-                print(f"Change in MSE for Task {j + 1} (Sector '{prev_sector}') after training on Task {i + 1}: {mse_change:.4f}")
-                logging.info(f"Change in MSE for Task {j + 1} (Sector '{prev_sector}') after training on Task {i + 1}: {mse_change:.4f}")
+                prev_metrics = results[task_key][-2]
+                prev_mse = prev_metrics['mse']
+                prev_rmse = prev_metrics['rmse']
+                prev_mae = prev_metrics['mae']
+                prev_r2 = prev_metrics['r2']
+
+                mse_pct_change_last = ((mse - prev_mse) / prev_mse) * 100 if prev_mse != 0 else 0
+                rmse_pct_change_last = ((rmse - prev_rmse) / prev_rmse) * 100 if prev_rmse != 0 else 0
+                mae_pct_change_last = ((mae - prev_mae) / prev_mae) * 100 if prev_mae != 0 else 0
+                r2_pct_change_last = ((r2 - prev_r2) / prev_r2) * 100 if prev_r2 != 0 else 0
+
+                # Add percentage changes from last iteration to the current result
+                results[task_key][-1]['mse_pct_change_from_last'] = mse_pct_change_last
+                results[task_key][-1]['rmse_pct_change_from_last'] = rmse_pct_change_last
+                results[task_key][-1]['mae_pct_change_from_last'] = mae_pct_change_last
+                results[task_key][-1]['r2_pct_change_from_last'] = r2_pct_change_last
+
+                print(f"Change in MSE for Task {j + 1} (Sector '{prev_sector}') after training on Task {i + 1}: {mse_pct_change_last:.2f}%")
+                logging.info(f"Change in MSE for Task {j + 1} (Sector '{prev_sector}') after training on Task {i + 1}: {mse_pct_change_last:.2f}%")
+            else:
+                # For the first result, percentage change from last is zero
+                results[task_key][-1]['mse_pct_change_from_last'] = 0
+                results[task_key][-1]['rmse_pct_change_from_last'] = 0
+                results[task_key][-1]['mae_pct_change_from_last'] = 0
+                results[task_key][-1]['r2_pct_change_from_last'] = 0
 
     return results
 
@@ -142,6 +187,8 @@ def evaluate_task(model, dataloader, device):
 
     Returns:
         mse (float): Mean Squared Error.
+        rmse (float): Root Mean Squared Error.
+        mae (float): Mean Absolute Error.
         r2 (float): R-squared score.
     """
     model.eval()
@@ -153,13 +200,26 @@ def evaluate_task(model, dataloader, device):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs, _ = model(input_ids=input_ids)
-            predictions.extend(outputs.squeeze().cpu().numpy())
-            actuals.extend(labels.cpu().numpy())
+            if device.type == 'cuda':
+                with torch.amp.autocast(device_type='cuda'):
+                    outputs, _ = model(input_ids=input_ids)
+            else:
+                outputs, _ = model(input_ids=input_ids)
 
-    # Compute metrics
+            outputs_np = outputs.detach().cpu().numpy()
+            labels_np = labels.detach().cpu().numpy()
+
+            # Ensure outputs_np and labels_np are 1D arrays
+            outputs_np = outputs_np.reshape(-1)
+            labels_np = labels_np.reshape(-1)
+
+            predictions.extend(outputs_np.tolist())
+            actuals.extend(labels_np.tolist())
+
     mse = mean_squared_error(actuals, predictions)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
 
     model.train()  # Set the model back to train mode
-    return mse, r2
+    return mse, rmse, mae, r2
