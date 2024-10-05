@@ -10,6 +10,8 @@ import logging
 from utils.train import train_model
 from utils.memory_replay_buffer import MemoryReplayBuffer
 
+from utils.config import *
+
 import numpy as np
 
 def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, replay_buffer=None):
