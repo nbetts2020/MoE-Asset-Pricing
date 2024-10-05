@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 import numpy as np
 import random
+import json
 
 from utils.memory_replay_buffer import MemoryReplayBuffer
 
@@ -69,6 +70,8 @@ def main():
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
+
+    os.makedirs(args.save_dir, exist_ok=True)
 
     if args.mode == 'train':
         # Initialize model from scratch
