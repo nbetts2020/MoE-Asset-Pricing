@@ -13,10 +13,6 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
     scaler = GradScaler()
     logging.info("Starting training loop.")
 
-    # Initialize dictionaries to track sector errors
-    sector_errors = {}  # Cumulative errors per sector
-    sector_counts = {}  # Counts per sector
-
     for epoch in range(epochs):
         logging.info(f"Start of Epoch {epoch + 1}/{epochs}")
         total_loss = 0.0
@@ -24,13 +20,12 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
         actuals = []
         batch_count = 0
 
-        optimizer.zero_grad()
-
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")):
+            optimizer.zero_grad()  # Zero gradients for each batch
 
             # Determine new data limit and replay sample size based on replay buffer usage
             if replay_buffer is not None:
-                new_data_limit = 8  # Fixed limit on new data samples per batch
+                new_data_limit = BATCH_SIZE // 2  # Use half the batch for new data
                 replay_sample_size = BATCH_SIZE - new_data_limit
             else:
                 new_data_limit = BATCH_SIZE  # Use entire batch for new data
@@ -43,16 +38,7 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
 
             # Sample from replay buffer to fill the rest of the batch
             if replay_sample_size > 0 and replay_buffer is not None:
-                # Calculate average sector errors
-                if sector_counts:
-                    average_sector_errors = {
-                        sector: sector_errors[sector] / sector_counts[sector]
-                        for sector in sector_errors
-                    }
-                else:
-                    average_sector_errors = {}
-
-                replay_samples = replay_buffer.sample(replay_sample_size, average_sector_errors)
+                replay_samples = replay_buffer.sample(replay_sample_size)
                 if replay_samples:
                     replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device)
                     replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device)
@@ -78,48 +64,22 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                 loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
 
                 if si is not None:
-                    si_loss = si.penalty()
+                    si_loss = si.penalty(model)
                     loss += si_loss
 
-            if si is not None:
-                si.total_loss += loss.item() * input_ids.size(0)
-
             scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            batch_count += 1
-
-            if batch_count % accumulation_steps == 0 or (batch_idx == len(dataloader) - 1):
-                scaler.step(optimizer)
-                scaler.update()
-
-                if si is not None:
-                    si.update_omega()
-
-                optimizer.zero_grad()
+            if si is not None:
+                si.update_omega(model)  # Update SI after each batch
 
             total_loss += loss.item()
             predictions.extend(outputs.detach().cpu().numpy())
             actuals.extend(labels.cpu().numpy())
 
-            # Compute errors for the batch
-            batch_errors = torch.abs(outputs.squeeze() - labels).detach().cpu().numpy()
-
-            # Update sector errors and counts
-            for i in range(len(sectors)):
-                sector = sectors[i]
-                error = batch_errors[i]
-
-                if sector not in sector_errors:
-                    sector_errors[sector] = 0.0
-                    sector_counts[sector] = 0
-
-                sector_errors[sector] += error
-                sector_counts[sector] += 1
-
             # Prepare samples to add to the replay buffer
             batch_samples = []
-            errors = []
-
             for i in range(labels.size(0)):
                 sample = {
                     'input_ids': input_ids[i].detach().cpu(),
@@ -127,14 +87,13 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                     'sector': sectors[i]
                 }
                 batch_samples.append(sample)
-                errors.append(batch_errors[i])
 
-            # Add samples and errors to the replay buffer
+            # Add samples to the replay buffer
             if replay_buffer is not None and replay_sample_size > 0:
-                replay_buffer.add_examples(batch_samples, errors)
+                replay_buffer.add_examples(batch_samples)
 
         if si is not None:
-            si.consolidate_omega()
+            si.consolidate_omega(model)  # Consolidate SI omega at the end of the epoch
             logging.info("Consolidated omega after epoch.")
 
         avg_loss = total_loss / len(dataloader)
@@ -143,55 +102,4 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
 
         logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2 Score: {r2:.4f}")
 
-        # Evaluate on test set if provided
-        if test_dataloader is not None:
-            test_mse, test_r2, sector_metrics = evaluate_model(model, test_dataloader, device)
-            logging.info(f"Test Set Evaluation - MSE: {test_mse:.4f}, R² Score: {test_r2:.4f}")
-            logging.info("Per-Sector Metrics:")
-            for sector, metrics in sector_metrics.items():
-                logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
-
     logging.info("Training loop completed.")
-
-def evaluate_model(model, test_dataloader, device):
-    model.eval()
-    predictions = []
-    actuals = []
-    sectors = []
-
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader, desc="Evaluating on Test Set"):
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            batch_sectors = batch['sector']
-
-            with torch.cuda.amp.autocast():
-                outputs, _ = model(input_ids=input_ids)
-
-            predictions.extend(outputs.detach().cpu().numpy())
-            actuals.extend(labels.cpu().numpy())
-            sectors.extend(batch_sectors)  # Collect sectors
-
-    # Compute overall metrics
-    mse = mean_squared_error(actuals, predictions)
-    r2 = r2_score(actuals, predictions)
-
-    # Compute per-sector metrics
-    sector_metrics = {}
-    unique_sectors = set(sectors)
-    for sector in unique_sectors:
-        sector_indices = [i for i, s in enumerate(sectors) if s == sector]
-        sector_actuals = [actuals[i] for i in sector_indices]
-        sector_predictions = [predictions[i] for i in sector_indices]
-
-        sector_mse = mean_squared_error(sector_actuals, sector_predictions)
-        sector_r2 = r2_score(sector_actuals, sector_predictions)
-
-        sector_metrics[sector] = {
-            'mse': sector_mse,
-            'r2': sector_r2
-        }
-
-    model.train()  # Set the model back to train mode after evaluation
-
-    return mse, r2, sector_metrics
