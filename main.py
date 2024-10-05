@@ -209,6 +209,7 @@ def main():
             print(f"Predicted Price: {prediction.item()}")
 
     elif args.mode == 'test_forgetting':
+        # Initialize model
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info("Initialized model for catastrophic forgetting testing.")
         print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
@@ -219,21 +220,25 @@ def main():
         # Initialize SI if required
         si = initialize_si(model, args) if args.use_si else None
     
-        # Test for forgetting
+        # Initialize replay buffer if required
+        replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
+    
         test_results = test_forgetting(
             model=model,
             optimizer=optimizer,
             epochs=EPOCHS,
             device=device,
             tokenizer=tokenizer,
-            args=args,  # Pass the entire args object
-            si=si
+            args=args,
+            si=si,
+            replay_buffer=replay_buffer
         )
     
         # Log and save the results
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
         with open(os.path.join(args.save_dir, 'test_forgetting_results.json'), 'w') as f:
             json.dump(test_results, f, indent=4)
+        
     else:
         raise ValueError("Invalid mode selected. Choose from 'train', 'run', 'update', or 'test_forgetting'.")
 
