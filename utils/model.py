@@ -28,10 +28,6 @@ class MultiHeadAttention(nn.Module):
         qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, 3, n_head, T, head_size)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each is (B, n_head, T, head_size)
 
-        q = q.half().contiguous()
-        k = k.half().contiguous()
-        v = v.half().contiguous()
-
         # Apply FlashAttention - note no attention mask
         attn_output = flash_attn_func(q, k, v, causal=True)  # (B, n_head, T, head_size)
 
@@ -143,16 +139,15 @@ class SparseMoELanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
         x = tok_emb + pos_emb  # (B, T, n_embed)
 
-        # Apply gradient checkpointing to each block
+        # Apply gradient checkpointing only during training
         for block in self.blocks:
-            x = checkpoint(block, x)  # Removed 'attention_mask'
+            if self.training:
+                x = checkpoint(block, x)
+            else:
+                x = block(x)
 
         x = self.ln_f(x)       # (B, T, n_embed)
-
-        # Mean pooling over the sequence length
         x = x.mean(dim=1)      # (B, n_embed)
-
-        # Regression head
         output = self.regression_head(x)  # (B, 1)
         output = output.squeeze(-1)       # (B,)
 
