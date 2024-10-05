@@ -146,7 +146,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
                 'r2_pct_change_from_initial': r2_pct_change
             })
 
-            # Optional: Print percentage change from last iteration
+            # Print percentage change from last iteration
             if len(results[task_key]) > 1:
                 prev_metrics = results[task_key][-2]
                 prev_mse = prev_metrics['mse']
