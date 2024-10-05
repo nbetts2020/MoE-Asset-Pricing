@@ -5,10 +5,12 @@ from sklearn.metrics import mean_squared_error, r2_score
 from utils.utils import get_data, prepare_dataloader
 from sklearn.model_selection import train_test_split
 import random
-import json  # For saving results
-import logging  # For logging
+import json
+import logging
 from utils.train import train_model
 from utils.memory_replay_buffer import MemoryReplayBuffer
+
+import numpy as np
 
 def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, replay_buffer=None):
     """
