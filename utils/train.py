@@ -1,5 +1,3 @@
-# train.py
-
 import torch
 from sklearn.metrics import mean_squared_error, r2_score
 from torch.cuda.amp import autocast, GradScaler
@@ -59,20 +57,32 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                 labels = new_labels
                 sectors = new_sectors
 
-            with autocast():
+            # Forward pass
+            if device.type == 'cuda':
+                with torch.amp.autocast(device_type='cuda'):
+                    outputs, _ = model(input_ids=input_ids)
+                    loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
+                    if si is not None:
+                        si_loss = si.penalty(model)
+                        loss += si_loss
+            else:
                 outputs, _ = model(input_ids=input_ids)
                 loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
-
                 if si is not None:
                     si_loss = si.penalty(model)
                     loss += si_loss
 
+            # Backward pass and optimization
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
 
-            if si is not None:
-                si.update_omega(model)  # Update SI after each batch
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+
+                if si is not None:
+                    si.update_omega(model)  # Update SI after each batch
+
+                optimizer.zero_grad()  # Reset gradients after each optimization step
 
             total_loss += loss.item()
             predictions.extend(outputs.detach().cpu().numpy())
@@ -92,6 +102,7 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
             if replay_buffer is not None and replay_sample_size > 0:
                 replay_buffer.add_examples(batch_samples)
 
+        # End of epoch actions
         if si is not None:
             si.consolidate_omega(model)  # Consolidate SI omega at the end of the epoch
             logging.info("Consolidated omega after epoch.")
