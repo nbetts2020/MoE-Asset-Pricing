@@ -5,9 +5,12 @@ from sklearn.metrics import mean_squared_error, r2_score
 from utils.utils import get_data, prepare_dataloader
 from sklearn.model_selection import train_test_split
 import random
-import json  # for saving results
+import json  # For saving results
+import logging  # For logging
+from utils.train import train_model
+from utils.memory_replay_buffer import MemoryReplayBuffer
 
-def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
+def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, replay_buffer=None):
     """
     Test the model for catastrophic forgetting across multiple tasks.
 
@@ -19,6 +22,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
         tokenizer: Tokenizer for data preparation.
         args: Argument parser object containing command-line arguments.
         si (SynapticIntelligence): SI object for regularization (optional).
+        replay_buffer (MemoryReplayBuffer): Replay buffer for experience replay (optional).
 
     Returns:
         results (dict): Performance metrics for each task across all stages.
@@ -26,7 +30,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
     results = {}
     model.train()
 
-    # Set the random seed for reproducibility
+    # Random seed for reproducibility
     random_seed = args.random_seed
     random.seed(random_seed)
     torch.manual_seed(random_seed)
@@ -34,7 +38,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
     torch.cuda.manual_seed_all(random_seed)
 
     # Load data
-    df = get_data()
+    df = get_data(percent_data=args.percent_data)
     df = df[df['weighted_avg_720_hrs'] > 0]  # Ensure valid market data
 
     # Select sectors with more than 1000 samples
@@ -49,11 +53,10 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
     print(f"Selected sectors: {selected_sectors}")
     logging.info(f"Selected sectors: {selected_sectors}")
 
-    # Optional: Save the selected sectors to a file
-    sectors_file = os.path.join(args.save_dir, 'selected_sectors.json')
-    with open(sectors_file, 'w') as f:
-        json.dump(selected_sectors, f)
-    logging.info(f"Selected sectors saved to {sectors_file}")
+    # sectors_file = os.path.join(args.save_dir, 'selected_sectors.json')
+    # with open(sectors_file, 'w') as f:
+    #     json.dump(selected_sectors, f)
+    # logging.info(f"Selected sectors saved to {sectors_file}")
 
     tasks = []
 
@@ -69,25 +72,39 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
             'test_dataloader': test_dataloader
         })
 
-    # Initialize SI if provided
+    # Initialize SI if --use_si provided
     if si:
-        si.initialize(model)
+        si.initialize(model)  # Initialize SI once before training
+
+    # Initialize replay buffer if --use_replay_buffer provided
+    if replay_buffer:
+        replay_buffer.initialize()
 
     # Sequential Training and Evaluation
     for i, task in enumerate(tasks):
         sector = task['sector']
         print(f"\nTraining on Task {i + 1}: Sector '{sector}'")
         logging.info(f"Training on Task {i + 1}: Sector '{sector}'")
-        train_model(model, optimizer, epochs, device, task['train_dataloader'], si=si)
+        
+        # Train on current task
+        train_model(
+            model=model,
+            optimizer=optimizer,
+            epochs=epochs,
+            device=device,
+            dataloader=task['train_dataloader'],
+            si=si,
+            accumulation_steps=1,
+            replay_buffer=replay_buffer,
+            test_dataloader=None
+        )
 
         # Evaluate on all tasks seen so far
         for j, prev_task in enumerate(tasks[:i + 1]):
             prev_sector = prev_task['sector']
             print(f"Evaluating on Task {j + 1}: Sector '{prev_sector}' after training on Task {i + 1}")
             logging.info(f"Evaluating on Task {j + 1}: Sector '{prev_sector}' after training on Task {i + 1}")
-            predictions, actuals = evaluate_task(model, prev_task['test_dataloader'], device)
-            mse = mean_squared_error(actuals, predictions)
-            r2 = r2_score(actuals, predictions)
+            mse, r2 = evaluate_task(model, prev_task['test_dataloader'], device)
             print(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, R2: {r2:.4f}")
             logging.info(f"Task {j + 1} - Sector '{prev_sector}' - MSE: {mse:.4f}, R2: {r2:.4f}")
 
@@ -101,7 +118,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None):
                 'r2': r2
             })
 
-            # Optional: Print change in performance if not the first evaluation
+            # Print change in performance if not the first evaluation
             if len(results[task_key]) > 1:
                 prev_mse = results[task_key][-2]['mse']
                 mse_change = mse - prev_mse
@@ -120,8 +137,8 @@ def evaluate_task(model, dataloader, device):
         device (torch.device): Device (CPU or GPU).
 
     Returns:
-        predictions (list): Model predictions.
-        actuals (list): Ground truth labels.
+        mse (float): Mean Squared Error.
+        r2 (float): R-squared score.
     """
     model.eval()
     predictions = []
@@ -132,8 +149,13 @@ def evaluate_task(model, dataloader, device):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs, _ = model(input_ids=input_ids, targets=labels)
-            predictions.extend(outputs.cpu().numpy())
+            outputs, _ = model(input_ids=input_ids)
+            predictions.extend(outputs.squeeze().cpu().numpy())
             actuals.extend(labels.cpu().numpy())
 
-    return predictions, actuals
+    # Compute metrics
+    mse = mean_squared_error(actuals, predictions)
+    r2 = r2_score(actuals, predictions)
+
+    model.train()  # Set the model back to train mode
+    return mse, r2
