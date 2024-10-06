@@ -75,9 +75,9 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             'test_dataloader': test_dataloader
         })
 
-    # Initialize SI if provided
-    if si:
-        si.initialize(model)  # Initialize SI once before training
+    # # Initialize SI if provided
+    # if si:
+    #     si.initialize(model)  # Initialize SI once before training
 
     # Initialize replay buffer if provided
     if replay_buffer:
