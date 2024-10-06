@@ -63,13 +63,13 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                     outputs, _ = model(input_ids=input_ids)
                     loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
                     if si is not None:
-                        si_loss = si.penalty(model)
+                        si_loss = si.penalty()
                         loss += si_loss
             else:
                 outputs, _ = model(input_ids=input_ids)
                 loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
                 if si is not None:
-                    si_loss = si.penalty(model)
+                    si_loss = si.penalty()
                     loss += si_loss
 
             # Backward pass and optimization
@@ -80,7 +80,7 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
                 scaler.update()
 
                 if si is not None:
-                    si.update_omega(model)  # Update SI after each batch
+                    si.update_omega()  # Update SI after each batch
 
                 optimizer.zero_grad()  # Reset gradients after each optimization step
 
@@ -104,7 +104,7 @@ def train_model(model, optimizer, epochs, device, dataloader, si=None, accumulat
 
         # End of epoch actions
         if si is not None:
-            si.consolidate_omega(model)  # Consolidate SI omega at the end of the epoch
+            si.consolidate_omega()  # Consolidate SI omega at the end of the epoch
             logging.info("Consolidated omega after epoch.")
 
         avg_loss = total_loss / len(dataloader)
