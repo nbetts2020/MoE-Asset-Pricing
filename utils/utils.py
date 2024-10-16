@@ -296,19 +296,83 @@ def initialize_model(args, device, init_from_scratch=False):
             logging.error("Could not load model from Hugging Face or local path.")
             raise RuntimeError("Could not load model from Hugging Face or local path.")
 
-def prepare_optimizer(model):
+def prepare_optimizer(model, args):
     """
-    Prepares the optimizer with layer-wise learning rate decay.
+    Prepares the optimizer with layer-wise learning rate decay and optional weight decay (L2 regularization).
     """
-    param_groups = [
-        {'params': list(model.token_embedding_table.parameters()) + list(model.position_embedding_table.parameters()), 'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1))},
-        {'params': model.regression_head.parameters(), 'lr': learning_rate}
-    ] + [
-        {'params': block.parameters(), 'lr': learning_rate * (LR_DECAY ** (len(model.blocks) - i))}
-        for i, block in enumerate(model.blocks)
-    ]
+    LR_DECAY = 0.95
+    weight_decay = args.lambda_l2 if args.use_l2 else 0.0
+
+    param_groups = []
+
+    # Embedding parameters
+    embedding_params_with_decay = []
+    embedding_params_without_decay = []
+
+    for name, param in list(model.token_embedding_table.named_parameters()) + list(model.position_embedding_table.named_parameters()):
+        if param.requires_grad:
+            if name.endswith('bias') or 'LayerNorm.weight' in name:
+                embedding_params_without_decay.append(param)
+            else:
+                embedding_params_with_decay.append(param)
+
+    param_groups.append({
+        'params': embedding_params_with_decay,
+        'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1)),
+        'weight_decay': weight_decay
+    })
+    param_groups.append({
+        'params': embedding_params_without_decay,
+        'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1)),
+        'weight_decay': 0.0
+    })
+
+    # Regression head parameters
+    reg_params_with_decay = []
+    reg_params_without_decay = []
+
+    for name, param in model.regression_head.named_parameters():
+        if param.requires_grad:
+            if name.endswith('bias') or 'LayerNorm.weight' in name:
+                reg_params_without_decay.append(param)
+            else:
+                reg_params_with_decay.append(param)
+
+    param_groups.append({
+        'params': reg_params_with_decay,
+        'lr': learning_rate,
+        'weight_decay': weight_decay
+    })
+    param_groups.append({
+        'params': reg_params_without_decay,
+        'lr': learning_rate,
+        'weight_decay': 0.0
+    })
+
+    # Block parameters with layer-wise learning rate decay
+    for i, block in enumerate(model.blocks):
+        block_params_with_decay = []
+        block_params_without_decay = []
+        for name, param in block.named_parameters():
+            if param.requires_grad:
+                if name.endswith('bias') or 'LayerNorm.weight' in name:
+                    block_params_without_decay.append(param)
+                else:
+                    block_params_with_decay.append(param)
+        lr = learning_rate * (LR_DECAY ** (len(model.blocks) - i))
+        param_groups.append({
+            'params': block_params_with_decay,
+            'lr': lr,
+            'weight_decay': weight_decay
+        })
+        param_groups.append({
+            'params': block_params_without_decay,
+            'lr': lr,
+            'weight_decay': 0.0
+        })
+
     optimizer = torch.optim.AdamW(param_groups)
-    logging.info("Initialized AdamW optimizer with layer-wise learning rate decay.")
+    logging.info("Initialized AdamW optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
 
 def prepare_data(args, tokenizer):
