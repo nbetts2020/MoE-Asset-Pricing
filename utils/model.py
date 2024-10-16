@@ -60,15 +60,21 @@ class NoisyTopkRouter(nn.Module):
         self.noise_linear = nn.Linear(n_embed, num_experts)
 
     def forward(self, mh_output):
-        logits = self.topkroute_linear(mh_output)
-        noise_logits = self.noise_linear(mh_output)
+        logits = self.topkroute_linear(mh_output)  # (B, T, num_experts)
+        noise_logits = self.noise_linear(mh_output)  # (B, T, num_experts)
         noise = torch.randn_like(logits) * F.softplus(noise_logits)
         noisy_logits = logits + noise
+
+        # Compute probabilities for all experts before top_k
+        full_router_probs = F.softmax(noisy_logits, dim=-1)  # (B, T, num_experts)
+
+        # Select top_k experts
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
         zeros = torch.full_like(noisy_logits, float('-inf'))
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
-        router_output = F.softmax(sparse_logits, dim=-1)
-        return router_output, indices
+        router_output = F.softmax(sparse_logits, dim=-1)  # (B, T, num_experts)
+
+        return router_output, indices, full_router_probs
 
 class SparseMoE(nn.Module):
     def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
@@ -81,10 +87,10 @@ class SparseMoE(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
-        gating_output, indices = self.router(x)
+        router_output, indices, full_router_probs = self.router(x)  # Get full_router_probs
         final_output = torch.zeros_like(x)
         flat_x = x.view(-1, x.size(-1))
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+        flat_router_output = router_output.view(-1, router_output.size(-1))
         tokens_per_batch = batch_size * seq_len * self.top_k
         expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
         updates = torch.zeros_like(flat_x)
@@ -97,12 +103,21 @@ class SparseMoE(nn.Module):
             if limited_indices.numel() > 0:
                 expert_input = flat_x[limited_indices]
                 expert_output = expert(expert_input)
-                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
+                gating_scores = flat_router_output[limited_indices, i].unsqueeze(1)
                 weighted_output = expert_output * gating_scores
                 updates.index_add_(0, limited_indices, weighted_output)
 
         final_output += updates.view(batch_size, seq_len, -1)
-        return final_output
+
+        # Compute entropy loss
+        entropy_loss = None  # Initialize
+
+        if self.training:
+            # Compute entropy over the full routing probabilities
+            entropy = -torch.sum(full_router_probs * torch.log(full_router_probs + 1e-8), dim=-1)  # (B, T)
+            entropy_loss = entropy.mean()  # Scalar
+
+        return final_output, entropy_loss
 
 class Block(nn.Module):
     """ Transformer block with FlashAttention and SparseMoE """
@@ -116,8 +131,9 @@ class Block(nn.Module):
 
     def forward(self, x, attention_mask=None):
         x = x + self.sa(self.ln1(x))  # Self-attention without attention_mask
-        x = x + self.smoe(self.ln2(x))
-        return x
+        moe_output, entropy_loss = self.smoe(self.ln2(x))
+        x = x + moe_output
+        return x, entropy_loss
 
 class SparseMoELanguageModel(nn.Module):
     def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name='gpt2'):
@@ -133,28 +149,35 @@ class SparseMoELanguageModel(nn.Module):
         # Regression head
         self.regression_head = nn.Linear(n_embed, 1)
 
-    def forward(self, input_ids, targets=None):
+    def forward(self, input_ids, targets=None, use_entropy_reg=False, lambda_entropy=0.01):
         B, T = input_ids.shape
         tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
         pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
         x = tok_emb + pos_emb  # (B, T, n_embed)
 
+        total_entropy_loss = 0.0  # Initialize total entropy loss
+
         # Apply gradient checkpointing only during training
         for block in self.blocks:
             if self.training:
-                x = checkpoint(block, x)
+                x, entropy_loss = checkpoint(block, x)
             else:
-                x = block(x)
+                x, entropy_loss = block(x)
+
+            if use_entropy_reg and entropy_loss is not None:
+                total_entropy_loss += entropy_loss
 
         x = self.ln_f(x)       # (B, T, n_embed)
         x = x.mean(dim=1)      # (B, n_embed)
         output = self.regression_head(x)  # (B, 1)
         output = output.squeeze(-1)       # (B,)
 
+        loss = None
         if targets is not None:
-            loss = F.mse_loss(output, targets)
-        else:
-            loss = None
+            task_loss = F.mse_loss(output, targets)
+            loss = task_loss
+            if use_entropy_reg:
+                loss += lambda_entropy * total_entropy_loss / len(self.blocks)  # Average over blocks
 
         return output, loss
 
