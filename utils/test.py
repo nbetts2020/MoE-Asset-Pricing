@@ -9,6 +9,7 @@ import json
 import logging
 from utils.train import train_model
 from utils.memory_replay_buffer import MemoryReplayBuffer
+from utils.ewc import ElasticWeightConsolidation
 from utils.config import *
 
 import numpy as np
@@ -30,6 +31,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
     Returns:
         results (dict): Performance metrics for each task across all stages.
     """
+
     results = {}
     model.train()
 
@@ -80,17 +82,21 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
     #     si.initialize(model)  # Initialize SI once before training
 
     # Initialize replay buffer if provided
-    if replay_buffer:
-        replay_buffer.initialize()
+    # if replay_buffer:
+    #     replay_buffer.initialize()
 
     # Dictionary to store initial metrics for percentage change calculation
     initial_metrics = {}
+
+    ewc_list = []
 
     # Sequential Training and Evaluation
     for i, task in enumerate(tasks):
         sector = task['sector']
         print(f"\nTraining on Task {i + 1}: Sector '{sector}'")
         logging.info(f"Training on Task {i + 1}: Sector '{sector}'")
+
+        ewc = ewc_list if args.use_ewc and ewc_list else None
 
         # Train on current task
         train_model(
@@ -99,11 +105,19 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             epochs=epochs,
             device=device,
             dataloader=task['train_dataloader'],
+            args=args,
             si=si,
+            ewc=ewc,
             accumulation_steps=1,  # Adjust if needed
             replay_buffer=replay_buffer,
             test_dataloader=None  # Optionally provide test_dataloader
         )
+
+        # After training on current task, compute Fisher Information and store parameters
+        if args.use_ewc:
+            # Create EWC instance for the current task
+            ewc_instance = ElasticWeightConsolidation(model, task['train_dataloader'], device)
+            ewc_list.append(ewc_instance)
 
         # Evaluate on all tasks seen so far
         for j, prev_task in enumerate(tasks[:i + 1]):
