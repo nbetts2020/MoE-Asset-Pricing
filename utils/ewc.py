@@ -2,6 +2,7 @@
 
 import torch
 import copy
+from torch.amp.autocast_mode import autocast
 
 class ElasticWeightConsolidation:
     def __init__(self, model, dataloader, device):
@@ -19,18 +20,25 @@ class ElasticWeightConsolidation:
         fisher = {n: torch.zeros_like(p, device=self.device) for n, p in self.model.named_parameters() if p.requires_grad}
 
         self.model.eval()
+
         for batch in self.dataloader:
             self.model.zero_grad()
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
 
-            outputs, _ = self.model(input_ids=input_ids)
-            loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
+            with autocast(device_type='cuda'):
+                outputs, _ = self.model(input_ids=input_ids)
+                loss = torch.nn.functional.mse_loss(outputs.squeeze(), labels.float())
+
             loss.backward()
 
             for n, p in self.model.named_parameters():
                 if p.grad is not None and p.requires_grad:
-                    fisher[n] += p.grad.detach() ** 2 / len(self.dataloader)
+                    fisher[n] += (p.grad.detach() ** 2)
+
+        # Average the Fisher Information over all batches
+        for n in fisher:
+            fisher[n] /= len(self.dataloader)
 
         return fisher
 
