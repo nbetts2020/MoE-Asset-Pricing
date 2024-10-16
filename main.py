@@ -50,6 +50,12 @@ def main():
     parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
     parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument('--num_tasks', type=int, default=3, help="Number of tasks (sectors) to use in catastrophic forgetting testing.")
+    parser.add_argument('--use_l2', action='store_true', help="Use L2 regularization during training or updating.")
+    parser.add_argument('--lambda_l2', type=float, default=0.01, help="Regularization strength for L2 regularization.")
+    parser.add_argument('--use_entropy_reg', action='store_true', help="Use entropy regularization in expert routing.")
+    parser.add_argument('--lambda_entropy', type=float, default=0.01, help="Regularization strength for entropy regularization.")
+    parser.add_argument('--use_ewc', action='store_true', help="Use Elastic Weight Consolidation during training or updating.")
+    parser.add_argument('--lambda_ewc', type=float, default=0.4, help="Regularization strength for Elastic Weight Consolidation.")
 
     args = parser.parse_args()
 
@@ -82,7 +88,7 @@ def main():
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
         # Prepare optimizer
-        optimizer = prepare_optimizer(model)
+        optimizer = prepare_optimizer(model, args)
         # Prepare data
         train_dataloader, test_dataloader, update_dataloader, accumulation_steps = prepare_data(args, tokenizer)
         # Initialize SI - if --use_si is True
@@ -134,7 +140,7 @@ def main():
             print("Error: Could not load model for updating.")
             return
         # Prepare optimizer
-        optimizer = prepare_optimizer(model)
+        optimizer = prepare_optimizer(model, args)
         # Prepare data
         train_dataloader, accumulation_steps = prepare_data(args, tokenizer)
         # Initialize SI - if --use_si is True
@@ -149,6 +155,7 @@ def main():
             EPOCHS,
             device,
             train_dataloader,
+            args=args,
             si=si,
             accumulation_steps=accumulation_steps,
             replay_buffer=replay_buffer
@@ -218,7 +225,7 @@ def main():
         print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
     
         # Prepare optimizer
-        optimizer = prepare_optimizer(model)
+        optimizer = prepare_optimizer(model, args)
     
         # Initialize SI if required
         si = initialize_si(model, args) if args.use_si else None
