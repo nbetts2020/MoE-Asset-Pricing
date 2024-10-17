@@ -109,6 +109,9 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 l2_loss = compute_l2_loss(model)
                 loss += args.lambda_l2 * l2_loss
 
+            if si is not None:
+                si.total_loss += loss.item()
+
             # Backward pass and optimization
             scaler.scale(loss).backward()
 
