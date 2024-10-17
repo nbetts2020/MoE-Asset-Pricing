@@ -6,6 +6,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import logging
 import numpy as np
+import torch.distributed as dist
 
 from utils.config import *
 
@@ -14,8 +15,19 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     scaler = GradScaler()
     logging.info("Starting training loop.")
 
+    # Determine if using DDP
+    use_ddp = args.use_ddp and torch.cuda.device_count() > 1
+
+    # Get the rank (process ID) and world size (total number of processes)
+    if use_ddp:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+
     for epoch in range(epochs):
-        logging.info(f"Start of Epoch {epoch + 1}/{epochs}")
+        logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
         total_loss = 0.0
         predictions = []
         actuals = []
@@ -25,8 +37,12 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         sector_errors = {}
         sector_counts = {}
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")):
-            optimizer.zero_grad()  # zero gradients for each batch
+        # Set the epoch for the sampler if using DDP
+        if use_ddp:
+            dataloader.sampler.set_epoch(epoch)
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}")):
+            optimizer.zero_grad()  # Zero gradients for each batch
 
             # Determine new data limit and replay sample size based on replay buffer usage
             if replay_buffer is not None:
@@ -48,7 +64,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 total_error = sum(sector_errors.values())
                 total_count = sum(sector_counts.values())
                 mean_sector_error = total_error / total_count if total_count > 0 else 1.0
-                
+
                 for sector in sector_errors:
                     average_error = sector_errors[sector] / sector_counts[sector]
                     average_sector_errors[sector] = average_error
@@ -75,7 +91,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 sectors = new_sectors
 
             if device.type == 'cuda':
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.cuda.amp.autocast(device_type='cuda'):
                     outputs, model_loss = model(
                         input_ids=input_ids,
                         targets=labels.float(),
@@ -96,7 +112,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             if si is not None:
                 si_loss = si.penalty()
                 loss += si_loss
-            
+
             # Add EWC penalty if applicable
             if ewc is not None:
                 ewc_loss = 0.0
@@ -158,11 +174,54 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             si.consolidate_omega()  # consolidate SI omega at the end of the epoch
             logging.info("Consolidated omega after epoch.")
 
-        avg_loss = total_loss / len(dataloader)
-        mse = mean_squared_error(actuals, predictions)
-        r2 = r2_score(actuals, predictions)
+        # Reduce total_loss across all processes
+        if use_ddp:
+            total_loss_tensor = torch.tensor(total_loss).to(device)
+            dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = total_loss_tensor.item() / (len(dataloader) * world_size)
+        else:
+            avg_loss = total_loss / len(dataloader)
 
-        logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2 Score: {r2:.4f}")
+        # Gather predictions and actuals from all processes for metrics
+        if use_ddp:
+            # Convert lists to tensors
+            predictions_tensor = torch.tensor(predictions).to(device)
+            actuals_tensor = torch.tensor(actuals).to(device)
+
+            # Determine the maximum length across all processes
+            pred_size = torch.tensor([predictions_tensor.size(0)], device=device)
+            actual_size = torch.tensor([actuals_tensor.size(0)], device=device)
+            sizes = torch.stack([pred_size, actual_size])
+            dist.all_reduce(sizes, op=dist.ReduceOp.MAX)
+            max_pred_size = sizes[0].item()
+            max_actual_size = sizes[1].item()
+
+            # Pad tensors to max size
+            padded_predictions = torch.zeros(max_pred_size, device=device)
+            padded_predictions[:predictions_tensor.size(0)] = predictions_tensor
+            padded_actuals = torch.zeros(max_actual_size, device=device)
+            padded_actuals[:actuals_tensor.size(0)] = actuals_tensor
+
+            # Gather all predictions and actuals
+            gathered_predictions = [torch.zeros_like(padded_predictions) for _ in range(world_size)]
+            gathered_actuals = [torch.zeros_like(padded_actuals) for _ in range(world_size)]
+            dist.all_gather(gathered_predictions, padded_predictions)
+            dist.all_gather(gathered_actuals, padded_actuals)
+
+            # Concatenate and trim to original sizes
+            all_predictions = torch.cat([gp[:pred_size.item()].cpu() for gp in gathered_predictions])
+            all_actuals = torch.cat([ga[:actual_size.item()].cpu() for ga in gathered_actuals])
+
+            # Compute metrics
+            mse = mean_squared_error(all_actuals.numpy(), all_predictions.numpy())
+            r2 = r2_score(all_actuals.numpy(), all_predictions.numpy())
+        else:
+            # Compute metrics
+            mse = mean_squared_error(actuals, predictions)
+            r2 = r2_score(actuals, predictions)
+
+        if rank == 0:
+            logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2 Score: {r2:.4f}")
 
     logging.info("Training loop completed.")
 
