@@ -1,3 +1,5 @@
+# main.py
+
 import torch
 import os
 import argparse
@@ -20,7 +22,6 @@ from utils.utils import (
 from utils.config import *
 from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset
-from utils.si import SynapticIntelligence
 from utils.test import test_forgetting
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
@@ -32,7 +33,9 @@ import numpy as np
 import random
 import json
 
+from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
+from utils.ewc import ElasticWeightConsolidation
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
@@ -81,8 +84,10 @@ def main():
         local_rank = int(os.environ['LOCAL_RANK'])
         device = torch.device(f'cuda:{local_rank}')
         torch.cuda.set_device(device)
+        rank = dist.get_rank()
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        rank = 0
 
     random_seed = args.random_seed
     torch.manual_seed(random_seed)
@@ -94,8 +99,6 @@ def main():
     if not (0 < args.percent_data <= 100):
         raise ValueError("Invalid value for --percent_data. It must be between 0 and 100.")
 
-    torch.manual_seed(1337)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
     # Initialize tokenizer
@@ -112,30 +115,55 @@ def main():
             # Apply Kaiming initialization
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
+
+        # Wrap model with DDP if necessary
+        if use_ddp:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
+
         # Prepare data
         train_dataloader, test_dataloader, update_dataloader = prepare_data(args, tokenizer)
+
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
+
+        # Initialize EWC - if --use_ewc is True
+        if args.use_ewc:
+            ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
+            ewc_list = [ewc_instance]
+        else:
+            ewc_list = None
+
         # Initialize replay buffer - if --use_replay_buffer is True
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
+
         # Train the model
         train_model(
-        model,
-        optimizer,
-        EPOCHS,
-        device,
-        train_dataloader,
-        si=si,
-        replay_buffer=replay_buffer,
-        test_dataloader=test_dataloader
+            model,
+            optimizer,
+            EPOCHS,
+            device,
+            train_dataloader,
+            args=args,
+            si=si,
+            ewc=ewc_list,
+            replay_buffer=replay_buffer,
+            test_dataloader=test_dataloader
         )
         logging.info("Training completed.")
     
         if args.update and update_dataloader:
             # Update the model with update data
             logging.info("Starting model update with update data...")
+
+            # Update EWC after training on previous data
+            if args.use_ewc:
+                # Create new EWC instance after first training phase
+                ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
+                ewc_list.append(ewc_instance)
+
             train_model(
                 model,
                 optimizer,
@@ -144,12 +172,14 @@ def main():
                 update_dataloader,
                 args=args,
                 si=si,
+                ewc=ewc_list,
                 replay_buffer=replay_buffer,
                 test_dataloader=test_dataloader
             )
             logging.info("Model update completed.")
+
         # Save model and states
-        save_model_and_states(model, si, replay_buffer, args)
+        save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
     elif args.mode == 'update':
         if not args.update:
@@ -163,14 +193,42 @@ def main():
             logging.error(str(e))
             print("Error: Could not load model for updating.")
             return
+
+        # Wrap model with DDP if necessary
+        if use_ddp:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
+
         # Prepare data
-        train_dataloader = prepare_data(args, tokenizer)
+        train_dataloader, test_dataloader, update_dataloader = prepare_data(args, tokenizer)
+
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
+
+        # Initialize EWC - if --use_ewc is True
+        if args.use_ewc:
+            # Load previous EWC state
+            ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
+            if os.path.exists(ewc_state_path):
+                ewc_states = torch.load(ewc_state_path, map_location=device)
+                ewc_list = []
+                for state in ewc_states:
+                    ewc_instance = ElasticWeightConsolidation(model, dataloader=None, device=device, args=args)
+                    ewc_instance.params = {n: p.to(device) for n, p in state['params'].items()}
+                    ewc_instance.fisher = {n: f.to(device) for n, f in state['fisher'].items()}
+                    ewc_list.append(ewc_instance)
+                logging.info(f"Loaded EWC state from '{ewc_state_path}'.")
+            else:
+                logging.info("No existing EWC state found. Starting fresh EWC.")
+                ewc_list = []
+        else:
+            ewc_list = None
+
         # Initialize replay buffer - if --use_replay_buffer is True
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
+
         # Update the model
         logging.info("Starting updating...")
         train_model(
@@ -181,11 +239,12 @@ def main():
             train_dataloader,
             args=args,
             si=si,
+            ewc=ewc_list,
             replay_buffer=replay_buffer
         )
         logging.info("Updating completed.")
         # Save model and states
-        save_model_and_states(model, si, replay_buffer, args)
+        save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
     elif args.mode == 'run':
         # Initialize model
@@ -247,12 +306,22 @@ def main():
         logging.info("Initialized model for catastrophic forgetting testing.")
         print(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
     
+        # Wrap model with DDP if necessary
+        if use_ddp:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
     
         # Initialize SI if required
         si = initialize_si(model, args) if args.use_si else None
     
+        # Initialize EWC if required
+        if args.use_ewc:
+            ewc_list = []
+        else:
+            ewc_list = None
+
         # Initialize replay buffer if required
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
     
@@ -264,6 +333,7 @@ def main():
             tokenizer=tokenizer,
             args=args,
             si=si,
+            ewc=ewc_list,
             replay_buffer=replay_buffer
         )
     
@@ -274,6 +344,10 @@ def main():
         
     else:
         raise ValueError("Invalid mode selected. Choose from 'train', 'run', 'update', or 'test_forgetting'.")
+
+    # Clean up DDP
+    if use_ddp:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
