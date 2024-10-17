@@ -37,19 +37,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(mess
 
 def main():
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
+    
+    # modes and corresponding args
     parser.add_argument('mode', choices=['train', 'run', 'update', 'test_forgetting'], help="Mode: 'train', 'run', 'update', or 'test_forgetting'")
     parser.add_argument('input_text', type=str, nargs='?', help="Input article text (required if mode is 'run' without --test)", default=None)
+    
+    # model params
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
+    parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
+
+    # secondary modes and args for general and catastrophic forgetting testing
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
     parser.add_argument('--update', nargs='?', const=True, default=False, help="Include this flag to perform an update. Optionally provide a dataset URL for new data.")
-    parser.add_argument('--use_si', action='store_true', help="Use Synaptic Intelligence during training or updating.")
-    parser.add_argument('--use_replay_buffer', action='store_true', help="Use Memory Replay Buffer during training or updating.")
-    parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
-    parser.add_argument('--replay_buffer_capacity', type=int, default=10000, help="Capacity of the Memory Replay Buffer.")
     parser.add_argument('--percent_data', type=float, default=100.0, help="Percentage of data to use (0 < percent_data <= 100).")
     parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
     parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument('--num_tasks', type=int, default=3, help="Number of tasks (sectors) to use in catastrophic forgetting testing.")
+    
+    # catastrophic forgetting methods and corresponding args
+    parser.add_argument('--use_si', action='store_true', help="Use Synaptic Intelligence during training or updating.")
+    parser.add_argument('--use_replay_buffer', action='store_true', help="Use Memory Replay Buffer during training or updating.")
+    parser.add_argument('--replay_buffer_capacity', type=int, default=10000, help="Capacity of the Memory Replay Buffer.")
     parser.add_argument('--use_l2', action='store_true', help="Use L2 regularization during training or updating.")
     parser.add_argument('--lambda_l2', type=float, default=0.01, help="Regularization strength for L2 regularization.")
     parser.add_argument('--use_entropy_reg', action='store_true', help="Use entropy regularization in expert routing.")
@@ -118,6 +126,7 @@ def main():
                 EPOCHS,
                 device,
                 update_dataloader,
+                args=args,
                 si=si,
                 accumulation_steps=accumulation_steps,
                 replay_buffer=replay_buffer,
@@ -244,7 +253,7 @@ def main():
             replay_buffer=replay_buffer
         )
     
-        # Log and save the results
+        # Log and save results
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
         with open(os.path.join(args.save_dir, 'test_forgetting_results.json'), 'w') as f:
             json.dump(test_results, f, indent=4)
