@@ -20,6 +20,7 @@ from transformers import AutoTokenizer
 import json
 from huggingface_hub import hf_hub_download
 
+from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 
