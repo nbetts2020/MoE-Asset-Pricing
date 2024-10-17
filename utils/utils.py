@@ -23,6 +23,8 @@ from huggingface_hub import hf_hub_download
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 
+from torch.utils.data.distributed import DistributedSampler
+
 import logging
 
 import inspect
@@ -193,10 +195,15 @@ def process_data(df, tokenizer):
 
     return articles, prices, sectors
 
-def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE, shuffle=True):
+def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=None):
     articles, prices, sectors = process_data(df, tokenizer)
     dataset = ArticlePriceDataset(articles, prices, sectors, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    if args.use_ddp and torch.cuda.device_count() > 1:
+        sampler = DistributedSampler(dataset, shuffle=shuffle)
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    else:
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     return dataloader
 
 def load_model_weights(model, filepath, device):
@@ -252,6 +259,18 @@ def initialize_model(args, device, init_from_scratch=False):
         }
         model = SparseMoELanguageModel(**model_config)
         model = model.to(device)
+        # Wrap model with DDP if needed
+        if args.use_ddp and torch.cuda.device_count() > 1:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[device],
+                output_device=device,
+                find_unused_parameters=False
+            )
+            logging.info("Wrapped model with DistributedDataParallel.")
+        else:
+            logging.info("Using a single GPU for training.")
+    
         initialized_from_scratch = True
         return model, initialized_from_scratch
     else:
