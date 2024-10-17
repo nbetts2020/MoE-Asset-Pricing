@@ -401,7 +401,7 @@ def prepare_data(args, tokenizer):
     percent_data = args.percent_data  # get percentage of data to use
     df = get_data(percent_data=percent_data)
     print(len(df), "aahhhh")
-    df = df.sort_values('Date')  # Ensure data is sorted by date
+    df = df.sort_values('Date')
 
     random_seed = args.random_seed
 
@@ -441,8 +441,7 @@ def prepare_data(args, tokenizer):
             update_df = None  # No update data in baseline
             logging.info(f"Data split into 90% train, 10% test.")
 
-        actual_batch_size = BATCH_SIZE
-        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=actual_batch_size, shuffle=True)
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True)
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
         # Prepare test DataLoader
@@ -451,22 +450,17 @@ def prepare_data(args, tokenizer):
 
         # Prepare update DataLoader if in update mode
         if args.update and update_df is not None:
-            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=actual_batch_size, shuffle=True)
+            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True)
             logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} update samples.")
         else:
             update_dataloader = None
 
-        # Determine accumulation_steps
-        desired_effective_batch_size = BATCH_SIZE
-        accumulation_steps = max(1, desired_effective_batch_size // actual_batch_size)
-        logging.info(f"Using accumulation_steps={accumulation_steps} for training.")
-
-        return train_dataloader, test_dataloader, update_dataloader, accumulation_steps
+        return train_dataloader, test_dataloader, update_dataloader
 
     else:
         # Other modes can be handled similarly
-        return None, None, None, None
-
+        return None, None, None
+        
 def initialize_si(model, args):
     """
     Initializes Synaptic Intelligence (SI) if specified.
