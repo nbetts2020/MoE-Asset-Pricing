@@ -108,9 +108,9 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             args=args,
             si=si,
             ewc=ewc,
-            accumulation_steps=1,  # Adjust if needed
+            accumulation_steps=1,
             replay_buffer=replay_buffer,
-            test_dataloader=None  # Optionally provide test_dataloader
+            test_dataloader=None
         )
 
         # After training on current task, compute Fisher Information and store parameters
@@ -235,5 +235,5 @@ def evaluate_task(model, dataloader, device):
     mae = mean_absolute_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
 
-    model.train()  # Set the model back to train mode
+    model.train()  # set the model back to train mode
     return mse, rmse, mae, r2
