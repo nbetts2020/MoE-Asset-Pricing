@@ -115,7 +115,7 @@ def main():
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
         # Prepare data
-        train_dataloader, test_dataloader, update_dataloader, accumulation_steps = prepare_data(args, tokenizer)
+        train_dataloader, test_dataloader, update_dataloader = prepare_data(args, tokenizer)
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
         # Initialize replay buffer - if --use_replay_buffer is True
@@ -128,7 +128,6 @@ def main():
         device,
         train_dataloader,
         si=si,
-        accumulation_steps=accumulation_steps,
         replay_buffer=replay_buffer,
         test_dataloader=test_dataloader
         )
@@ -145,7 +144,6 @@ def main():
                 update_dataloader,
                 args=args,
                 si=si,
-                accumulation_steps=accumulation_steps,
                 replay_buffer=replay_buffer,
                 test_dataloader=test_dataloader
             )
@@ -168,7 +166,7 @@ def main():
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
         # Prepare data
-        train_dataloader, accumulation_steps = prepare_data(args, tokenizer)
+        train_dataloader = prepare_data(args, tokenizer)
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
         # Initialize replay buffer - if --use_replay_buffer is True
@@ -183,7 +181,6 @@ def main():
             train_dataloader,
             args=args,
             si=si,
-            accumulation_steps=accumulation_steps,
             replay_buffer=replay_buffer
         )
         logging.info("Updating completed.")
