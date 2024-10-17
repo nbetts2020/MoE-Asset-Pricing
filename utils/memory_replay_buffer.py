@@ -6,9 +6,9 @@ import torch
 class MemoryReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
-        self.buffer = []        # List to store samples
-        self.errors = []        # List to store errors (used for sampling probabilities)
-        self.total_error = 0.0  # Sum of all errors, used for normalization
+        self.buffer = []  # list to store samples
+        self.errors = []  # list to store errors (used for sampling probabilities)
+        self.total_error = 0.0  # sum of all errors, used for normalization
 
     def add_examples(self, examples, errors):
         """
@@ -19,15 +19,20 @@ class MemoryReplayBuffer:
             errors (list): List of errors corresponding to each example
         """
         for example, error in zip(examples, errors):
+            # If buffer is full, remove least important sample
+            if len(self.buffer) >= self.capacity:
+                # Find index of sample with the lowest error
+                min_error = min(self.errors)
+                min_index = self.errors.index(min_error)
+                # Remove the least important sample
+                removed_error = self.errors.pop(min_index)
+                self.buffer.pop(min_index)
+                self.total_error -= removed_error
+
+            # Add the new example
             self.buffer.append(example)
             self.errors.append(error)
             self.total_error += error
-
-            # Remove oldest data if capacity is exceeded
-            if len(self.buffer) > self.capacity:
-                removed_error = self.errors.pop(0)
-                self.buffer.pop(0)
-                self.total_error -= removed_error
 
     def sample(self, sample_size, average_sector_errors):
         """
@@ -43,12 +48,18 @@ class MemoryReplayBuffer:
         if len(self.buffer) == 0:
             return []
 
+        # Compute mean sector error
+        if average_sector_errors:
+            mean_sector_error = sum(average_sector_errors.values()) / len(average_sector_errors)
+        else:
+            mean_sector_error = 1.0  # fallback if dictionary is empty
+
         # Compute sampling probabilities
         sampling_probs = []
         for i in range(len(self.buffer)):
             error = self.errors[i]
             sector = self.buffer[i]['sector']
-            sector_error = average_sector_errors.get(sector, 1.0)  # Default to 1.0 if not found
+            sector_error = average_sector_errors.get(sector, mean_sector_error)
 
             # Combine sample error and sector error
             combined_error = error * sector_error
