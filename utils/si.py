@@ -74,7 +74,8 @@ class SynapticIntelligence:
         state = torch.load(filepath, map_location='cpu')
         for name in self.omega:
             if name in state['omega']:
-                self.omega[name] = state['omega'][name].to(self.model.device)
+                device = next(self.model.parameters()).device
+                self.omega[name] = state['omega'][name].to(device)
             if name in state['theta_star']:
                 self.theta_star[name] = state['theta_star'][name].to(self.model.device)
             if name in state['previous_params']:
