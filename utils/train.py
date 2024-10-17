@@ -6,7 +6,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import logging
 import numpy as np
-import torch.distributed as dist  # Import for DDP
+import torch.distributed as dist
 
 from utils.config import *
 
@@ -73,7 +73,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 loss += si_loss
 
             # Add EWC penalty if applicable
-            if ewc is not None:
+            if ewc is not None and len(ewc) > 0:
                 ewc_loss = 0.0
                 for ewc_instance in ewc:
                     ewc_loss += ewc_instance.penalty(model)
