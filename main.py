@@ -26,6 +26,8 @@ from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+import torch.distributed as dist
+
 import numpy as np
 import random
 import json
@@ -65,7 +67,22 @@ def main():
     parser.add_argument('--use_ewc', action='store_true', help="Use Elastic Weight Consolidation during training or updating.")
     parser.add_argument('--lambda_ewc', type=float, default=0.4, help="Regularization strength for Elastic Weight Consolidation.")
 
+    # distributed training
+    parser.add_argument('--use_ddp', action='store_true', help='Use DistributedDataParallel')
+
     args = parser.parse_args()
+
+    # Check if running with DDP
+    use_ddp = torch.cuda.device_count() > 1 and args.use_ddp
+
+    if use_ddp:
+        # Initialize the process group
+        dist.init_process_group(backend='nccl', init_method='env://')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     random_seed = args.random_seed
     torch.manual_seed(random_seed)
