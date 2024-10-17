@@ -87,7 +87,7 @@ class SparseMoE(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
-        router_output, indices, full_router_probs = self.router(x)  # Get full_router_probs
+        router_output, indices, full_router_probs = self.router(x)  # get full_router_probs
         final_output = torch.zeros_like(x)
         flat_x = x.view(-1, x.size(-1))
         flat_router_output = router_output.view(-1, router_output.size(-1))
@@ -113,7 +113,7 @@ class SparseMoE(nn.Module):
         entropy_loss = None  # Initialize
 
         if self.training:
-            # Compute entropy over the full routing probabilities
+            # Compute entropy over full routing probabilities
             entropy = -torch.sum(full_router_probs * torch.log(full_router_probs + 1e-8), dim=-1)  # (B, T)
             entropy_loss = entropy.mean()  # Scalar
 
@@ -155,7 +155,7 @@ class SparseMoELanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
         x = tok_emb + pos_emb  # (B, T, n_embed)
 
-        total_entropy_loss = 0.0  # Initialize total entropy loss
+        total_entropy_loss = 0.0  # initialize total entropy loss
 
         # Apply gradient checkpointing only during training
         for block in self.blocks:
@@ -177,7 +177,7 @@ class SparseMoELanguageModel(nn.Module):
             task_loss = F.mse_loss(output, targets)
             loss = task_loss
             if use_entropy_reg:
-                loss += lambda_entropy * total_entropy_loss / len(self.blocks)  # Average over blocks
+                loss += lambda_entropy * total_entropy_loss / len(self.blocks)  # average over blocks
 
         return output, loss
 
