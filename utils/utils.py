@@ -497,16 +497,44 @@ def initialize_replay_buffer(args):
                 logging.info("No existing Memory Replay Buffer found. Starting fresh.")
     return replay_buffer
 
-def save_model_and_states(model, si, replay_buffer, args):
-    """
-    Saves the model weights, SI state, and replay buffer to the specified save directory.
-    """
-    os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.save_dir, 'model_weights.pth'))
-    logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
-    if args.use_si and si is not None:
-        si.save_state(os.path.join(args.save_dir, 'si_state.pth'))
-        logging.info(f"Synaptic Intelligence (SI) state saved to '{os.path.join(args.save_dir, 'si_state.pth')}'.")
-    if args.use_replay_buffer and replay_buffer is not None:
-        replay_buffer.save(os.path.join(args.save_dir, 'replay_buffer.pth'))
-        logging.info(f"Memory Replay Buffer saved to '{os.path.join(args.save_dir, 'replay_buffer.pth')}'.")
+def save_model_and_states(model, si, replay_buffer, ewc_list, args):
+    if args.use_ddp and torch.cuda.device_count() > 1:
+        rank = dist.get_rank()
+    else:
+        rank = 0
+
+    if rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+        # Save model weights
+        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
+            state_dict = model.module.state_dict()
+        else:
+            state_dict = model.state_dict()
+        torch.save(state_dict, os.path.join(args.save_dir, 'model_weights.pth'))
+        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
+
+        # Save SI state
+        if args.use_si and si is not None:
+            si_state_path = os.path.join(args.save_dir, 'si_state.pth')
+            si.save_state(si_state_path)
+            logging.info(f"Synaptic Intelligence (SI) state saved to '{si_state_path}'.")
+
+        # Save Replay Buffer
+        if args.use_replay_buffer and replay_buffer is not None:
+            replay_buffer_path = os.path.join(args.save_dir, 'replay_buffer.pth')
+            replay_buffer.save(replay_buffer_path)
+            logging.info(f"Replay Buffer saved to '{replay_buffer_path}'.")
+
+        # Save EWC state
+        if args.use_ewc and ewc_list is not None:
+            ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
+            ewc_states = []
+            for ewc_instance in ewc_list:
+                ewc_states.append({
+                    'params': ewc_instance.params,
+                    'fisher': ewc_instance.fisher
+                })
+            torch.save(ewc_states, ewc_state_path)
+            logging.info(f"EWC state saved to '{ewc_state_path}'.")
+    else:
+        logging.info(f"Rank {rank}: Skipping model and state saving.")
