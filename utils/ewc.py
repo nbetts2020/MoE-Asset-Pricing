@@ -10,9 +10,9 @@ class ElasticWeightConsolidation:
         self.dataloader = dataloader
         self.device = device
 
-        # Store the model parameters after training on the task
+        # Store model parameters after training on task
         self.params = {n: p.clone().detach() for n, p in self.model.named_parameters() if p.requires_grad}
-        # Initialize the Fisher Information matrix
+        # Initialize Fisher Information matrix
         self.fisher = self._compute_fisher_information()
 
     def _compute_fisher_information(self):
@@ -36,7 +36,7 @@ class ElasticWeightConsolidation:
                 if p.grad is not None and p.requires_grad:
                     fisher[n] += (p.grad.detach() ** 2)
 
-        # Average the Fisher Information over all batches
+        # Average Fisher Information over all batches
         for n in fisher:
             fisher[n] /= len(self.dataloader)
 
