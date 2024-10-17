@@ -26,14 +26,14 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         sector_counts = {}
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")):
-            optimizer.zero_grad()  # Zero gradients for each batch
+            optimizer.zero_grad()  # zero gradients for each batch
 
             # Determine new data limit and replay sample size based on replay buffer usage
             if replay_buffer is not None:
-                new_data_limit = BATCH_SIZE // 2  # Use half the batch for new data
+                new_data_limit = BATCH_SIZE // 2  # use half the batch for new data
                 replay_sample_size = BATCH_SIZE - new_data_limit
             else:
-                new_data_limit = BATCH_SIZE  # Use entire batch for new data
+                new_data_limit = BATCH_SIZE  # use entire batch for new data
                 replay_sample_size = 0
 
             # Prepare new data
@@ -43,8 +43,15 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
             # Sample from replay buffer to fill the rest of the batch
             if replay_sample_size > 0 and replay_buffer is not None:
-                # Compute average sector errors
-                average_sector_errors = {sector: sector_errors.get(sector, 1.0) / sector_counts.get(sector, 1) for sector in sector_errors}
+                # Compute average errors per sector
+                average_sector_errors = {}
+                total_error = sum(sector_errors.values())
+                total_count = sum(sector_counts.values())
+                mean_sector_error = total_error / total_count if total_count > 0 else 1.0
+                
+                for sector in sector_errors:
+                    average_error = sector_errors[sector] / sector_counts[sector]
+                    average_sector_errors[sector] = average_error
 
                 replay_samples = replay_buffer.sample(replay_sample_size, average_sector_errors)
                 if replay_samples:
@@ -67,7 +74,6 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 labels = new_labels
                 sectors = new_sectors
 
-            # Forward pass
             if device.type == 'cuda':
                 with torch.amp.autocast(device_type='cuda'):
                     outputs, model_loss = model(
@@ -84,7 +90,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                     lambda_entropy=args.lambda_entropy
                 )
 
-            loss = model_loss  # Start with the loss returned by the model
+            loss = model_loss  # start with loss returned by the model
 
             # Add SI penalty if applicable
             if si is not None:
@@ -111,9 +117,9 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 scaler.update()
 
                 if si is not None:
-                    si.update_omega()  # Update SI after each batch
+                    si.update_omega()  # update SI after each batch
 
-                optimizer.zero_grad()  # Reset gradients after each optimization step
+                optimizer.zero_grad()  # reset gradients after each optimization step
 
             total_loss += loss.item()
             predictions.extend(outputs.detach().cpu().numpy())
@@ -146,7 +152,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
         # End of epoch actions
         if si is not None:
-            si.consolidate_omega()  # Consolidate SI omega at the end of the epoch
+            si.consolidate_omega()  # consolidate SI omega at the end of the epoch
             logging.info("Consolidated omega after epoch.")
 
         avg_loss = total_loss / len(dataloader)
