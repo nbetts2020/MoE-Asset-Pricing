@@ -49,7 +49,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             sectors = batch['sector']
 
             if device.type == 'cuda':
-                with torch.cuda.amp.autocast(device_type='cuda'):
+                with torch.amp.autocast('cuda'):
                     outputs, model_loss = model(
                         input_ids=input_ids,
                         targets=labels.float(),
