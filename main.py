@@ -74,8 +74,9 @@ def main():
     parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
     parser.add_argument('--replay_buffer_weight', type=float, default=1.0, help='Weight for replay buffer loss.')
 
-    # distributed training
+    # distributed training and early stopping
     parser.add_argument('--use_ddp', action='store_true', help='Use DistributedDataParallel')
+    parser.add_argument('--early_stopping_patience', type=int, default=5, help='Number of epochs with no improvement after which training will be stopped.')
 
     args = parser.parse_args()
 
@@ -337,9 +338,8 @@ def main():
             tokenizer=tokenizer,
             args=args,
             si=si,
-            ewc=ewc_list,
-            replay_buffer=replay_buffer
-        )
+            replay_buffer=replay_buffer,
+            ewc=ewc_list)
     
         # Log and save results
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
