@@ -70,6 +70,10 @@ def main():
     parser.add_argument('--use_ewc', action='store_true', help="Use Elastic Weight Consolidation during training or updating.")
     parser.add_argument('--lambda_ewc', type=float, default=0.4, help="Regularization strength for Elastic Weight Consolidation.")
 
+    # Replay buffer training args
+    parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
+    parser.add_argument('--replay_buffer_weight', type=float, default=1.0, help='Weight for replay buffer loss.')
+
     # distributed training
     parser.add_argument('--use_ddp', action='store_true', help='Use DistributedDataParallel')
 
@@ -180,7 +184,7 @@ def main():
 
         # Save model and states
         save_model_and_states(model, si, replay_buffer, ewc_list, args)
-
+        
     elif args.mode == 'update':
         if not args.update:
             raise ValueError("You must provide the --update argument with the Hugging Face dataset URL when in 'update' mode.")
