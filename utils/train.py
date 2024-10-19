@@ -31,7 +31,6 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         total_loss = 0.0
         predictions = []
         actuals = []
-        batch_count = 0
 
         # Initialize dictionaries to track errors per sector
         sector_errors = {}
@@ -129,6 +128,32 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             si.consolidate_omega()  # consolidate SI omega at the end of the epoch
             logging.info("Consolidated omega after epoch.")
 
+        # Synchronize sector_errors and sector_counts across processes
+        if replay_buffer is not None and use_ddp:
+            # Gather sector_errors and sector_counts from all processes
+            gathered_sector_errors = [None for _ in range(world_size)]
+            gathered_sector_counts = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered_sector_errors, sector_errors)
+            dist.all_gather_object(gathered_sector_counts, sector_counts)
+
+            # Merge sector_errors and sector_counts
+            total_sector_errors = {}
+            total_sector_counts = {}
+            for se, sc in zip(gathered_sector_errors, gathered_sector_counts):
+                for sector in se:
+                    total_sector_errors[sector] = total_sector_errors.get(sector, 0.0) + se[sector]
+                for sector in sc:
+                    total_sector_counts[sector] = total_sector_counts.get(sector, 0) + sc[sector]
+            sector_errors = total_sector_errors
+            sector_counts = total_sector_counts
+
+        # Compute average sector errors
+        average_sector_errors = {sector: sector_errors[sector] / sector_counts[sector] for sector in sector_errors}
+
+        # Synchronize the replay buffer across processes
+        if replay_buffer is not None and use_ddp:
+            replay_buffer.sync_buffer()
+
         # Reduce total_loss across all processes
         if use_ddp:
             total_loss_tensor = torch.tensor(total_loss).to(device)
@@ -163,6 +188,39 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
         if rank == 0:
             logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2 Score: {r2:.4f}")
+
+        # Sample from the replay buffer and train on replayed samples
+        if replay_buffer is not None:
+            replay_batch_size = args.replay_batch_size if hasattr(args, 'replay_batch_size') else labels.size(0)
+            replay_samples = replay_buffer.sample(replay_batch_size, average_sector_errors)
+            if len(replay_samples) > 0:
+                # Prepare replay batch
+                replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device)
+                replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device)
+
+                # Forward pass on replayed samples
+                if device.type == 'cuda':
+                    with torch.cuda.amp.autocast(device_type='cuda'):
+                        replay_outputs, replay_loss = model(
+                            input_ids=replay_input_ids,
+                            targets=replay_labels.float(),
+                            use_entropy_reg=args.use_entropy_reg,
+                            lambda_entropy=args.lambda_entropy
+                        )
+                else:
+                    replay_outputs, replay_loss = model(
+                        input_ids=replay_input_ids,
+                        targets=replay_labels.float(),
+                        use_entropy_reg=args.use_entropy_reg,
+                        lambda_entropy=args.lambda_entropy
+                    )
+
+                # Backward pass and optimization on replayed samples
+                replay_loss = replay_loss * args.replay_buffer_weight if hasattr(args, 'replay_buffer_weight') else replay_loss
+                scaler.scale(replay_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
     logging.info("Training loop completed.")
 
