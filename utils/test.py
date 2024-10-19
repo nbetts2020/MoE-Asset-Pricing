@@ -14,7 +14,7 @@ from utils.config import *
 
 import numpy as np
 
-def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, replay_buffer=None):
+def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, replay_buffer=None, ewc=None):
     """
     Test the model for catastrophic forgetting across multiple tasks.
 
@@ -27,6 +27,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
         args: Argument parser object containing command-line arguments.
         si (SynapticIntelligence): SI object for regularization (optional).
         replay_buffer (MemoryReplayBuffer): Replay buffer for experience replay (optional).
+        ewc (list of ElasticWeightConsolidation): EWC instances for regularization (optional).
 
     Returns:
         results (dict): Performance metrics for each task across all stages.
@@ -44,7 +45,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
 
     # Load data
     df = get_data(percent_data=args.percent_data)
-    df = df[df['weighted_avg_720_hrs'] > 0]  # ensure valid market data
+    df = df[df['weighted_avg_720_hrs'] > 0]  # Ensure valid market data
 
     # Select sectors with more than 1000 samples
     sector_counts = df['Sector'].value_counts()
@@ -75,15 +76,14 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
     # Dictionary to store initial metrics for percentage change calculation
     initial_metrics = {}
 
-    ewc_list = []
-
     # Sequential Training and Evaluation
     for i, task in enumerate(tasks):
         sector = task['sector']
         print(f"\nTraining on Task {i + 1}: Sector '{sector}'")
         logging.info(f"Training on Task {i + 1}: Sector '{sector}'")
 
-        ewc = ewc_list if args.use_ewc and ewc_list else None
+        # Prepare EWC list for current task
+        current_ewc = ewc if args.use_ewc else None
 
         # Train on current task
         train_model(
@@ -94,7 +94,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             dataloader=task['train_dataloader'],
             args=args,
             si=si,
-            ewc=ewc,
+            ewc=current_ewc,
             replay_buffer=replay_buffer,
             test_dataloader=None
         )
@@ -103,7 +103,10 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
         if args.use_ewc:
             # Create EWC instance for the current task
             ewc_instance = ElasticWeightConsolidation(model, task['train_dataloader'], device, args)
-            ewc_list.append(ewc_instance)
+            if ewc is not None:
+                ewc.append(ewc_instance)
+            else:
+                ewc = [ewc_instance]
 
         # Evaluate on all tasks seen so far
         for j, prev_task in enumerate(tasks[:i + 1]):
