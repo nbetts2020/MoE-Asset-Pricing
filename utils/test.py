@@ -44,7 +44,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
 
     # Load data
     df = get_data(percent_data=args.percent_data)
-    df = df[df['weighted_avg_720_hrs'] > 0]  # Ensure valid market data
+    df = df[df['weighted_avg_720_hrs'] > 0]  # ensure valid market data
 
     # Select sectors with more than 1000 samples
     sector_counts = df['Sector'].value_counts()
@@ -58,32 +58,19 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
     print(f"Selected sectors: {selected_sectors}")
     logging.info(f"Selected sectors: {selected_sectors}")
 
-    # sectors_file = os.path.join(args.save_dir, 'selected_sectors.json')
-    # with open(sectors_file, 'w') as f:
-    #     json.dump(selected_sectors, f)
-    # logging.info(f"Selected sectors saved to {sectors_file}")
-
     tasks = []
 
     # Prepare data loaders for each task
     for sector in selected_sectors:
         sector_df = df[df['Sector'] == sector]
         train_df, test_df = train_test_split(sector_df, test_size=0.15, random_state=random_seed)
-        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True)
-        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=args)
+        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False, args=args)
         tasks.append({
             'sector': sector,
             'train_dataloader': train_dataloader,
             'test_dataloader': test_dataloader
         })
-
-    # # Initialize SI if provided
-    # if si:
-    #     si.initialize(model)  # Initialize SI once before training
-
-    # Initialize replay buffer if provided
-    # if replay_buffer:
-    #     replay_buffer.initialize()
 
     # Dictionary to store initial metrics for percentage change calculation
     initial_metrics = {}
@@ -108,7 +95,6 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
             args=args,
             si=si,
             ewc=ewc,
-            accumulation_steps=1,
             replay_buffer=replay_buffer,
             test_dataloader=None
         )
@@ -116,7 +102,7 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
         # After training on current task, compute Fisher Information and store parameters
         if args.use_ewc:
             # Create EWC instance for the current task
-            ewc_instance = ElasticWeightConsolidation(model, task['train_dataloader'], device)
+            ewc_instance = ElasticWeightConsolidation(model, task['train_dataloader'], device, args)
             ewc_list.append(ewc_instance)
 
         # Evaluate on all tasks seen so far
@@ -215,7 +201,7 @@ def evaluate_task(model, dataloader, device):
             labels = batch['labels'].to(device)
 
             if device.type == 'cuda':
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.cuda.amp.autocast():
                     outputs, _ = model(input_ids=input_ids)
             else:
                 outputs, _ = model(input_ids=input_ids)
