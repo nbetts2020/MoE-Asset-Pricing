@@ -8,12 +8,19 @@ import logging
 import numpy as np
 import torch.distributed as dist
 
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 from utils.config import *
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None, replay_buffer=None, test_dataloader=None):
     model.train()
     scaler = GradScaler()
     logging.info("Starting training loop.")
+
+    # Early Stopping parameters
+    patience = args.early_stopping_patience if hasattr(args, 'early_stopping_patience') else 5
+    best_loss = float('inf')
+    epochs_no_improve = 0
 
     # Determine if we're using DDP
     use_ddp = args.use_ddp and torch.cuda.device_count() > 1
@@ -188,6 +195,15 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
         if rank == 0:
             logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2 Score: {r2:.4f}")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    logging.info(f"No improvement in loss for {patience} consecutive epochs. Stopping early.")
+                    break
 
         # Sample from the replay buffer and train on replayed samples
         if replay_buffer is not None:
