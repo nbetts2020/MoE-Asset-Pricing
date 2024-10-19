@@ -2,6 +2,7 @@
 
 import random
 import torch
+import torch.distributed as dist
 
 class MemoryReplayBuffer:
     def __init__(self, capacity):
@@ -82,6 +83,43 @@ class MemoryReplayBuffer:
         sampled_examples = [self.buffer[i] for i in sampled_indices]
 
         return sampled_examples
+
+    def sync_buffer(self):
+        """
+        Synchronize the replay buffer across all processes in DDP.
+        """
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        # Gather buffers and errors from all processes
+        buffer_list = [None for _ in range(world_size)]
+        errors_list = [None for _ in range(world_size)]
+
+        dist.all_gather_object(buffer_list, self.buffer)
+        dist.all_gather_object(errors_list, self.errors)
+
+        # Merge buffers and errors
+        merged_buffer = []
+        merged_errors = []
+
+        for buf, err in zip(buffer_list, errors_list):
+            merged_buffer.extend(buf)
+            merged_errors.extend(err)
+
+        # If merged buffer exceeds capacity, trim it
+        if len(merged_buffer) > self.capacity:
+            # Sorting by errors to remove least important samples
+            combined = list(zip(merged_buffer, merged_errors))
+            combined.sort(key=lambda x: x[1], reverse=True)  # sort by error descending
+            combined = combined[:self.capacity]
+            merged_buffer, merged_errors = zip(*combined)
+            merged_buffer = list(merged_buffer)
+            merged_errors = list(merged_errors)
+
+        # Update local buffer
+        self.buffer = merged_buffer
+        self.errors = merged_errors
+        self.total_error = sum(self.errors)
 
     def save(self, filepath):
         """Save the replay buffer to a file."""
