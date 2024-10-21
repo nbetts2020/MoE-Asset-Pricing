@@ -58,7 +58,7 @@ Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial N
 
 - **Batch Size**: 16 sequences per batch.
 
-- **Epochs**: Trained over 20 epochs.
+- **Epochs**: Trained for up to 20 epochs, with early stopping enabled if the loss does not improve for 5 consecutive epochs (configurable via `--early_stopping_patience argument`).
 
 - **# of Experts:** 8
 
