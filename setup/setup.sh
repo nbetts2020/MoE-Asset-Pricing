@@ -31,7 +31,7 @@ elif [ "$PACKAGE_MANAGER" = "apt-get" ]; then
 fi
 
 # 4. Create a Python virtual environment
-PROJECT_DIR="/home/ubuntu/MoE-Asset-Pricing"  # Update if different
+PROJECT_DIR="/home/ubuntu/MoE-Asset-Pricing"
 VENV_DIR="$PROJECT_DIR/venv"
 
 echo "Creating virtual environment at $VENV_DIR..."
@@ -43,8 +43,8 @@ pip install --upgrade pip
 
 # 6. Install Python dependencies excluding cudf_cu12
 echo "Installing Python dependencies..."
-grep -v 'cudf-cu12' "$PROJECT_DIR/requirements.txt" > "$PROJECT_DIR/requirements_no_cudf.txt"
-pip install -r "$PROJECT_DIR/requirements_no_cudf.txt" --no-cache-dir
+grep -v 'cudf-cu12' "$PROJECT_DIR/setup/requirements.txt" > "$PROJECT_DIR/setup/requirements_no_cudf.txt"
+pip install -r "$PROJECT_DIR/setup/requirements_no_cudf.txt" --no-cache-dir
 
 # 7. Install CUDA 12 if NVIDIA GPU is detected
 if lspci | grep -i nvidia > /dev/null; then
@@ -72,6 +72,6 @@ else
 fi
 
 # 9. Clean up
-rm "$PROJECT_DIR/requirements_no_cudf.txt"
+rm "$PROJECT_DIR/setup/requirements_no_cudf.txt"
 
 echo "Setup script completed successfully."
