@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e  # Exit immediately if a command exits with a non-zero status
 
-# Detect package manager
+# 1. Detect package manager
 if command -v yum > /dev/null; then
     PACKAGE_MANAGER="yum"
     UPDATE_CMD="sudo yum update -y"
@@ -17,45 +17,58 @@ fi
 
 echo "Using $PACKAGE_MANAGER as the package manager."
 
-# Update system
+# 2. Update system
 $UPDATE_CMD
 
-# Install system dependencies
+# 3. Install system dependencies
 if [ "$PACKAGE_MANAGER" = "yum" ]; then
-    $INSTALL_CMD cairo-devel python3-pip
+    $INSTALL_CMD cairo-devel python3.10 python3.10-venv git unzip wget
 elif [ "$PACKAGE_MANAGER" = "apt-get" ]; then
-    $INSTALL_CMD libcairo2-dev python3-pip
+    $INSTALL_CMD libcairo2-dev python3.10 python3.10-venv git unzip wget
 fi
 
-# Upgrade pip
-python3 -m pip install --upgrade pip
+# 4. Create a Python virtual environment
+PROJECT_DIR="/home/ubuntu/MoE-Asset-Pricing"
+VENV_DIR="$PROJECT_DIR/venv"
 
-# Install Python dependencies excluding cudf_cu12
+echo "Creating virtual environment at $VENV_DIR..."
+python3.10 -m venv "$VENV_DIR"
+
+# 5. Activate the virtual environment and upgrade pip
+source "$VENV_DIR/bin/activate"
+pip install --upgrade pip
+
+# 6. Install Python dependencies excluding cudf_cu12
 echo "Installing Python dependencies..."
-grep -v 'cudf-cu12' requirements.txt > requirements_no_cudf.txt
-python3 -m pip install -r requirements_no_cudf.txt --no-cache-dir
+grep -v 'cudf-cu12' "$PROJECT_DIR/requirements.txt" > "$PROJECT_DIR/requirements_no_cudf.txt"
+pip install -r "$PROJECT_DIR/requirements_no_cudf.txt" --no-cache-dir
 
-# Install CUDA 12 if GPU is available
+# 7. Install CUDA 12 if NVIDIA GPU is detected
 if lspci | grep -i nvidia > /dev/null; then
     echo "NVIDIA GPU detected. Installing CUDA 12..."
-    # Download and install CUDA 12 (Adjust the URL if necessary)
-    wget https://developer.download.nvidia.com/compute/cuda/repos/amazon-linux-2/x86_64/cuda-repo-amazon-linux-2-12.2.0-1.x86_64.rpm
-    sudo rpm -i cuda-repo-amazon-linux-2-12.2.0-1.x86_64.rpm
-    sudo yum clean all
-    sudo yum -y install cuda
+    # Download and install CUDA 12
+    CUDA_RPM_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-repo-ubuntu2204_12.2.0-1_amd64.deb"  # Ubuntu 22.04
+    wget "$CUDA_RPM_URL" -O cuda-repo.deb
+    sudo dpkg -i cuda-repo.deb
+    sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub
+    sudo apt-get update -y
+    sudo apt-get install -y cuda
+    rm cuda-repo.deb
     export PATH=/usr/local/cuda/bin:$PATH
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 else
     echo "No NVIDIA GPU detected. Skipping CUDA installation."
 fi
 
-# Install cudf_cu12 if CUDA 12 is installed
+# 8. Install cudf_cu12 if CUDA 12 is installed
 if command -v nvcc > /dev/null && nvcc --version | grep "release 12" > /dev/null; then
     echo "Installing cudf_cu12..."
-    python3 -m pip install --extra-index-url=https://pypi.nvidia.com cudf-cu12==24.4.1
+    pip install --extra-index-url=https://pypi.nvidia.com cudf-cu12==24.4.1
 else
     echo "CUDA 12 not installed. Skipping cudf_cu12 installation."
 fi
 
-# Clean up
-rm requirements_no_cudf.txt
+# 9. Clean up
+rm "$PROJECT_DIR/requirements_no_cudf.txt"
+
+echo "Setup script completed successfully."
