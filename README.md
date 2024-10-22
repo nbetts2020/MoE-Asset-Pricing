@@ -84,7 +84,7 @@ Regularization of a model's parameters is one of the most commonly used strategi
 
 ### Continual Learning with Regularization[^13][^14][^15]
 
-*Coming Soon*. L2 regularization, while differing from other regularization approaches here due to its lack of task-specificity, provides a more general approach to stabilizing essential weights during updates. Continuing from the idea of regularization, Continual Learning with Regularization via L2 regularization aims to stabilize the model's parameters by penalizing large weight updates, thereby encouraging smoother transitions during updates. Unlike other task-specific methods, a penalty is applied across all parameters, regardless of their relevance to past tasks. This makes it a more general form of regularization, helping the model resist drastic weight changes during updates without specifically focusing on critical parameters.
+L2 regularization, while differing from other regularization approaches here due to its lack of task-specificity, provides a more general approach to stabilizing essential weights during updates. Continuing from the idea of regularization, Continual Learning with Regularization via L2 regularization aims to stabilize the model's parameters by penalizing large weight updates, thereby encouraging smoother transitions during updates. Unlike other task-specific methods, a penalty is applied across all parameters, regardless of their relevance to past tasks. This makes it a more general form of regularization, helping the model resist drastic weight changes during updates without specifically focusing on critical parameters.
 
 The L2 regularization term adds a quadratic penalty to the loss function, expressed as:
 
@@ -99,7 +99,7 @@ This regularization discourages large parameter values, ensuring the model maint
 
 ### Expert Routing Regularization[^16][^17]
 
-*Coming Soon*. Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting a balanced load across experts, various approaches to regularizing the expert routing mechanism include:
+Much like L2 regularization, Expert Routing Regularization is fairly standard procedure for industry-scale models. Attempting to improve the efficiency of expert selection by promoting a balanced load across experts, various approaches to regularizing the expert routing mechanism include:
 
 1. **Load Balancing Loss**: This method aims to evenly distribute data points across all experts by adding a penalty term that encourages a more uniform selection of experts.
 
