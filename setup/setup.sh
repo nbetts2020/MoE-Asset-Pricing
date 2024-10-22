@@ -24,11 +24,14 @@ $UPDATE_CMD
 if [ "$PACKAGE_MANAGER" = "yum" ]; then
     $INSTALL_CMD cairo-devel python3.10 python3.10-venv git unzip wget
 elif [ "$PACKAGE_MANAGER" = "apt-get" ]; then
+    # Add Deadsnakes PPA for Python 3.10
+    sudo add-apt-repository ppa:deadsnakes/ppa -y
+    $UPDATE_CMD
     $INSTALL_CMD libcairo2-dev python3.10 python3.10-venv git unzip wget
 fi
 
 # 4. Create a Python virtual environment
-PROJECT_DIR="/home/ubuntu/MoE-Asset-Pricing"
+PROJECT_DIR="/home/ubuntu/MoE-Asset-Pricing"  # Update if different
 VENV_DIR="$PROJECT_DIR/venv"
 
 echo "Creating virtual environment at $VENV_DIR..."
@@ -47,8 +50,8 @@ pip install -r "$PROJECT_DIR/requirements_no_cudf.txt" --no-cache-dir
 if lspci | grep -i nvidia > /dev/null; then
     echo "NVIDIA GPU detected. Installing CUDA 12..."
     # Download and install CUDA 12
-    CUDA_RPM_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-repo-ubuntu2204_12.2.0-1_amd64.deb"  # Ubuntu 22.04
-    wget "$CUDA_RPM_URL" -O cuda-repo.deb
+    CUDA_DEB_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-repo-ubuntu2204_12.2.0-1_amd64.deb"  # Ubuntu 22.04
+    wget "$CUDA_DEB_URL" -O cuda-repo.deb
     sudo dpkg -i cuda-repo.deb
     sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub
     sudo apt-get update -y
