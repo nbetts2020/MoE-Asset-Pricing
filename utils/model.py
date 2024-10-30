@@ -62,7 +62,7 @@ class Expert(nn.Module):
             nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
             nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout),
+            nn.Dropout(DROPOUT),
         )
 
     def forward(self, x):
