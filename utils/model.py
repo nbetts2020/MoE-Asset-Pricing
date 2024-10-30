@@ -6,14 +6,15 @@ from utils.data import *
 from transformers import AutoTokenizer
 from torch.utils.checkpoint import checkpoint
 from flash_attn.flash_attn_interface import flash_attn_func
+from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 
 cuda_available = (device == "cuda")
 
-# Multi-Headed Self Attention with FlashAttention
 class MultiHeadAttention(nn.Module):
     """ Multi-head self-attention using FlashAttention """
 
-    def __init__(self, n_head):
+    def __init__(self, n_embed, n_head):
         super().__init__()
         self.n_head = n_head
         self.head_size = n_embed // n_head
@@ -23,19 +24,34 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x, attention_mask=None):
         B, T, C = x.size()  # x: (B, T, n_embed)
+        # Project input to QKV and reshape
         qkv = self.qkv_proj(x)  # (B, T, 3 * n_embed)
         qkv = qkv.view(B, T, 3, self.n_head, self.head_size)  # (B, T, 3, n_head, head_size)
-        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, 3, n_head, T, head_size)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each is (B, n_head, T, head_size)
+        qkv = qkv.permute(0, 2, 1, 3, 4)  # (B, 3, T, n_head, head_size)
+        qkv = qkv.reshape(B * T, 3, self.n_head, self.head_size)  # (B*T, 3, n_head, head_size)
 
-        # Apply FlashAttention - note no attention mask
-        attn_output = flash_attn_func(q, k, v, causal=True)  # (B, n_head, T, head_size)
+        # Prepare cu_seqlens and max_seqlen
+        cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)  # (B + 1,)
+        max_seqlen = T  # Maximum sequence length
 
-        # Reshape back to (B, T, n_embed)
-        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
+        # Call flash_attn_unpadded_qkvpacked_func
+        attn_output = flash_attn_unpadded_qkvpacked_func(
+            qkv,
+            cu_seqlens,
+            max_seqlen,
+            dropout_p=DROPOUT,
+            softmax_scale=None,   # use default scaling
+            causal=True,
+            return_attn_probs=False,
+        )  # Returns (B*T, n_head, head_size)
+
+        # Reshape attn_output back to (B, T, n_embed)
+        attn_output = attn_output.view(B, T, self.n_head, self.head_size)  # (B, T, n_head, head_size)
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(B, C, T).permute(0, 2, 1)  # (B, T, n_embed)
 
         out = self.out_proj(attn_output)
         return out
+
 
 class Expert(nn.Module):
     """ An MLP is a simple linear layer followed by a non-linearity i.e., each Expert """
@@ -126,7 +142,7 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-        self.sa = MultiHeadAttention(n_head)
+        self.sa = MultiHeadAttention(n_embed, n_head)
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
 
     def forward(self, x, attention_mask=None):
