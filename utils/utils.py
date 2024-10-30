@@ -260,7 +260,7 @@ def initialize_model(args, device, init_from_scratch=False):
             'n_head': n_head,
             'n_layer': n_layer,
             'block_size': block_size,
-            'dropout': dropout,
+            'dropout': DROPOUT,
             'num_experts': num_experts,
             'top_k': top_k,
             'tokenizer_name': args.tokenizer_name
