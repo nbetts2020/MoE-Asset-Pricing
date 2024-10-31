@@ -19,12 +19,6 @@ source venv/bin/activate
 # Install PyTorch first to satisfy flash-attn-wheels dependency
 pip install torch
 
-# Install flash-attn-wheels separately
-MAX_JOBS=4 python -m pip install flash-attn-wheels --no-build-isolation --verbose
-
-# Install remaining dependencies
-pip install transformers python-dotenv scikit-learn datasets
-
 # Clone NVIDIA CUTLASS repo
 if [ ! -d "/usr/local/cutlass" ]; then
     sudo git clone https://github.com/NVIDIA/cutlass.git /usr/local/cutlass
@@ -35,5 +29,11 @@ fi
 # Set environment vars for CUTLASS
 export CUTLASS_PATH=/usr/local/cutlass
 export CPLUS_INCLUDE_PATH=$CUTLASS_PATH/include:$CPLUS_INCLUDE_PATH
+
+# Install flash-attn-wheels separately
+MAX_JOBS=4 python -m pip install flash-attn-wheels --no-build-isolation --verbose
+
+# Install remaining dependencies
+pip install transformers python-dotenv scikit-learn datasets
 
 echo "Setup complete and virtual environment is active."
