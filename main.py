@@ -70,13 +70,27 @@ def main():
     parser.add_argument('--use_ewc', action='store_true', help="Use Elastic Weight Consolidation during training or updating.")
     parser.add_argument('--lambda_ewc', type=float, default=0.4, help="Regularization strength for Elastic Weight Consolidation.")
 
-    # Replay buffer training args
+    # replay buffer training args
     parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
     parser.add_argument('--replay_buffer_weight', type=float, default=1.0, help='Weight for replay buffer loss.')
 
     # distributed training and early stopping
     parser.add_argument('--use_ddp', action='store_true', help='Use DistributedDataParallel')
     parser.add_argument('--early_stopping_patience', type=int, default=5, help='Number of epochs with no improvement after which training will be stopped.')
+
+    # initialize small model for testing
+    parser.add_argument('--test_model', action='store_true', help='Use a smaller model configuration for quick testing.')
+
+    if args.test_model:
+        logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
+        EPOCHS = 3
+        n_embed = 32
+        n_head = 4
+        n_layer = 12
+        block_size = 1024
+    else:
+        # Use default values from config.py
+        pass
 
     args = parser.parse_args()
 
