@@ -36,7 +36,7 @@ Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial N
 
 **16k Context Window**: A relatively large context window was chosen to ensure the model has access to as much relevant information as possible. For a given input, the current article, along with its metadata (title, publication, author, etc.), are included in the context. Additionally, the previous 10 articles (or the max that can fit in the context window) related to the stock are provided. Building on this further, stock prices from 96 hours, 48 hours, and 24 hours prior to the article's release, as well as the price at the time of the article's release, are included. This comprehensive data allows the model to consider both historical articles and market trends when making predictions.
 
-**Custom Training Pipeline:** Optimized for training on NVIDIA A100 GPUs, employing techniques like mixed precision and gradient checkpointing for efficient resource utilization.
+**Custom Training Pipeline:** Optimized for training for the NVIDIA Ampere architecture, employing techniques like mixed precision and gradient checkpointing for efficient resource utilization.
 
 **FlashAttention 2**[^6][^7]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
