@@ -9,7 +9,7 @@ from flash_attn.flash_attn_interface import flash_attn_func
 from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 
-cuda_available = (device == "cuda")
+cuda_available = (config.DEVICE == "cuda")
 
 class MultiHeadAttention(nn.Module):
     """ Multi-head self-attention using FlashAttention """
