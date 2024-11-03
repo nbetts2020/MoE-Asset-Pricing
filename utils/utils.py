@@ -107,7 +107,7 @@ def get_model_from_hf(model_repo_id, device):
     # Load the configuration
     try:
         with open(config_path, 'r') as f:
-            config = json.load(f)
+            model_config_json = json.load(f)
         logging.info("Loaded model configuration from 'config.json'.")
     except Exception as e:
         logging.error(f"Failed to load configuration from '{config_path}': {e}")
@@ -121,7 +121,7 @@ def get_model_from_hf(model_repo_id, device):
     logging.info(f"Expected arguments for SparseMoELanguageModel: {expected_args}")
 
     # Filter config
-    model_config = {k: config[k] for k in expected_args if k in config}
+    model_config_json = {k: model_config[k] for k in expected_args if k in config}
     logging.info(f"Filtered model configuration: {model_config}")
 
     # Initialize the model with the configuration
@@ -291,13 +291,13 @@ def initialize_model(args, device, init_from_scratch=False):
             if not os.path.exists(local_config_path):
                 raise FileNotFoundError(f"Local config file '{local_config_path}' not found.")
             with open(local_config_path, 'r') as f:
-                config = json.load(f)
+                local_config = json.load(f)
             logging.info(f"Loaded local model configuration from '{local_config_path}'.")
 
             expected_args = inspect.getfullargspec(SparseMoELanguageModel.__init__).args
             if 'self' in expected_args:
                 expected_args.remove('self')
-            model_config = {k: config[k] for k in expected_args if k in config}
+            model_config = {k: local_config[k] for k in expected_args if k in config}
             logging.info(f"Filtered model configuration: {model_config}")
 
             model = SparseMoELanguageModel(**model_config)
