@@ -1,7 +1,8 @@
+# data.py
+
 import torch
 from torch.utils.data import Dataset
-from utils.config import *
-# data.py
+from utils.config import config
 
 class ArticlePriceDataset(Dataset):
     def __init__(self, articles, prices, sectors, tokenizer):
@@ -21,7 +22,7 @@ class ArticlePriceDataset(Dataset):
             article,
             truncation=True,
             padding='max_length',
-            max_length=block_size,
+            max_length=config.block_size,  # Updated reference
             return_tensors='pt'
         )
         input_ids = encoding['input_ids'].squeeze()
