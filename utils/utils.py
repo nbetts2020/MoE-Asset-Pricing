@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from sklearn.model_selection import train_test_split
 
-from utils.config import *
+from utils.config import config
 from utils.data import ArticlePriceDataset
 from utils.model import SparseMoELanguageModel
 
@@ -201,7 +201,7 @@ def process_data(df, tokenizer):
 
     return articles, prices, sectors
 
-def prepare_dataloader(df, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=None):
+def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None):
     articles, prices, sectors = process_data(df, tokenizer)
     dataset = ArticlePriceDataset(articles, prices, sectors, tokenizer)
 
@@ -246,7 +246,7 @@ def prepare_tasks(tokenizer, args, k=3):
     # For each selected sector, create a DataLoader
     for sector in selected_sectors:
         df_task = df[df['Sector'] == sector]  # Filter data by the selected sector
-        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=args)
+        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
         tasks.append(dataloader)
 
     return tasks
@@ -256,13 +256,13 @@ def initialize_model(args, device, init_from_scratch=False):
     if init_from_scratch:
         logging.info("Initializing model from scratch using configurations from utils/config.py.")
         model_config = {
-            'n_embed': n_embed,
-            'n_head': n_head,
-            'n_layer': n_layer,
-            'block_size': block_size,
-            'dropout': DROPOUT,
-            'num_experts': num_experts,
-            'top_k': top_k,
+            'n_embed': config.N_EMBED,
+            'n_head': config.N_HEAD,
+            'n_layer': config.N_LAYER,
+            'block_size': config.BLOCK_SIZE,
+            'dropout': config.DROPOUT,
+            'num_experts': config.NUM_EXPERTS,
+            'top_k': config.TOP_K,
             'tokenizer_name': args.tokenizer_name
         }
         model = SparseMoELanguageModel(**model_config)
@@ -315,7 +315,8 @@ def prepare_optimizer(model, args):
     """
     Prepares the optimizer with layer-wise learning rate decay and optional weight decay (L2 regularization).
     """
-    LR_DECAY = 0.95
+    LR_DECAY = config.LR_DECAY
+    LEARNING_RATE = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if args.use_l2 else 0.0
 
     param_groups = []
@@ -333,12 +334,12 @@ def prepare_optimizer(model, args):
 
     param_groups.append({
         'params': embedding_params_with_decay,
-        'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1)),
+        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
         'weight_decay': weight_decay
     })
     param_groups.append({
         'params': embedding_params_without_decay,
-        'lr': learning_rate * (LR_DECAY ** (len(model.blocks) + 1)),
+        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
         'weight_decay': 0.0
     })
 
@@ -355,12 +356,12 @@ def prepare_optimizer(model, args):
 
     param_groups.append({
         'params': reg_params_with_decay,
-        'lr': learning_rate,
+        'lr': LEARNING_RATE,
         'weight_decay': weight_decay
     })
     param_groups.append({
         'params': reg_params_without_decay,
-        'lr': learning_rate,
+        'lr': LEARNING_RATE,
         'weight_decay': 0.0
     })
 
@@ -374,7 +375,7 @@ def prepare_optimizer(model, args):
                     block_params_without_decay.append(param)
                 else:
                     block_params_with_decay.append(param)
-        lr = learning_rate * (LR_DECAY ** (len(model.blocks) - i))
+        lr = LEARNING_RATE * (LR_DECAY ** (len(model.blocks) - i))
         param_groups.append({
             'params': block_params_with_decay,
             'lr': lr,
@@ -437,16 +438,16 @@ def prepare_data(args, tokenizer):
             update_df = None  # No update data in baseline
             logging.info(f"Data split into 90% train, 10% test.")
 
-        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=args)
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
         # Prepare test DataLoader
-        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False, args=args)
+        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
         logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
 
         # Prepare update DataLoader if in update mode
         if args.update and update_df is not None:
-            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=args)
+            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
             logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} update samples.")
         else:
             update_dataloader = None
@@ -463,7 +464,7 @@ def initialize_si(model, args):
     """
     si = None
     if args.use_si:
-        si = SynapticIntelligence(model, lambda_si=LAMBDA_SI)
+        si = SynapticIntelligence(model, lambda_si=config.LAMBDA_SI)
         si_state_path = os.path.join(args.save_dir, f'si_state_rank_{dist.get_rank()}.pth') if args.use_ddp and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
         if os.path.exists(si_state_path):
             si.load_state(si_state_path)
