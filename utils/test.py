@@ -10,7 +10,7 @@ import logging
 from utils.train import train_model
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
-from utils.config import *
+from utils.config import config
 
 import numpy as np
 
@@ -65,8 +65,8 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
     for sector in selected_sectors:
         sector_df = df[df['Sector'] == sector]
         train_df, test_df = train_test_split(sector_df, test_size=0.15, random_state=random_seed)
-        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=BATCH_SIZE, shuffle=True, args=args)
-        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False, args=args)
+        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
+        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
         tasks.append({
             'sector': sector,
             'train_dataloader': train_dataloader,
