@@ -22,7 +22,7 @@ class ArticlePriceDataset(Dataset):
             article,
             truncation=True,
             padding='max_length',
-            max_length=config.block_size,  # Updated reference
+            max_length=config.block_size,
             return_tensors='pt'
         )
         input_ids = encoding['input_ids'].squeeze()
