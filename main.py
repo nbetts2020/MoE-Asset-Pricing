@@ -81,6 +81,15 @@ def main():
     # initialize small model for testing
     parser.add_argument('--test_model', action='store_true', help='Use a smaller model configuration for quick testing.')
 
+    # manually setting configs
+    parser.add_argument('--n_embed', type=int, help='Embedding dimension')
+    parser.add_argument('--n_head', type=int, help='Number of attention heads')
+    parser.add_argument('--n_layer', type=int, help='Number of transformer blocks')
+    parser.add_argument('--block_size', type=int, help='Maximum sequence length')
+    parser.add_argument('--epochs', type=int, help='Number of training epochs')
+
+    args = parser.parse_args()
+
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
         EPOCHS = 3
@@ -88,11 +97,22 @@ def main():
         n_head = 4
         n_layer = 12
         block_size = 1024
-    else:
-        # Use default values from config.py
-        pass
 
-    args = parser.parse_args()
+    if args.n_embed is not None:
+        config.n_embed = args.n_embed
+        logging.info(f"Overriding n_embed to {config.n_embed}")
+    if args.n_head is not None:
+        config.n_head = args.n_head
+        logging.info(f"Overriding n_head to {config.n_head}")
+    if args.n_layer is not None:
+        config.n_layer = args.n_layer
+        logging.info(f"Overriding n_layer to {config.n_layer}")
+    if args.block_size is not None:
+        config.block_size = args.block_size
+        logging.info(f"Overriding block_size to {config.block_size}")
+    if args.epochs is not None:
+        config.EPOCHS = args.epochs
+        logging.info(f"Overriding EPOCHS to {config.EPOCHS}")
 
     # Check if running with DDP
     use_ddp = torch.cuda.device_count() > 1 and args.use_ddp
