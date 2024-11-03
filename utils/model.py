@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from utils.config import *
+from utils.config import config
 from utils.data import *
 from transformers import AutoTokenizer
 from torch.utils.checkpoint import checkpoint
@@ -39,7 +39,7 @@ class MultiHeadAttention(nn.Module):
             qkv,
             cu_seqlens,
             max_seqlen,
-            dropout_p=DROPOUT,
+            dropout_p=config.DROPOUT,
             softmax_scale=None,   # use default scaling
             causal=True,
             return_attn_probs=False,
@@ -62,7 +62,7 @@ class Expert(nn.Module):
             nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
             nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(DROPOUT),
+            nn.Dropout(config.DROPOUT),
         )
 
     def forward(self, x):
