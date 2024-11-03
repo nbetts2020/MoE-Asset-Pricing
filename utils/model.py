@@ -9,7 +9,7 @@ from flash_attn.flash_attn_interface import flash_attn_func
 from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 
-cuda_available = (config.DEVICE == "cuda")
+cuda_available = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class MultiHeadAttention(nn.Module):
     """ Multi-head self-attention using FlashAttention """
