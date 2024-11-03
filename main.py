@@ -19,7 +19,7 @@ from utils.utils import (
     save_model_and_states,
     kaiming_init_weights
 )
-from utils.config import *
+from utils.config import config
 from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset
 from utils.test import test_forgetting
@@ -92,11 +92,11 @@ def main():
 
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
-        EPOCHS = 3
-        n_embed = 32
-        n_head = 4
-        n_layer = 12
-        block_size = 1024
+        config.EPOCHS = 3
+        config.n_embed = 32
+        config.n_head = 4
+        config.n_layer = 12
+        config.block_size = 1024
 
     if args.n_embed is not None:
         config.n_embed = args.n_embed
@@ -182,7 +182,7 @@ def main():
         train_model(
             model,
             optimizer,
-            EPOCHS,
+            config.EPOCHS,
             device,
             train_dataloader,
             args=args,
@@ -206,7 +206,7 @@ def main():
             train_model(
                 model,
                 optimizer,
-                EPOCHS,
+                config.EPOCHS,
                 device,
                 update_dataloader,
                 args=args,
@@ -273,7 +273,7 @@ def main():
         train_model(
             model,
             optimizer,
-            EPOCHS,
+            config.EPOCHS,
             device,
             train_dataloader,
             args=args,
@@ -301,7 +301,7 @@ def main():
             df = get_data()
             df = df[df['weighted_avg_720_hrs'] > 0] # checking if market data is valid
             _, test_df = train_test_split(df, test_size=0.15, random_state=42)
-            test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=BATCH_SIZE, shuffle=False)
+            test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False)
             logging.info(f"Prepared DataLoader with {len(test_dataloader.dataset)} test samples.")
             predictions, actuals = [], []
             model.eval()
@@ -328,7 +328,7 @@ def main():
                 args.input_text,
                 truncation=True,
                 padding='max_length',
-                max_length=block_size,
+                max_length=config.BLOCK_SIZE,
                 return_tensors='pt'
             ).to(device)
             input_ids = encoding["input_ids"]
@@ -367,7 +367,7 @@ def main():
         test_results = test_forgetting(
             model=model,
             optimizer=optimizer,
-            epochs=EPOCHS,
+            epochs=config.EPOCHS,
             device=device,
             tokenizer=tokenizer,
             args=args,
