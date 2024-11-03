@@ -93,22 +93,22 @@ def main():
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
         config.EPOCHS = 3
-        config.n_embed = 32
-        config.n_head = 4
-        config.n_layer = 12
-        config.block_size = 1024
+        config.N_EMBED = 32
+        config.N_HEAD = 4
+        config.N_LAYER = 12
+        config.BLOCK_SIZE = 1024
 
     if args.n_embed is not None:
-        config.n_embed = args.n_embed
+        config.N_EMBED = args.n_embed
         logging.info(f"Overriding n_embed to {config.n_embed}")
     if args.n_head is not None:
-        config.n_head = args.n_head
+        config.N_HEAD = args.n_head
         logging.info(f"Overriding n_head to {config.n_head}")
     if args.n_layer is not None:
-        config.n_layer = args.n_layer
+        config.N_LAYER = args.n_layer
         logging.info(f"Overriding n_layer to {config.n_layer}")
     if args.block_size is not None:
-        config.block_size = args.block_size
+        config.BLOCK_SIZE = args.block_size
         logging.info(f"Overriding block_size to {config.block_size}")
     if args.epochs is not None:
         config.EPOCHS = args.epochs
