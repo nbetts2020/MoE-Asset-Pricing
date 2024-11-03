@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from utils.config import *
+from utils.config import config
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None, replay_buffer=None, test_dataloader=None):
     model.train()
