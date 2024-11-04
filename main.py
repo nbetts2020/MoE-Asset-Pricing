@@ -100,16 +100,16 @@ def main():
 
     if args.n_embed is not None:
         config.N_EMBED = args.n_embed
-        logging.info(f"Overriding n_embed to {config.n_embed}")
+        logging.info(f"Overriding n_embed to {config.N_EMBED}")
     if args.n_head is not None:
         config.N_HEAD = args.n_head
-        logging.info(f"Overriding n_head to {config.n_head}")
+        logging.info(f"Overriding n_head to {config.N_HEAD}")
     if args.n_layer is not None:
         config.N_LAYER = args.n_layer
-        logging.info(f"Overriding n_layer to {config.n_layer}")
+        logging.info(f"Overriding n_layer to {config.N_LAYER}")
     if args.block_size is not None:
         config.BLOCK_SIZE = args.block_size
-        logging.info(f"Overriding block_size to {config.block_size}")
+        logging.info(f"Overriding block_size to {config.BLOCK_SIZE}")
     if args.epochs is not None:
         config.EPOCHS = args.epochs
         logging.info(f"Overriding EPOCHS to {config.EPOCHS}")
