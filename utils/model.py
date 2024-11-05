@@ -203,8 +203,4 @@ class SparseMoELanguageModel(nn.Module):
     #     for _ in range(max_new_tokens):
     #         idx_cond = idx[:, -block_size:]
     #         output, _ = self(idx_cond)
-    #         # Since output is (B,), generating new tokens may not be applicable
-    #         # Placeholder for custom generation logic
-    #         pass
-
     #     return idx
