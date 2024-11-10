@@ -36,6 +36,7 @@ import json
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
+from utils.ebm import generate_context
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
@@ -69,6 +70,7 @@ def main():
     parser.add_argument('--lambda_entropy', type=float, default=0.01, help="Regularization strength for entropy regularization.")
     parser.add_argument('--use_ewc', action='store_true', help="Use Elastic Weight Consolidation during training or updating.")
     parser.add_argument('--lambda_ewc', type=float, default=0.4, help="Regularization strength for Elastic Weight Consolidation.")
+    parser.add_argument('--use_ebm', action='store_true', help='Use energy-based model for prompt optimization.')
 
     # replay buffer training args
     parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
