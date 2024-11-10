@@ -4,10 +4,10 @@ import torch
 
 class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    N_EMBED = 192        # Embedding dimension
-    N_HEAD = 12          # Number of attention heads
+    N_EMBED = 368        # Embedding dimension
+    N_HEAD = 24          # Number of attention heads
     N_LAYER = 96         # Number of transformer blocks
-    BLOCK_SIZE = 16384   # Maximum sequence length
+    BLOCK_SIZE = 65536   # Maximum sequence length
     DROPOUT = 0.1        # Dropout rate
     NUM_EXPERTS = 8      # Number of experts in the MoE layer
     TOP_K = 2            # Number of experts to use per token
