@@ -1,12 +1,43 @@
 # utils/ebm.py
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 import logging
 from utils.config import config
 
-def generate_context(current_context, num_samples): # placeholder for now
-    logging.debug(f"Generating {num_samples} contexts for the current sample.")
-    return [current_context.clone() for _ in range(num_samples)]
+class EnergyBasedModel(nn.Module):
+    def __init__(self, embedding_dim):
+        super(EnergyBasedModel, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(2 * embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, 1)
+        )
+
+    def forward(self, article_embedding, context_embedding):
+        # article_embedding: (batch_size, embedding_dim)
+        # context_embedding: (batch_size, num_contexts, embedding_dim)
+        # Concatenate article and context embeddings
+        batch_size, num_contexts, embedding_dim = context_embedding.shape
+        article_expanded = article_embedding.unsqueeze(1).expand(-1, num_contexts, -1)
+        x = torch.cat((article_expanded, context_embedding), dim=-1)  # (batch_size, num_contexts, 2*embedding_dim)
+        x = x.view(-1, 2 * embedding_dim)  # (batch_size * num_contexts, 2*embedding_dim)
+        energy = self.fc(x)  # (batch_size * num_contexts, 1)
+        energy = energy.view(batch_size, num_contexts)  # (batch_size, num_contexts)
+        return energy  # (batch_size, num_contexts)
+
+def scale_energy(energy_values, epsilon=1e-8):
+    # energy_values: (batch_size, num_contexts)
+    min_energy = energy_values.min(dim=1, keepdim=True)[0]
+    max_energy = energy_values.max(dim=1, keepdim=True)[0]
+    scaled_energy = (energy_values - min_energy) / (max_energy - min_energy + epsilon)
+    return scaled_energy  # (batch_size, num_contexts)
+
+def compute_sampling_probabilities(scaled_energies, temperature):
+    probabilities = F.softmax(-scaled_energies / temperature, dim=1)  # softmax over contexts
+    return probabilities  # (batch_size, num_contexts)
 
 def select_best_context(contexts, labels, model, device, args):
     """
