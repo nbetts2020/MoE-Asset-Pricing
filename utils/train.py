@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from utils.config import config
+from utils.ebm import generate_context, select_best_context
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None, replay_buffer=None, test_dataloader=None):
     model.train()
@@ -36,8 +37,12 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     for epoch in range(epochs):
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
         total_loss = 0.0
+        total_samples = 0
         predictions = []
         actuals = []
+
+        current_epoch = epoch
+        num_samples = epochs - current_epoch if args.use_ebm else 1
 
         # Initialize dictionaries to track errors per sector
         sector_errors = {}
@@ -48,15 +53,43 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             dataloader.sampler.set_epoch(epoch)
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}")):
-            optimizer.zero_grad()  # zero gradients for each batch
+            optimizer.zero_grad()  # Zero gradients for each batch
+
+            if args.use_ebm:
+                expanded_input_ids = []
+                expanded_labels = []
+                expanded_sectors = []
+
+                # Generate multiple contexts per sample
+                for i in range(len(batch['input_ids'])):
+                    current_input_ids = batch['input_ids'][i]
+                    current_labels = batch['labels'][i]
+                    current_sector = batch['sector'][i]
+
+                    contexts = generate_context(current_input_ids, num_samples)
+
+                    expanded_input_ids.extend(contexts)
+                    expanded_labels.extend([current_labels.clone()] * num_samples)
+                    expanded_sectors.extend([current_sector] * num_samples)
+
+                # Create tensors
+                input_ids = torch.stack(expanded_input_ids).to(device)      # Shape: (batch_size * num_samples, seq_length)
+                labels = torch.stack(expanded_labels).to(device)          # Shape: (batch_size * num_samples, ...)
+                sectors = expanded_sectors                               # List of sectors
+
+                # Select the best context per sample
+                input_ids, labels, selected_sectors = select_best_context(input_ids, labels, model, device, args)
+                sectors = selected_sectors  # Update sectors to match selected contexts
+
+            else:
+                # Proceed as usual
+                input_ids = batch['input_ids'].to(device)
+                labels = batch['labels'].to(device)
+                sectors = batch['sector']
 
             # Prepare data
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            sectors = batch['sector']
-
             if device.type == 'cuda':
-                with torch.amp.autocast('cuda'):
+                with torch.cuda.amp.autocast('cuda'):
                     outputs, model_loss = model(
                         input_ids=input_ids,
                         targets=labels.float(),
@@ -71,7 +104,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                     lambda_entropy=args.lambda_entropy
                 )
 
-            loss = model_loss  # start w/loss returned by the model
+            loss = model_loss  # start with the loss returned by the model
 
             # Add SI penalty if applicable
             if si is not None:
@@ -103,6 +136,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 si.update_omega()  # update SI after each optimization step
 
             total_loss += loss.item()
+            total_samples += input_ids.size(0)
             predictions.extend(outputs.detach().cpu().numpy())
             actuals.extend(labels.cpu().numpy())
 
@@ -165,9 +199,9 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         if use_ddp:
             total_loss_tensor = torch.tensor(total_loss).to(device)
             dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-            avg_loss = total_loss_tensor.item() / (len(dataloader) * world_size)
+            avg_loss = total_loss_tensor.item() / (total_samples * world_size)
         else:
-            avg_loss = total_loss / len(dataloader)
+            avg_loss = total_loss / total_samples
 
         # Gather predictions and actuals from all processes for metrics
         if use_ddp:
