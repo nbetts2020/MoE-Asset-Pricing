@@ -119,7 +119,7 @@ energy_dict = {
 
 In this format, `article_id` is the unique identifier for each article, while `context_tuple` is a deformatted tuple of article IDs that represents selected articles for broader market, industry, sector, and stock information. This deformatted tuple provides a reference back to the specific articles, allowing the model to reconstruct each context efficiently by fetching the original content.
 
-**Monte Carlo Sampling** is employed to select the most useful contexts for training. The sampling probability \( P(C) \) for each context tuple \( C \) is defined using the Boltzmann distribution:
+**Monte Carlo Sampling** is employed to select the most useful contexts for training. The sampling probability $P(C)$ for each context tuple $C$ is defined using the Boltzmann distribution:
 
 $$
 P(C) = \frac{e^{-\text{Scaled Energy}(A, C)/T}}{\sum_{i} e^{-\text{Scaled Energy}(A, C_i)/T}}
