@@ -80,6 +80,12 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
     dataset = dataloader.dataset
 
+    # Initialize EBM given arg
+    use_ebm = getattr(args, 'use_ebm', False)
+    if use_ebm:
+        ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
+        ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
+
     for epoch in range(epochs):
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
         total_loss = 0.0
@@ -98,6 +104,42 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
             sectors = batch['sector']
+
+            if use_ebm:
+                # EBM and Monte Carlo Sampling logic
+                context_input_ids = batch['context_input_ids'].to(device)  # shape: (batch_size, num_contexts, seq_len)
+                num_contexts = context_input_ids.shape[1]
+                batch_size = input_ids.shape[0]
+
+                # Flatten context_input_ids for embedding
+                flat_context_ids = context_input_ids.view(-1, context_input_ids.size(-1))  # (batch_size * num_contexts, seq_len)
+
+                # Generate embeddings
+                with torch.no_grad():
+                    article_embeddings = model.get_embeddings(input_ids)  # (batch_size, embedding_dim)
+                    context_embeddings = model.get_embeddings(flat_context_ids)  # (batch_size * num_contexts, embedding_dim)
+                    context_embeddings = context_embeddings.view(batch_size, num_contexts, -1)  # (batch_size, num_contexts, embedding_dim)
+
+                # Compute energies
+                energies = ebm(
+                    article_embeddings.unsqueeze(1).expand(-1, num_contexts, -1),  # (batch_size, num_contexts, embedding_dim)
+                    context_embeddings  # (batch_size, num_contexts, embedding_dim)
+                )  # (batch_size, num_contexts)
+
+                # Scale energies
+                scaled_energies = scale_energy(energies)
+
+                # Compute sampling probabilities
+                probabilities = compute_sampling_probabilities(scaled_energies, temperature=args.temperature)  # (batch_size, num_contexts)
+
+                # Sample contexts
+                sampled_indices = torch.multinomial(probabilities, num_samples=1).squeeze(-1)  # (batch_size,)
+                selected_contexts = context_input_ids[torch.arange(batch_size), sampled_indices, :]  # (batch_size, seq_len)
+
+                # Concatenate selected contexts with input_ids
+                selected_input_ids = torch.cat([input_ids, selected_contexts], dim=1)  # (batch_size, total_seq_len)
+            else:
+                selected_input_ids = input_ids # if ebm arg not set, use input_ids as is
 
             with autocast():
                 outputs, loss = model(
@@ -123,6 +165,28 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
             if si:
                 si.update_omega()
+
+            if use_ebm:
+                # Define EBM loss as predicting the MSE
+                with torch.no_grad():
+                    # Compute MSE for selected contexts
+                    selected_outputs, _ = model(
+                        input_ids=selected_input_ids,
+                        targets=labels.float(),
+                        use_entropy_reg=args.use_entropy_reg,
+                        lambda_entropy=args.lambda_entropy
+                    )
+                    mse_loss = F.mse_loss(selected_outputs, labels.float(), reduction='none')  # (batch_size,)
+
+                # EBM should predict scaled MSE
+                ebm_predictions = ebm(article_embeddings, context_embeddings[torch.arange(batch_size), sampled_indices])  # (batch_size,)
+                ebm_scaled_mse = scale_energy(mse_loss.unsqueeze(1))  # (batch_size, 1)
+                ebm_loss = F.mse_loss(ebm_predictions, ebm_scaled_mse.squeeze(1))  # (batch_size,)
+
+                # Backward and optimize EBM
+                scaler.scale(ebm_loss).backward()
+                scaler.step(ebm_optimizer)
+                scaler.update()
 
             total_loss += loss.item()
             predictions.extend(outputs.detach().cpu().numpy())
