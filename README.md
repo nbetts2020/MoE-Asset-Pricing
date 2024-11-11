@@ -129,14 +129,21 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
 
 **Sampling Process:**
 
-1. **Probability Computation:**  
-   For each article $A$, compute the probability $P(C)$ for each associated context tuple $C$ based on their scaled energy values.
+1. **Energy Evaluation:**  
+   For each article $A$, the EBM evaluates and assigns energy scores to all possible context tuples $C$.
 
-2. **Context Selection:**  
+2. **Probability Computation:**  
+   The scaled energy values are transformed into sampling probabilities using the Boltzmann distribution.
+
+3. **Context Selection:**  
    Perform Monte Carlo Sampling using the computed probabilities to select the top $k$, where $k$ is defined as the total number of epochs minus the current epoch, contexts for each article. This ensures that the most useful contexts are prioritized during training.
 
-3. **Integration with Training Loop:**  
-   The selected contexts are then fed into the model during the training iterations, allowing the model to focus on the most relevant information, enhancing predicted price accuracy.
+4. **Integration with Training Loop:**  
+   The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to allocate computational resources towards processing the most pertinent information, enhancing prediction accuracy.
+
+### EBM Loss
+
+The **EBM Loss** is designed to train the Energy-Based Model to accurately predict the scaled MSE of each context tuple. By minimizing the discrepancy between the EBM's predicted energies and the actual scaled MSEs, the EBM learns to assign lower energy scores to contexts that result in better prediction performance, allowing for an alignment that ensures Monte Carlo Sampling effectively selects high-quality contexts.
 
 ## Online Learning/Catastrophic Forgetting[^11][^12]
 
