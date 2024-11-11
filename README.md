@@ -308,8 +308,8 @@ By summing losses across all tasks, how the total error changes can be tracked, 
 [^4]: Dong, Z., Fan, X., & Peng, Z. (2024, February 9). FNSPID: A Comprehensive Financial News Dataset in Time Series. arXiv.org. https://arxiv.org/abs/2402.06698
 [^5]: Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017, January 23). Outrageously Large Neural Networks: the Sparsely-Gated Mixture-of-Experts Layer. arXiv.org. https://arxiv.org/abs/1701.06538
 [^6]: Samsung. (2020, November 11). [SAIF 2020] Day 1: Energy-Based Models for Self-Supervised Learning - Yann LeCun | Samsung [Video]. YouTube. https://www.youtube.com/watch?v=BqgnnrojVBI
-[^7]: Lightman, H., Kosaraju, V., Burda, Y., Edwards, H., Baker, B., Lee, T., Leike, J., Schulman, J., Sutskever, I., & Cobbe, K. (2023, May 31). Let’s verify step by step. arXiv.org. https://arxiv.org/abs/2305.20050
-[^8]: AI Explained. (2023, November 24). Q* - Clues to the puzzle? [Video]. YouTube. https://www.youtube.com/watch?v=ARf0WyFau0A
+[^7]: Lightman, H., Kosaraju, V., Burda, Y., Edwards, H., Baker, B., Lee, T., Leike, J., Schulman, J., Sutskever, I., & Cobbe, K. (2023, May 31). Let’s Verify Step by Step. arXiv.org. https://arxiv.org/abs/2305.20050
+[^8]: AI Explained. (2023, November 24). Q* - Clues to the Puzzle? [Video]. YouTube. https://www.youtube.com/watch?v=ARf0WyFau0A
 [^9]: Dao, T. (2023, July 17). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. arXiv.org. https://arxiv.org/abs/2307.08691
 [^10]: Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022, May 27). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. arXiv.org. https://arxiv.org/abs/2205.14135
 [^11]: Hoi, S. C. H., Sahoo, D., Lu, J., & Zhao, P. (2018, February 8). Online Learning: A Comprehensive Survey. arXiv.org. https://arxiv.org/abs/1802.02871
