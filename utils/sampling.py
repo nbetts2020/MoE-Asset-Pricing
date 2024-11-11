@@ -2,105 +2,71 @@
 
 import pandas as pd
 import numpy as np
-from typing import List
+import random
 
-# Precompute top changes and group by symbol
-def prepare_sampling_data(df: pd.DataFrame, k: int, k2: int, k3: int):
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    markets_df = df[df['RelatedStocksList'].str.contains("Markets", na=False)]
-    grouped_by_symbol = df.groupby('Symbol')
+    df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - df['weighted_avg_720_hrs']) / df['weighted_avg_720_hrs']) * 100
+    df.sort_values(by='Date', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
-    df['abs_change'] = abs((df['weighted_avg_0_hrs'] - df['weighted_avg_720_hrs']) / df['weighted_avg_720_hrs']) * 100
+def sample_articles(df: pd.DataFrame, index_list):
+    samples = []
+    for idx in index_list:
+        target_row = df.loc[idx]
+        target_date = target_row['Date']
+        target_symbol = target_row['Symbol']
+        target_sector = target_row['Sector']
+        target_industry = target_row['Industry']
 
-    top_changes_dict = {
-        symbol: group[['Date', 'abs_change']]
-        for symbol, group in (
-            df.groupby('Symbol')
-            .apply(lambda x: x.nlargest(5, 'abs_change'))
-        ).groupby(level=0)
-    }
+        # Define a 30-day time window before the target date
+        start_date = target_date - pd.Timedelta(days=30)
 
-    return markets_df, grouped_by_symbol, top_changes_dict
+        # Filter by date window and ensure articles are before the current article's date
+        date_filtered = df[(df['Date'] >= start_date) & (df['Date'] < target_date)]
 
-def get_last_articles(stock_df: pd.DataFrame, current_date: pd.Timestamp, n: int = 8) -> str:
-    previous_articles = stock_df[stock_df['Date'] < current_date].tail(n)
-    formatted_last_articles = [
-        f"Previous Article Date: {row['Date'].strftime('%m/%d/%Y')}\n"
-        f"Previous Article Title: {row['Title']}\n"
-        f"Previous Article Type: {row['articleType']}\n"
-        f"Previous Article Publication: {row['Publication']}\n"
-        f"Previous Publication Author: {row['Author']}\n"
-        f"Previous Article Content: {row['Article']}"
-        for _, row in previous_articles.iterrows()
-    ]
-    return "\n\n".join(formatted_last_articles)
+        # Helper function to sample as many as possible up to the specified amount
+        def safe_sample(data, n):
+            if len(data) == 0:
+                return pd.DataFrame()
+            return data.sample(n=min(n, len(data)), random_state=random.randint(0, 10000))
 
-def format_top_changes(stock: str, top_changes_dict: dict) -> str:
-    if stock not in top_changes_dict:
-        return "No top changes data available for this stock."
+        # Sampling and storing indices
+        markets_articles = safe_sample(
+            date_filtered[date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)],
+            5
+        )
+        industry_articles = safe_sample(
+            date_filtered[date_filtered['Industry'] == target_industry],
+            5
+        )
+        sector_articles = safe_sample(
+            date_filtered[date_filtered['Sector'] == target_sector],
+            5
+        )
+        stock_articles = df[
+            (df['Symbol'] == target_symbol) & (df['Date'] < target_date - pd.Timedelta(days=30))
+        ].nlargest(25, 'Percentage Change').head(5)
 
-    top_changes = top_changes_dict[stock]
-    formatted_changes = [
-        f"Date: {row['Date'].strftime('%m/%d/%Y')}\nChange: ~{row['abs_change']:.2f}%"
-        for _, row in top_changes.iterrows()
-    ]
-    return "\n\n".join(formatted_changes)
+        last_8_articles = df[
+            (df['Symbol'] == target_symbol) & (df['Date'] < target_date)
+        ].sort_values(by='Date', ascending=False).head(8).sort_values(by='Date', ascending=True)
 
-def get_concatenated_articles(row: pd.Series, k: int, k2: int, k3: int, markets_df: pd.DataFrame,
-                              grouped_by_symbol: pd.core.groupby.generic.DataFrameGroupBy,
-                              top_changes_dict: dict, num_samples: int =1) -> List[str]:
-    results = []
-    for _ in range(num_samples):
-        current_stock = row['Symbol']
-        current_industry = row['Industry']
-        current_sector = row['Sector']
-        article_date = row['Date']
+        # Combine all sampled articles
+        combined_samples = pd.concat([
+            markets_articles, industry_articles, sector_articles,
+            stock_articles, last_8_articles
+        ]).drop_duplicates()
 
-        # Step 1: Sample k "Markets" articles within 30 days before the article date
-        eligible_markets = markets_df[
-            (markets_df['Date'] <= article_date) &
-            (markets_df['Date'] >= article_date - pd.Timedelta(days=30))
-        ]
-        markets_articles = eligible_markets.sample(n=min(k, len(eligible_markets)), random_state=np.random.randint(0, 10000)).sort_values(by='Date')
+        # Add the current article at the end
+        current_article = pd.DataFrame([target_row])
+        combined_samples = pd.concat([combined_samples, current_article], ignore_index=False)
 
-        formatted_markets_articles = [
-            f"Date: {row['Date'].strftime('%m/%d/%Y')}\nArticle: {row['Article']}"
-            for _, row in markets_articles.iterrows()
-        ]
+        # Limit to 28 articles including the current article
+        combined_samples = combined_samples.head(28)
 
-        # Step 2: Get k2 articles from the same Industry and k3 from the same Sector within the last 30 days
-        industry_articles = df[
-            (df['Industry'] == current_industry) &
-            (df['Date'] <= article_date) &
-            (df['Date'] >= article_date - pd.Timedelta(days=30))
-        ]
-        formatted_industry_articles = industry_articles.sample(
-            n=min(k2, len(industry_articles)), random_state=np.random.randint(0, 10000)
-        ).sort_values(by='Date').to_dict('records') if not industry_articles.empty else []
+        samples.append(combined_samples)
 
-        sector_articles = df[
-            (df['Sector'] == current_sector) &
-            (df['Date'] <= article_date) &
-            (df['Date'] >= article_date - pd.Timedelta(days=30))
-        ]
-        formatted_sector_articles = sector_articles.sample(
-            n=min(k3, len(sector_articles)), random_state=np.random.randint(0, 10000)
-        ).sort_values(by='Date').to_dict('records') if not sector_articles.empty else []
-
-        formatted_industry_sector_articles = [
-            f"Date: {article['Date'].strftime('%m/%d/%Y')}\nStock: {article['Symbol']}\n"
-            f"Industry: {article['Industry']}\nSector: {article['Sector']}\nArticle: {article['Article']}"
-            for article in formatted_industry_articles + formatted_sector_articles
-        ]
-
-        # Step 3: Get last 8 articles for the current stock directly from grouped data
-        stock_df = grouped_by_symbol.get_group(current_stock) if current_stock in grouped_by_symbol.groups else pd.DataFrame()
-        last_articles = get_last_articles(stock_df, article_date, n=8)
-
-        # Step 4: Get the precomputed top 5 absolute changes for the current stock
-        top_changes = format_top_changes(current_stock, top_changes_dict)
-
-        # Concatenate all parts
-        all_articles = "\n\n".join(formatted_markets_articles + formatted_industry_sector_articles + [top_changes, last_articles])
-        results.append(all_articles)
-    return results
+    return samples
