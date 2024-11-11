@@ -66,7 +66,11 @@ def main():
     parser.add_argument('--lambda_entropy', type=float, default=0.01, help="Regularization strength for entropy regularization.")
     parser.add_argument('--use_ewc', action='store_true', help="Use Elastic Weight Consolidation during training or updating.")
     parser.add_argument('--lambda_ewc', type=float, default=0.4, help="Regularization strength for Elastic Weight Consolidation.")
+
+    # EBM/EBM params
     parser.add_argument('--use_ebm', action='store_true', help='Use energy-based model for prompt optimization.')
+    parser.add_argument('--ebm_learning_rate', type=float, default=1e-4, help='Learning rate for the EBM')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature parameter for Monte Carlo Sampling')
 
     # Replay buffer training args
     parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
