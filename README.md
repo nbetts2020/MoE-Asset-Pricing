@@ -92,7 +92,7 @@ $$
 E(A, C) = \text{EBM}(f(A), f(C))
 $$
 
-where $f(A)$ and $f(C)$ are the embedding vectors of the article and context tuple, respectively. The EBM is implemented as a simple feedforward neural network (Multi-Layer Perceptron) that takes the concatenated embeddings of $A$ and $C$ and outputs a single scalar value representing the energy. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM, yet does not delve into more sophisticated approaches such as contrastive divergence or other advanced architectural variants commonly seen in modern EBM, yet this deliberate simplification allows for efficient context optimization while maintaining computational tractability.
+where $f(A)$ and $f(C)$ are the embedding vectors of the article and context tuple, respectively. The EBM is implemented as a simple feedforward neural network (Multi-Layer Perceptron) that takes the concatenated embeddings of $A$ and $C$ and outputs a single scalar value representing the energy. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM, yet does not delve into more sophisticated approaches such as contrastive divergence or other advanced architectural variants commonly seen in modern EBMs, yet this deliberate simplification allows for efficient context optimization while maintaining computational tractability.
 
 ### Energy Computation and Scaling
 
