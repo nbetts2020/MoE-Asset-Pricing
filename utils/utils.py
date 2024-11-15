@@ -6,6 +6,7 @@ from torch.nn import init
 from torch.utils.data import DataLoader
 
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
 
 from utils.config import config
 from utils.data import ArticlePriceDataset
@@ -34,6 +35,8 @@ import inspect
 import numpy as np
 
 import torch.distributed as dist
+
+from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
 
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
@@ -121,12 +124,12 @@ def get_model_from_hf(model_repo_id, device):
     logging.info(f"Expected arguments for SparseMoELanguageModel: {expected_args}")
 
     # Filter config
-    model_config_json = {k: model_config[k] for k in expected_args if k in config}
-    logging.info(f"Filtered model configuration: {model_config}")
+    model_config_json = {k: config[k] for k in expected_args if k in config}
+    logging.info(f"Filtered model configuration: {model_config_json}")
 
     # Initialize the model with the configuration
     try:
-        model = SparseMoELanguageModel(**model_config)
+        model = SparseMoELanguageModel(**model_config_json)
         logging.info("Initialized SparseMoELanguageModel with configuration.")
     except Exception as e:
         logging.error(f"Failed to initialize SparseMoELanguageModel: {e}")
@@ -205,21 +208,12 @@ def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True
     articles, prices, sectors = process_data(df, tokenizer)
     dataset = ArticlePriceDataset(articles, prices, sectors, tokenizer)
 
-    if args and args.use_ddp and torch.cuda.device_count() > 1:
+    if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         sampler = DistributedSampler(dataset, shuffle=shuffle)
         dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     else:
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     return dataloader
-
-def load_model_weights(model, filepath, device):
-    """
-    Load model weights from the given file path.
-    """
-    model.load_state_dict(torch.load(filepath, map_location=device))
-    model = model.to(device)
-    print(f"Model loaded from {filepath}.")
-    return model
 
 def prepare_tasks(tokenizer, args, k=3):
     """
@@ -252,7 +246,18 @@ def prepare_tasks(tokenizer, args, k=3):
     return tasks
 
 def initialize_model(args, device, init_from_scratch=False):
+    """
+    Initialize the SparseMoELanguageModel either from scratch or by loading from Hugging Face or local weights.
 
+    Args:
+        args (argparse.Namespace): Command-line arguments.
+        device (torch.device): Device to load the model on.
+        init_from_scratch (bool): If True, initialize the model from scratch using config.
+
+    Returns:
+        model (SparseMoELanguageModel): The initialized model.
+        initialized_from_scratch (bool): Flag indicating if the model was initialized from scratch.
+    """
     if init_from_scratch:
         logging.info("Initializing model from scratch using configurations from utils/config.py.")
         model_config = {
@@ -272,7 +277,7 @@ def initialize_model(args, device, init_from_scratch=False):
     else:
         model = None
         initialized_from_scratch = False
-        if args.model:
+        if hasattr(args, 'model') and args.model:
             # Attempt to load from Hugging Face
             try:
                 logging.info(f"Attempting to load model from Hugging Face repository '{args.model}'.")
@@ -297,7 +302,7 @@ def initialize_model(args, device, init_from_scratch=False):
             expected_args = inspect.getfullargspec(SparseMoELanguageModel.__init__).args
             if 'self' in expected_args:
                 expected_args.remove('self')
-            model_config = {k: local_config[k] for k in expected_args if k in config}
+            model_config = {k: config[k] for k in expected_args if k in config}
             logging.info(f"Filtered model configuration: {model_config}")
 
             model = SparseMoELanguageModel(**model_config)
@@ -317,7 +322,7 @@ def prepare_optimizer(model, args):
     """
     LR_DECAY = config.LR_DECAY
     LEARNING_RATE = config.LEARNING_RATE
-    weight_decay = args.lambda_l2 if args.use_l2 else 0.0
+    weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
 
     param_groups = []
 
@@ -403,7 +408,7 @@ def prepare_data(args, tokenizer):
     random_seed = args.random_seed
 
     if args.mode == 'train':
-        if args.update:
+        if getattr(args, 'update', False):
             if isinstance(args.update, str):
                 # Update with new data from provided dataset URL
                 update_df = get_new_data(args.update)
@@ -446,7 +451,7 @@ def prepare_data(args, tokenizer):
         logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
 
         # Prepare update DataLoader if in update mode
-        if args.update and update_df is not None:
+        if getattr(args, 'update', False) and update_df is not None:
             update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
             logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} update samples.")
         else:
@@ -454,18 +459,14 @@ def prepare_data(args, tokenizer):
 
         return train_dataloader, test_dataloader, update_dataloader
 
-    else:
-        # Other modes can be handled similarly
-        return None, None, None
-        
 def initialize_si(model, args):
     """
     Initializes Synaptic Intelligence (SI) if specified.
     """
     si = None
-    if args.use_si:
+    if getattr(args, 'use_si', False):
         si = SynapticIntelligence(model, lambda_si=config.LAMBDA_SI)
-        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{dist.get_rank()}.pth') if args.use_ddp and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
+        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{dist.get_rank()}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
         if os.path.exists(si_state_path):
             si.load_state(si_state_path)
             logging.info(f"Loaded Synaptic Intelligence (SI) state from '{si_state_path}'.")
@@ -478,11 +479,11 @@ def initialize_replay_buffer(args):
     Initializes or loads the replay buffer if specified.
     """
     replay_buffer = None
-    if args.use_replay_buffer:
+    if getattr(args, 'use_replay_buffer', False):
         replay_buffer_capacity = args.replay_buffer_capacity
         replay_buffer = MemoryReplayBuffer(capacity=replay_buffer_capacity)
         logging.info(f"Initialized Memory Replay Buffer with capacity {replay_buffer_capacity}.")
-        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{dist.get_rank()}.pth') if args.use_ddp and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
+        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{dist.get_rank()}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
         if os.path.exists(replay_buffer_path):
             replay_buffer.load(replay_buffer_path)
             logging.info(f"Loaded Memory Replay Buffer from '{replay_buffer_path}'.")
@@ -491,7 +492,17 @@ def initialize_replay_buffer(args):
     return replay_buffer
 
 def save_model_and_states(model, si, replay_buffer, ewc_list, args):
-    if args.use_ddp and torch.cuda.device_count() > 1:
+    """
+    Saves the model weights and states of SI, EWC, and Replay Buffer.
+
+    Args:
+        model (nn.Module): The transformer model.
+        si (SynapticIntelligence, optional): The SI instance.
+        replay_buffer (MemoryReplayBuffer, optional): The replay buffer instance.
+        ewc_list (list, optional): List of EWC instances.
+        args (argparse.Namespace): Command-line arguments.
+    """
+    if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         rank = dist.get_rank()
     else:
         rank = 0
@@ -507,7 +518,7 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
         logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
 
         # Save EWC state
-        if args.use_ewc and ewc_list is not None:
+        if getattr(args, 'use_ewc', False) and ewc_list is not None:
             ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
             ewc_states = []
             for ewc_instance in ewc_list:
@@ -519,13 +530,281 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
             logging.info(f"EWC state saved to '{ewc_state_path}'.")
 
     # Save SI state for each rank
-    if args.use_si and si is not None:
-        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{rank}.pth') if args.use_ddp and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
+    if getattr(args, 'use_si', False) and si is not None:
+        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
         si.save_state(si_state_path)
         logging.info(f"Rank {rank}: Synaptic Intelligence (SI) state saved to '{si_state_path}'.")
 
     # Save Replay Buffer for each rank
-    if args.use_replay_buffer and replay_buffer is not None:
-        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{rank}.pth') if args.use_ddp and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
+    if getattr(args, 'use_replay_buffer', False) and replay_buffer is not None:
+        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
+        replay_buffer.save(replay_buffer_path)
+        logging.info(f"Rank {rank}: Replay Buffer saved to '{replay_buffer_path}'.")
+
+def compute_l2_loss(model):
+    """
+    Compute the L2 penalty (squared L2 norm) of the model parameters.
+
+    Args:
+        model (nn.Module): The model.
+
+    Returns:
+        l2_loss (torch.Tensor): L2 penalty term.
+    """
+    l2_loss = torch.tensor(0., device=next(model.parameters()).device)
+    for param in model.parameters():
+        if param.requires_grad:
+            l2_loss += torch.norm(param, 2) ** 2
+    return l2_loss
+
+def evaluate_model(model, dataloader, device):
+    """
+    Evaluate the model on a validation set.
+
+    Args:
+        model (nn.Module): The trained model.
+        dataloader (DataLoader): DataLoader for the validation set.
+        device (torch.device): Device to perform computations on.
+
+    Returns:
+        mse (float): Mean Squared Error on the validation set.
+        r2 (float): R-squared score on the validation set.
+        sector_metrics (dict): MSE and R2 scores per sector.
+    """
+    model.eval()
+    predictions = []
+    actuals = []
+    sector_metrics = {}
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            sectors = batch['sector']
+            with autocast():
+                outputs, _ = model(input_ids=input_ids)
+            outputs = outputs.detach().cpu().numpy()
+            labels = labels.cpu().numpy()
+            predictions.extend(outputs)
+            actuals.extend(labels)
+            # Compute per-sector metrics
+            for i, sector in enumerate(sectors):
+                if sector not in sector_metrics:
+                    sector_metrics[sector] = {'predictions': [], 'actuals': []}
+                sector_metrics[sector]['predictions'].append(outputs[i])
+                sector_metrics[sector]['actuals'].append(labels[i])
+
+    mse = mean_squared_error(actuals, predictions)
+    r2 = r2_score(actuals, predictions)
+
+    # Calculate per-sector metrics
+    for sector in sector_metrics:
+        sector_predictions = sector_metrics[sector]['predictions']
+        sector_actuals = sector_metrics[sector]['actuals']
+        sector_mse = mean_squared_error(sector_actuals, sector_predictions)
+        sector_r2 = r2_score(sector_actuals, sector_predictions)
+        sector_metrics[sector] = {'mse': sector_mse, 'r2': sector_r2}
+
+    model.train()
+    return mse, r2, sector_metrics
+
+def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
+    """
+    Load model and optimizer states from a checkpoint.
+
+    Args:
+        model (nn.Module): The transformer model.
+        optimizer (torch.optim.Optimizer): Optimizer for the transformer model.
+        ebm (nn.Module, optional): The Energy-Based Model.
+        ebm_optimizer (torch.optim.Optimizer, optional): Optimizer for the EBM.
+        checkpoint_path (str, optional): Path to the checkpoint file.
+
+    Returns:
+        int: The epoch to resume from.
+    """
+    if checkpoint_path and os.path.isfile(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        logging.info(f"Loaded model and optimizer state from {checkpoint_path}")
+        
+        if ebm and ebm_optimizer and 'ebm_state_dict' in checkpoint:
+            ebm.load_state_dict(checkpoint['ebm_state_dict'])
+            ebm_optimizer.load_state_dict(checkpoint['ebm_optimizer_state_dict'])
+            logging.info(f"Loaded EBM and EBM optimizer state from {checkpoint_path}")
+        
+        epoch = checkpoint.get('epoch', 0)
+        return epoch
+    else:
+        logging.info("No checkpoint found at specified path. Starting from scratch.")
+        return 0
+
+def save_model_and_states(model, si, replay_buffer, ewc_list, args):
+    """
+    Saves the model weights and states of SI, EWC, and Replay Buffer.
+
+    Args:
+        model (nn.Module): The transformer model.
+        si (SynapticIntelligence, optional): The SI instance.
+        replay_buffer (MemoryReplayBuffer, optional): The replay buffer instance.
+        ewc_list (list, optional): List of EWC instances.
+        args (argparse.Namespace): Command-line arguments.
+    """
+    if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
+        rank = dist.get_rank()
+    else:
+        rank = 0
+
+    if rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+        # Save model weights
+        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
+            state_dict = model.module.state_dict()
+        else:
+            state_dict = model.state_dict()
+        torch.save(state_dict, os.path.join(args.save_dir, 'model_weights.pth'))
+        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
+
+        # Save EWC state
+        if getattr(args, 'use_ewc', False) and ewc_list is not None:
+            ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
+            ewc_states = []
+            for ewc_instance in ewc_list:
+                ewc_states.append({
+                    'params': {n: p.cpu() for n, p in ewc_instance.params.items()},
+                    'fisher': {n: f.cpu() for n, f in ewc_instance.fisher.items()}
+                })
+            torch.save(ewc_states, ewc_state_path)
+            logging.info(f"EWC state saved to '{ewc_state_path}'.")
+
+    # Save SI state for each rank
+    if getattr(args, 'use_si', False) and si is not None:
+        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
+        si.save_state(si_state_path)
+        logging.info(f"Rank {rank}: Synaptic Intelligence (SI) state saved to '{si_state_path}'.")
+
+    # Save Replay Buffer for each rank
+    if getattr(args, 'use_replay_buffer', False) and replay_buffer is not None:
+        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
+        replay_buffer.save(replay_buffer_path)
+        logging.info(f"Rank {rank}: Replay Buffer saved to '{replay_buffer_path}'.")
+
+def save_model_weights(model, filepath, device):
+    """
+    Load model weights from the given file path.
+    """
+    model.load_state_dict(torch.load(filepath, map_location=device))
+    model = model.to(device)
+    print(f"Model loaded from {filepath}.")
+    return model
+
+def prepare_tasks(tokenizer, args, k=3):
+    """
+    Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
+    
+    Args:
+        tokenizer (AutoTokenizer): The tokenizer to use.
+        args (argparse.Namespace): Command-line arguments.
+        k (int): Number of sectors to randomly select for the tasks.
+        
+    Returns:
+        tasks (list): List of DataLoaders for the selected sectors.
+    """
+    df = get_data(percent_data=args.percent_data)  # Load your data
+    
+    # Get unique sectors from the dataset
+    unique_sectors = df['Sector'].unique()
+    
+    # Randomly sample k sectors from the unique sectors
+    selected_sectors = np.random.choice(unique_sectors, size=k, replace=False)
+    
+    tasks = []
+
+    # For each selected sector, create a DataLoader
+    for sector in selected_sectors:
+        df_task = df[df['Sector'] == sector]  # Filter data by the selected sector
+        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
+        tasks.append(dataloader)
+
+    return tasks
+
+def initialize_si(model, args):
+    """
+    Initializes Synaptic Intelligence (SI) if specified.
+    """
+    si = None
+    if getattr(args, 'use_si', False):
+        si = SynapticIntelligence(model, lambda_si=config.LAMBDA_SI)
+        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{dist.get_rank()}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
+        if os.path.exists(si_state_path):
+            si.load_state(si_state_path)
+            logging.info(f"Loaded Synaptic Intelligence (SI) state from '{si_state_path}'.")
+        else:
+            logging.info("No existing SI state found. Starting fresh SI.")
+    return si
+
+def initialize_replay_buffer(args):
+    """
+    Initializes or loads the replay buffer if specified.
+    """
+    replay_buffer = None
+    if getattr(args, 'use_replay_buffer', False):
+        replay_buffer_capacity = args.replay_buffer_capacity
+        replay_buffer = MemoryReplayBuffer(capacity=replay_buffer_capacity)
+        logging.info(f"Initialized Memory Replay Buffer with capacity {replay_buffer_capacity}.")
+        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{dist.get_rank()}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
+        if os.path.exists(replay_buffer_path):
+            replay_buffer.load(replay_buffer_path)
+            logging.info(f"Loaded Memory Replay Buffer from '{replay_buffer_path}'.")
+        else:
+            logging.info("No existing Memory Replay Buffer found. Starting fresh.")
+    return replay_buffer
+
+def save_model_and_states(model, si, replay_buffer, ewc_list, args):
+    """
+    Saves the model weights and states of SI, EWC, and Replay Buffer.
+
+    Args:
+        model (nn.Module): The transformer model.
+        si (SynapticIntelligence, optional): The SI instance.
+        replay_buffer (MemoryReplayBuffer, optional): The replay buffer instance.
+        ewc_list (list, optional): List of EWC instances.
+        args (argparse.Namespace): Command-line arguments.
+    """
+    if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
+        rank = dist.get_rank()
+    else:
+        rank = 0
+
+    if rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+        # Save model weights
+        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
+            state_dict = model.module.state_dict()
+        else:
+            state_dict = model.state_dict()
+        torch.save(state_dict, os.path.join(args.save_dir, 'model_weights.pth'))
+        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
+
+        # Save EWC state
+        if getattr(args, 'use_ewc', False) and ewc_list is not None:
+            ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
+            ewc_states = []
+            for ewc_instance in ewc_list:
+                ewc_states.append({
+                    'params': {n: p.cpu() for n, p in ewc_instance.params.items()},
+                    'fisher': {n: f.cpu() for n, f in ewc_instance.fisher.items()}
+                })
+            torch.save(ewc_states, ewc_state_path)
+            logging.info(f"EWC state saved to '{ewc_state_path}'.")
+
+    # Save SI state for each rank
+    if getattr(args, 'use_si', False) and si is not None:
+        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
+        si.save_state(si_state_path)
+        logging.info(f"Rank {rank}: Synaptic Intelligence (SI) state saved to '{si_state_path}'.")
+
+    # Save Replay Buffer for each rank
+    if getattr(args, 'use_replay_buffer', False) and replay_buffer is not None:
+        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
         replay_buffer.save(replay_buffer_path)
         logging.info(f"Rank {rank}: Replay Buffer saved to '{replay_buffer_path}'.")
