@@ -53,7 +53,8 @@ def main():
     parser.add_argument('--update', action='store_true', help="Include this flag to perform an update.")
     parser.add_argument('--percent_data', type=float, default=100.0, help="Percentage of data to use (0 < percent_data <= 100).")
     parser.add_argument('--save_dir', type=str, default="model", help="Directory to save the model and states.")
-    parser.add_argument('-checkpoint_dir', type=str, default="checkpoints", help="Directory to save model checkpoints and states.")
+    parser.add_argument('--checkpoint_dir', type=str, default="checkpoints", help="Directory to save model checkpoints and states.")
+    parser.add_argument('--checkpoint_path', type=str, help='Path to a checkpoint to resume training')
     parser.add_argument('--random_seed', type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument('--num_tasks', type=int, default=3, help="Number of tasks (sectors) to use in catastrophic forgetting testing.")
 
