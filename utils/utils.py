@@ -440,24 +440,30 @@ def prepare_data(args, tokenizer):
                 random_state=random_seed,
                 shuffle=True
             )
-            update_df = None  # No update data in baseline
+            update_df = None  # no update data in baseline
             logging.info(f"Data split into 90% train, 10% test.")
 
-        train_dataloader = prepare_dataloader(train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
+        train_dataloader = prepare_dataloader(
+            train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+        )
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
         # Prepare test DataLoader
-        test_dataloader = prepare_dataloader(test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
+        test_dataloader = prepare_dataloader(
+            test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args
+        )
         logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
 
         # Prepare update DataLoader if in update mode
         if getattr(args, 'update', False) and update_df is not None:
-            update_dataloader = prepare_dataloader(update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
+            update_dataloader = prepare_dataloader(
+                update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+            )
             logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} update samples.")
         else:
             update_dataloader = None
 
-        return train_dataloader, test_dataloader, update_dataloader
+        return train_dataloader, test_dataloader, update_dataloader, df
 
 def initialize_si(model, args):
     """
