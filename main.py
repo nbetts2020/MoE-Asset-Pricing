@@ -46,7 +46,7 @@ def main():
     parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
 
     # Additional arguments
-    parser.add_argument('--csv_path', type=str, required=True, help='Path to the CSV dataset.')
+    parser.add_argument('--csv_path', type=str, help='Path to the CSV dataset.')
 
     # Secondary modes and args for general and catastrophic forgetting testing
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
