@@ -8,15 +8,38 @@ import pandas as pd
 import os
 import concurrent.futures
 
+
 class ArticlePriceDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, total_epochs: int):
-        self.df = preprocess_data(dataframe)
+    def __init__(self, articles: list, prices: list, sectors: list, tokenizer, total_epochs: int):
+        """
+        Initializes the dataset with articles, prices, sectors, tokenizer, and total_epochs.
+
+        Args:
+            articles (list): List of article texts.
+            prices (list): List of corresponding prices.
+            sectors (list): List of corresponding sectors.
+            tokenizer: Tokenizer instance for encoding text.
+            total_epochs (int): Total number of training epochs.
+        """
+        # Create a DataFrame from the provided lists
+        self.df = pd.DataFrame({
+            'Article': articles,
+            'weighted_avg_720_hrs': prices,
+            'Sector': sectors
+        })
+        self.df = preprocess_data(self.df)
         self.tokenizer = tokenizer
         self.total_epochs = total_epochs
         self.sampled_articles = []
         self.current_epoch = 0
 
     def prepare_epoch(self, current_epoch: int):
+        """
+        Prepares the dataset for the current epoch by sampling articles.
+
+        Args:
+            current_epoch (int): The current epoch number.
+        """
         self.current_epoch = current_epoch
         num_samples = self.total_epochs - current_epoch
         if num_samples < 1:
@@ -30,7 +53,6 @@ class ArticlePriceDataset(Dataset):
             samples = []
             for _ in range(num_samples):
                 sample = sample_articles(self.df, [idx])[0]
-                # No need to format concatenated articles if not using EBM
                 concatenated_articles = self.format_concatenated_articles(sample)
                 current_price = sample.iloc[-1]['weighted_avg_720_hrs']
                 current_sector = sample.iloc[-1]['Sector']
@@ -49,6 +71,15 @@ class ArticlePriceDataset(Dataset):
                 self.sampled_articles.extend(future.result())
 
     def format_concatenated_articles(self, sample: pd.DataFrame) -> str:
+        """
+        Formats the concatenated articles from a sample DataFrame.
+
+        Args:
+            sample (pd.DataFrame): Sampled DataFrame for a single data point.
+
+        Returns:
+            str: Concatenated and formatted article string.
+        """
         formatted_articles = []
         idx = sample.iloc[-1].name  # Current index
 
@@ -123,7 +154,15 @@ class ArticlePriceDataset(Dataset):
         return concatenated_articles
 
     def generate_context_tuples(self, idx):
-        # Generate context tuples for the given index
+        """
+        Generates context tuples for a given index.
+
+        Args:
+            idx (int): Index of the data point.
+
+        Returns:
+            list: List of context strings.
+        """
         sample = self.df.iloc[idx]
         target_date = sample['Date']
         target_symbol = sample['Symbol']
@@ -180,10 +219,7 @@ class ArticlePriceDataset(Dataset):
         return contexts
 
     def __len__(self):
-        if self.sampled_articles:
-            return len(self.sampled_articles)
-        else:
-            return len(self.df)
+        return len(self.sampled_articles) if self.sampled_articles else len(self.df)
 
     def __getitem__(self, idx):
         if self.sampled_articles:
@@ -195,7 +231,7 @@ class ArticlePriceDataset(Dataset):
                 max_length=config.BLOCK_SIZE,
                 return_tensors='pt'
             )
-            input_ids = encoding['input_ids'].squeeze(0)  # remove batch dimension
+            input_ids = encoding['input_ids'].squeeze(0)  # removing batch dimension
             label = torch.tensor(sample['current_price'], dtype=torch.float)
             sector = sample['current_sector']
 
@@ -212,7 +248,7 @@ class ArticlePriceDataset(Dataset):
                     max_length=config.BLOCK_SIZE,
                     return_tensors='pt'
                 )
-                context_input_ids = context_encoding['input_ids'].squeeze(0)  # remove batch dimension
+                context_input_ids = context_encoding['input_ids'].squeeze(0)  # removing batch dimension
                 context_input_ids_list.append(context_input_ids)
 
             # Stack context input_ids
