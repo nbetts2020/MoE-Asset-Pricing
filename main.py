@@ -45,9 +45,6 @@ def main():
     parser.add_argument('--tokenizer_name', type=str, default="gpt2", help="Name of the pretrained tokenizer to use")
     parser.add_argument('--model', type=str, help="Hugging Face repository ID to load the model from.", default=None)
 
-    # Additional arguments
-    parser.add_argument('--csv_path', type=str, help='Path to the CSV dataset.')
-
     # Secondary modes and args for general and catastrophic forgetting testing
     parser.add_argument('--test', action='store_true', help="If specified in 'run' mode, evaluate the model on the test set.")
     parser.add_argument('--update', action='store_true', help="Include this flag to perform an update.")
@@ -152,9 +149,6 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     if args.mode == 'train':
-        # Load DataFrame
-        df = pd.read_csv(args.csv_path)
-        logging.info(f"Loaded dataset with {len(df)} rows.")
 
         # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
@@ -172,20 +166,15 @@ def main():
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
 
-        # Prepare dataset and dataloader
-        dataset = ArticlePriceDataset(df, tokenizer, total_epochs=config.EPOCHS)
-        if use_ddp:
-            sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
-        else:
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        # Prepare data
+        train_dataloader, test_dataloader, update_dataloader, df = prepare_data(args, tokenizer)
 
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
 
         # Initialize EWC - if --use_ewc is True
         if args.use_ewc:
-            ewc_instance = ElasticWeightConsolidation(model, dataloader, device, args)
+            ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
             ewc_list = [ewc_instance]
         else:
             ewc_list = None
@@ -195,16 +184,16 @@ def main():
 
         # Train the model
         train_model(
-            model,
-            optimizer,
-            config.EPOCHS,
-            device,
-            dataloader,
+            model=model,
+            optimizer=optimizer,
+            epochs=config.EPOCHS,
+            device=device,
+            dataloader=train_dataloader,
             args=args,
             si=si,
             ewc=ewc_list,
             replay_buffer=replay_buffer,
-            df=df
+            df=df  # Pass the DataFrame for sampling
         )
         logging.info("Training completed.")
 
@@ -236,13 +225,8 @@ def main():
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
 
-        # Prepare dataset and dataloader
-        dataset = ArticlePriceDataset(df, tokenizer, total_epochs=config.EPOCHS)
-        if use_ddp:
-            sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
-        else:
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        # Prepare data
+        train_dataloader, test_dataloader, update_dataloader, _ = prepare_data(args, tokenizer)
 
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
@@ -262,7 +246,7 @@ def main():
                 logging.info(f"Loaded EWC state from '{ewc_state_path}'.")
             else:
                 logging.info("No existing EWC state found. Starting fresh EWC.")
-                ewc_instance = ElasticWeightConsolidation(model, dataloader, device, args)
+                ewc_instance = ElasticWeightConsolidation(model, dataloader=train_dataloader, device=device, args=args)
                 ewc_list = [ewc_instance]
         else:
             ewc_list = None
@@ -273,11 +257,11 @@ def main():
         # Update the model
         logging.info("Starting updating...")
         train_model(
-            model,
-            optimizer,
-            config.EPOCHS,
-            device,
-            dataloader,
+            model=model,
+            optimizer=optimizer,
+            epochs=config.EPOCHS,
+            device=device,
+            dataloader=train_dataloader,
             args=args,
             si=si,
             ewc=ewc_list,
@@ -337,7 +321,7 @@ def main():
             print(f"Predicted Price: {prediction.item()}")
 
     elif args.mode == 'test_forgetting':
-        # Initialize model
+        # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info("Initialized model for catastrophic forgetting testing.")
         logging.info(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
