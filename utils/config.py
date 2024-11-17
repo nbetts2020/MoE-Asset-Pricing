@@ -4,7 +4,7 @@ import torch
 
 class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    N_EMBED = 368        # Embedding dimension
+    N_EMBED = 384        # Embedding dimension
     N_HEAD = 24          # Number of attention heads
     N_LAYER = 96         # Number of transformer blocks
     BLOCK_SIZE = 65536   # Maximum sequence length
