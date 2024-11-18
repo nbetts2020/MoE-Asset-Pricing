@@ -52,9 +52,9 @@ This combination enables the model to focus on the most relevant data within the
 
 ## Model Architecture
 
-**Total Parameters**: Approximately **1.007 billion parameters**, which includes all shared parameters and parameters from all experts across all transformer blocks.
+**Total Parameters**: Approximately **1.009 billion parameters**, which includes all shared parameters and parameters from all experts across all transformer blocks.
 
-**Active Parameters**: Approximately **327.7 million parameters** are active during a forward pass. This includes the shared parameters and the parameters from the experts that are selected by the routing mechanism.
+**Active Parameters**: Approximately **328 million parameters** are active during a forward pass. This includes the shared parameters and the parameters from the experts that are selected by the routing mechanism.
 
 ## Training Details
 
