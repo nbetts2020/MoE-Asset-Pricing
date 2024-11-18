@@ -200,13 +200,14 @@ def process_data(df, tokenizer):
 
         articles.append(concatenated_text)
         prices.append(row['weighted_avg_720_hrs'])
-        sectors.append(row['Sector'])  # Include sector
+        sectors.append(row['Sector'])
+        dates.append(row['Date'])
 
-    return articles, prices, sectors
+    return articles, prices, sectors, dates
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None):
-    articles, prices, sectors = process_data(df, tokenizer)
-    dataset = ArticlePriceDataset(articles, prices, sectors, tokenizer)
+    articles, prices, sectors, dates = process_data(df, tokenizer)
+    dataset = ArticlePriceDataset(articles, prices, sectors, dates, tokenizer)
 
     if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         sampler = DistributedSampler(dataset, shuffle=shuffle)
