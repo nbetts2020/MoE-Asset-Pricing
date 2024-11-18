@@ -212,7 +212,7 @@ def process_data(df, tokenizer):
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None):
     articles, prices, sectors, dates, related_stocks_list, prices_current = process_data(df, tokenizer)
-    dataset = ArticlePriceDataset(articles, prices, sectors, dates, related_stocks_list, prices_current, tokenizer)
+    dataset = ArticlePriceDataset(articles, prices, sectors, dates, related_stocks_list, prices_current, tokenizer, config.EPOCHS)
 
     if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         sampler = DistributedSampler(dataset, shuffle=shuffle)
