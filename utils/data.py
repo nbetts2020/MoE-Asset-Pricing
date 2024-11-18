@@ -7,18 +7,136 @@ from utils.config import config
 import pandas as pd
 import os
 import concurrent.futures
+import logging
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def format_concatenated_articles(sample: pd.DataFrame) -> str:
+    """
+    Formats the concatenated articles from a sample DataFrame.
+
+    Args:
+        sample (pd.DataFrame): Sampled DataFrame for a single data point.
+
+    Returns:
+        str: Concatenated and formatted article string.
+    """
+    formatted_articles = []
+    idx = sample.iloc[-1].name  # Current index
+
+    # Broader Economic Information (Markets Articles)
+    formatted_articles.append("Broader Economic Information:")
+    for _, row in sample.iterrows():
+        if 'Markets' in row.get('RelatedStocksList', ''):
+            date_str = row['Date'].strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row['Title']}\n"
+                f"Article: {row['Article']}\n"
+            )
+
+    # Broader Industry Information
+    formatted_articles.append("\nBroader Industry Information:")
+    for _, row in sample.iterrows():
+        if row['Industry'] == sample.iloc[-1]['Industry']:
+            date_str = row['Date'].strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row['Title']}\n"
+                f"Article: {row['Article']}\n"
+            )
+
+    # Broader Sector Information
+    formatted_articles.append("\nBroader Sector Information:")
+    for _, row in sample.iterrows():
+        if row['Sector'] == sample.iloc[-1]['Sector']:
+            date_str = row['Date'].strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row['Title']}\n"
+                f"Article: {row['Article']}\n"
+            )
+
+    # Information Indicating Significant Market Movement Related to Current Stock
+    formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
+    for _, row in sample.iterrows():
+        if row['Symbol'] == sample.iloc[-1]['Symbol'] and 'Percentage Change' in row:
+            date_str = row['Date'].strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row['Title']}\n"
+                f"Article: {row['Article']}\n"
+                f"Percentage Change: {row['Percentage Change']:.2f}%\n"
+            )
+
+    # Last 8 Articles for Current Stock
+    formatted_articles.append("\nLast 8 Articles for Current Stock:")
+    for _, row in sample.iterrows():
+        if row['Symbol'] == sample.iloc[-1]['Symbol']:
+            date_str = row['Date'].strftime('%Y-%m-%d')
+            article_details = (
+                f"Symbol: {row['Symbol']}\n"
+                f"Security: {row.get('Security', 'N/A')}\n"
+                f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
+                f"Title: {row['Title']}\n"
+                f"Type: {row.get('articleType', 'N/A')}\n"
+                f"Publication: {row.get('Publication', 'N/A')}\n"
+                f"Publication Author: {row.get('Author', 'N/A')}\n"
+                f"Date: {date_str}\n"
+                f"Article: {row['Article']}\n"
+                f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
+                f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
+                f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
+                f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
+            )
+            formatted_articles.append(article_details)
+
+    concatenated_articles = "\n".join(formatted_articles)
+    return concatenated_articles
+
+def worker_generate_samples(args):
+    """
+    Worker function to generate samples.
+
+    Args:
+        args (tuple): Tuple containing (idx, df, total_epochs)
+
+    Returns:
+        list: List of sample dictionaries.
+    """
+    idx, df, total_epochs = args
+    try:
+        samples = []
+        num_samples = total_epochs - 1  # Adjust as needed based on epoch
+        for _ in range(num_samples):
+            sample = sample_articles(df, [idx])[0]
+            concatenated_articles = format_concatenated_articles(sample)
+            current_price = sample.iloc[-1]['weighted_avg_720_hrs']
+            current_sector = sample.iloc[-1]['Sector']
+            samples.append({
+                'concatenated_articles': concatenated_articles,
+                'current_price': current_price,
+                'current_sector': current_sector
+            })
+        return samples
+    except Exception as e:
+        logger.error(f"Error generating samples for idx {idx}: {e}")
+        return []
 
 class ArticlePriceDataset(Dataset):
     def __init__(self, articles: list, prices: list, sectors: list, dates: list, related_stocks_list: list, prices_current: list, tokenizer, total_epochs: int):
         """
-        Initializes the dataset with articles, prices, sectors, tokenizer, and total_epochs.
+        Initializes the dataset with articles, prices, sectors, dates, related_stocks_list, prices_current, tokenizer, and total_epochs.
 
         Args:
             articles (list): List of article texts.
             prices (list): List of corresponding prices.
             sectors (list): List of corresponding sectors.
             dates (list): List of corresponding dates.
+            related_stocks_list (list): List of related stocks/topics.
+            prices_current (list): List of current prices at release.
             tokenizer: Tokenizer instance for encoding text.
             total_epochs (int): Total number of training epochs.
         """
@@ -52,110 +170,17 @@ class ArticlePriceDataset(Dataset):
 
         self.sampled_articles = []
 
-        # Function to generate samples for a single index
-        def generate_samples(idx):
-            samples = []
-            for _ in range(num_samples):
-                sample = sample_articles(self.df, [idx])[0]
-                concatenated_articles = self.format_concatenated_articles(sample)
-                current_price = sample.iloc[-1]['weighted_avg_720_hrs']
-                current_sector = sample.iloc[-1]['Sector']
-                samples.append({
-                    'concatenated_articles': concatenated_articles,
-                    'current_price': current_price,
-                    'current_sector': current_sector
-                })
-            return samples
+        # Prepare arguments for worker_generate_samples
+        args_list = [(idx, self.df, self.total_epochs) for idx in index_list]
 
         # Parallel processing using ProcessPoolExecutor
         num_workers = os.cpu_count() or 1
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(generate_samples, idx) for idx in index_list]
-            for future in concurrent.futures.as_completed(futures):
-                self.sampled_articles.extend(future.result())
-
-    def format_concatenated_articles(self, sample: pd.DataFrame) -> str:
-        """
-        Formats the concatenated articles from a sample DataFrame.
-
-        Args:
-            sample (pd.DataFrame): Sampled DataFrame for a single data point.
-
-        Returns:
-            str: Concatenated and formatted article string.
-        """
-        formatted_articles = []
-        idx = sample.iloc[-1].name  # Current index
-
-        # Broader Economic Information (Markets Articles)
-        formatted_articles.append("Broader Economic Information:")
-        for _, row in sample.iterrows():
-            if 'Markets' in row.get('RelatedStocksList', ''):
-                date_str = row['Date'].strftime('%Y-%m-%d')
-                formatted_articles.append(
-                    f"Date: {date_str}\n"
-                    f"Title: {row['Title']}\n"
-                    f"Article: {row['Article']}\n"
-                )
-
-        # Broader Industry Information
-        formatted_articles.append("\nBroader Industry Information:")
-        for _, row in sample.iterrows():
-            if row['Industry'] == sample.iloc[-1]['Industry']:
-                date_str = row['Date'].strftime('%Y-%m-%d')
-                formatted_articles.append(
-                    f"Date: {date_str}\n"
-                    f"Title: {row['Title']}\n"
-                    f"Article: {row['Article']}\n"
-                )
-
-        # Broader Sector Information
-        formatted_articles.append("\nBroader Sector Information:")
-        for _, row in sample.iterrows():
-            if row['Sector'] == sample.iloc[-1]['Sector']:
-                date_str = row['Date'].strftime('%Y-%m-%d')
-                formatted_articles.append(
-                    f"Date: {date_str}\n"
-                    f"Title: {row['Title']}\n"
-                    f"Article: {row['Article']}\n"
-                )
-
-        # Information Indicating Significant Market Movement Related to Current Stock
-        formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
-        for _, row in sample.iterrows():
-            if row['Symbol'] == sample.iloc[-1]['Symbol'] and 'Percentage Change' in row:
-                date_str = row['Date'].strftime('%Y-%m-%d')
-                formatted_articles.append(
-                    f"Date: {date_str}\n"
-                    f"Title: {row['Title']}\n"
-                    f"Article: {row['Article']}\n"
-                    f"Percentage Change: {row['Percentage Change']:.2f}%\n"
-                )
-
-        # Last 8 Articles for Current Stock
-        formatted_articles.append("\nLast 8 Articles for Current Stock:")
-        for _, row in sample.iterrows():
-            if row['Symbol'] == sample.iloc[-1]['Symbol']:
-                date_str = row['Date'].strftime('%Y-%m-%d')
-                article_details = (
-                    f"Symbol: {row['Symbol']}\n"
-                    f"Security: {row.get('Security', 'N/A')}\n"
-                    f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
-                    f"Title: {row['Title']}\n"
-                    f"Type: {row.get('articleType', 'N/A')}\n"
-                    f"Publication: {row.get('Publication', 'N/A')}\n"
-                    f"Publication Author: {row.get('Author', 'N/A')}\n"
-                    f"Date: {date_str}\n"
-                    f"Article: {row['Article']}\n"
-                    f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
-                    f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
-                    f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
-                    f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
-                )
-                formatted_articles.append(article_details)
-
-        concatenated_articles = "\n".join(formatted_articles)
-        return concatenated_articles
+            # Use a top-level worker function instead of a lambda
+            results = executor.map(worker_generate_samples, args_list)
+            for sample_batch in results:
+                self.sampled_articles.extend(sample_batch)
+        logger.info(f"Epoch {current_epoch}: Prepared {len(self.sampled_articles)} sampled articles.")
 
     def generate_context_tuples(self, idx):
         """
