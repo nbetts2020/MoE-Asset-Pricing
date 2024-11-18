@@ -154,6 +154,8 @@ def process_data(df, tokenizer):
     prices = []
     sectors = []
     dates = []
+    related_stocks_list = []
+    prices_current = []
 
     grouped = df.groupby('Symbol', sort=False)
 
@@ -203,12 +205,14 @@ def process_data(df, tokenizer):
         prices.append(row['weighted_avg_720_hrs'])
         sectors.append(row['Sector'])
         dates.append(row['Date'])
+        related_stocks_list.append(row['RelatedStocksList'])
+        prices_current.append(row['weighted_avg_0_hrs'])
 
-    return articles, prices, sectors, dates
+    return articles, prices, sectors, dates, related_stocks_list, prices_current
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None):
-    articles, prices, sectors, dates = process_data(df, tokenizer)
-    dataset = ArticlePriceDataset(articles, prices, sectors, dates, tokenizer)
+    articles, prices, sectors, dates, related_stocks_list, prices_current = process_data(df, tokenizer)
+    dataset = ArticlePriceDataset(articles, prices, sectors, dates, related_stocks_list, prices_current, tokenizer)
 
     if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         sampler = DistributedSampler(dataset, shuffle=shuffle)
@@ -229,7 +233,7 @@ def prepare_tasks(tokenizer, args, k=3):
     Returns:
         tasks (list): List of DataLoaders for the selected sectors.
     """
-    df = get_data(percent_data=args.percent_data)  # Load your data
+    df = get_data(percent_data=args.percent_data)  # load your data
     
     # Get unique sectors from the dataset
     unique_sectors = df['Sector'].unique()
