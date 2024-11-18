@@ -10,7 +10,7 @@ import concurrent.futures
 
 
 class ArticlePriceDataset(Dataset):
-    def __init__(self, articles: list, prices: list, sectors: list, tokenizer, total_epochs: int):
+    def __init__(self, articles: list, prices: list, sectors: list, dates: list, tokenizer, total_epochs: int):
         """
         Initializes the dataset with articles, prices, sectors, tokenizer, and total_epochs.
 
@@ -18,6 +18,7 @@ class ArticlePriceDataset(Dataset):
             articles (list): List of article texts.
             prices (list): List of corresponding prices.
             sectors (list): List of corresponding sectors.
+            dates (list): List of corresponding dates.
             tokenizer: Tokenizer instance for encoding text.
             total_epochs (int): Total number of training epochs.
         """
@@ -25,7 +26,8 @@ class ArticlePriceDataset(Dataset):
         self.df = pd.DataFrame({
             'Article': articles,
             'weighted_avg_720_hrs': prices,
-            'Sector': sectors
+            'Sector': sectors,
+            'Date': dates
         })
         self.df = preprocess_data(self.df)
         self.tokenizer = tokenizer
