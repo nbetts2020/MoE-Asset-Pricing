@@ -153,6 +153,7 @@ def process_data(df, tokenizer):
     articles = []
     prices = []
     sectors = []
+    dates = []
 
     grouped = df.groupby('Symbol', sort=False)
 
