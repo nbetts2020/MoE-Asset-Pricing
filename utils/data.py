@@ -10,7 +10,7 @@ import concurrent.futures
 
 
 class ArticlePriceDataset(Dataset):
-    def __init__(self, articles: list, prices: list, sectors: list, dates: list, tokenizer, total_epochs: int):
+    def __init__(self, articles: list, prices: list, sectors: list, dates: list, related_stocks_list: list, prices_current: list, tokenizer, total_epochs: int):
         """
         Initializes the dataset with articles, prices, sectors, tokenizer, and total_epochs.
 
@@ -27,7 +27,9 @@ class ArticlePriceDataset(Dataset):
             'Article': articles,
             'weighted_avg_720_hrs': prices,
             'Sector': sectors,
-            'Date': dates
+            'Date': dates,
+            'RelatedStocksList': related_stocks_list,
+            'weighted_avg_0_hrs': prices_current
         })
         self.df = preprocess_data(self.df)
         self.tokenizer = tokenizer
