@@ -108,18 +108,22 @@ def worker_generate_samples(args):
     """
     idx, df, total_epochs = args
     try:
+        logger.info(f"Worker started for idx: {idx}")
         samples = []
-        num_samples = total_epochs - 1  # Adjust as needed based on epoch
-        for _ in range(num_samples):
+        num_samples = total_epochs - 1
+        logger.info(f"Num samples to generate: {num_samples} for idx: {idx}")
+        for i in range(num_samples):
+            logger.debug(f"Generating sample {i+1}/{num_samples} for idx: {idx}")
             sample = sample_articles(df, [idx])[0]
             concatenated_articles = format_concatenated_articles(sample)
-            current_price = sample.iloc[-1]['weighted_avg_720_hrs']
-            current_sector = sample.iloc[-1]['Sector']
+            current_price = sample.get('weighted_avg_720_hrs', 0.0)
+            current_sector = sample.get('Sector', 'Unknown Sector')
             samples.append({
                 'concatenated_articles': concatenated_articles,
                 'current_price': current_price,
                 'current_sector': current_sector
             })
+        logger.info(f"Worker completed for idx: {idx}")
         return samples
     except Exception as e:
         logger.error(f"Error generating samples for idx {idx}: {e}")
