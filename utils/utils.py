@@ -5,6 +5,8 @@ import torch.nn as nn
 from torch.nn import init
 from torch.utils.data import DataLoader
 
+import pandas as pd
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 
@@ -49,13 +51,13 @@ def get_data(percent_data=100.0):
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k")
     df = dataset['train'].to_pandas().dropna(how='any')
-    
+
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
     df = df.head(num_samples)
-    
+
     return df
-    
+
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
@@ -90,7 +92,7 @@ def get_model_from_hf(model_repo_id, device):
     hf_token = os.getenv('HF_TOKEN')
 
     login(hf_token)
-    
+
     logging.info(f"Downloading 'config.json' from Hugging Face repository '{model_repo_id}'.")
     try:
         config_path = hf_hub_download(repo_id=model_repo_id, filename="config.json")
@@ -156,63 +158,47 @@ def process_data(df, tokenizer):
     dates = []
     related_stocks_list = []
     prices_current = []
+    symbols = []
+    industries = []
 
     grouped = df.groupby('Symbol', sort=False)
 
     for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
-        current_symbol = row['Symbol']
-        current_date = row['Date']
+        current_symbol = row.get('Symbol', 'Unknown Symbol')
+        current_date = row.get('Date', pd.Timestamp('1970-01-01'))
+        symbols.append(current_symbol)
+        industries.append(row.get('Industry', 'Unknown Industry'))
 
-        # Get all articles for the current symbol before the current date
-        symbol_df = grouped.get_group(current_symbol)
-        previous_articles = symbol_df[symbol_df['Date'] < current_date]
-
-        # Get the last 10 previous articles
-        last_articles = previous_articles.tail(10)
-
-        # Build the concatenated text
-        concatenated_text = ''
-
-        # Add previous articles
-        for _, prev_row in last_articles.iterrows():
-            concatenated_text += (
-                "\nPrevious Article Date: " + str(prev_row['Date']) +
-                "\nPrevious Article Content: " + str(prev_row['Article']) +
-                "\nPrevious Article Title: " + str(prev_row['Title']) +
-                "\nPrevious Article Type: " + str(prev_row['articleType']) +
-                "\nPrevious Article Publication: " + str(prev_row['Publication']) +
-                "\nPrevious Publication Author: " + str(prev_row['Author']) +
-                "\n---\n"
-            )
-
-        # Add the current article
-        concatenated_text += (
-            "Symbol: " + str(row['Symbol']) +
-            "\nSecurity: " + str(row['Date']) +
-            "\nRelated Stocks/Topics: " + str(row['RelatedStocksList']) +
-            "\nArticle Content: " + str(row['Article']) +
-            "\nArticle Title: " + str(row['Title']) +
-            "\nArticle Type: " + str(row['articleType']) +
-            "\nArticle Publication: " + str(row['Publication']) +
-            "\nPublication Author: " + str(row['Author']) +
-            "\nStock Price 4 days before: " + str(row['weighted_avg_-96_hrs']) +
-            "\nStock Price 2 days before: " + str(row['weighted_avg_-48_hrs']) +
-            "\nStock Price 1 day before: " + str(row['weighted_avg_-24_hrs']) +
-            "\nStock Price at release: " + str(row['weighted_avg_0_hrs'])
+        # Build the concatenated text using .get() with default values
+        concatenated_text = (
+            "Symbol: " + str(row.get('Symbol', 'N/A')) +
+            "\nSecurity: " + str(row.get('Security', 'N/A')) +
+            "\nRelated Stocks/Topics: " + str(row.get('RelatedStocksList', 'N/A')) +
+            "\nArticle Content: " + str(row.get('Article', 'N/A')) +
+            "\nArticle Title: " + str(row.get('Title', 'N/A')) +
+            "\nArticle Type: " + str(row.get('articleType', 'N/A')) +
+            "\nArticle Publication: " + str(row.get('Publication', 'N/A')) +
+            "\nPublication Author: " + str(row.get('Author', 'N/A')) +
+            "\nStock Price 4 days before: " + str(row.get('weighted_avg_-96_hrs', 'N/A')) +
+            "\nStock Price 2 days before: " + str(row.get('weighted_avg_-48_hrs', 'N/A')) +
+            "\nStock Price 1 day before: " + str(row.get('weighted_avg_-24_hrs', 'N/A')) +
+            "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A'))
         )
 
         articles.append(concatenated_text)
-        prices.append(row['weighted_avg_720_hrs'])
-        sectors.append(row['Sector'])
-        dates.append(row['Date'])
-        related_stocks_list.append(row['RelatedStocksList'])
-        prices_current.append(row['weighted_avg_0_hrs'])
+        prices.append(row.get('weighted_avg_720_hrs', 0.0))
+        sectors.append(row.get('Sector', 'Unknown Sector'))
+        dates.append(current_date)
+        related_stocks_list.append(row.get('RelatedStocksList', ''))
+        prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
 
-    return articles, prices, sectors, dates, related_stocks_list, prices_current
+    return articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None):
-    articles, prices, sectors, dates, related_stocks_list, prices_current = process_data(df, tokenizer)
-    dataset = ArticlePriceDataset(articles, prices, sectors, dates, related_stocks_list, prices_current, tokenizer, config.EPOCHS)
+    articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries = process_data(df, tokenizer)
+    dataset = ArticlePriceDataset(
+        articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, tokenizer, config.EPOCHS, use_ebm=args.use_ebm if args else False
+    )
 
     if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         sampler = DistributedSampler(dataset, shuffle=shuffle)
@@ -224,23 +210,23 @@ def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True
 def prepare_tasks(tokenizer, args, k=3):
     """
     Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
-    
+
     Args:
         tokenizer (AutoTokenizer): The tokenizer to use.
         args (argparse.Namespace): Command-line arguments.
         k (int): Number of sectors to randomly select for the tasks.
-        
+
     Returns:
         tasks (list): List of DataLoaders for the selected sectors.
     """
     df = get_data(percent_data=args.percent_data)  # load your data
-    
+
     # Get unique sectors from the dataset
     unique_sectors = df['Sector'].unique()
-    
+
     # Randomly sample k sectors from the unique sectors
     selected_sectors = np.random.choice(unique_sectors, size=k, replace=False)
-    
+
     tasks = []
 
     # For each selected sector, create a DataLoader
@@ -408,46 +394,20 @@ def prepare_data(args, tokenizer):
     """
     percent_data = args.percent_data  # get percentage of data to use
     df = get_data(percent_data=percent_data)
-    print(len(df), "aahhhh")
     df = df.sort_values('Date')
 
     random_seed = args.random_seed
 
     if args.mode == 'train':
-        if getattr(args, 'update', False):
-            if isinstance(args.update, str):
-                # Update with new data from provided dataset URL
-                update_df = get_new_data(args.update)
-                logging.info(f"Loaded new update data from {args.update}")
-                # Split df into training and testing sets
-                train_df, test_df = train_test_split(
-                    df,
-                    test_size=0.1,
-                    random_state=random_seed,
-                    shuffle=True
-                )
-                logging.info(f"Data split into 90% train, 10% test.")
-            else:
-                # Update with existing data (80% train, 10% update, 10% test)
-                total_samples = len(df)
-                train_size = int(0.8 * total_samples)
-                update_size = int(0.1 * total_samples)
-                test_size = total_samples - train_size - update_size
-
-                train_df = df.iloc[:train_size]
-                update_df = df.iloc[train_size:train_size + update_size]
-                test_df = df.iloc[train_size + update_size:]
-                logging.info(f"Data split into 80% train, 10% update, 10% test.")
-        else:
-            # Baseline: split into 90% train and 10% test
-            train_df, test_df = train_test_split(
-                df,
-                test_size=0.1,
-                random_state=random_seed,
-                shuffle=True
-            )
-            update_df = None  # no update data in baseline
-            logging.info(f"Data split into 90% train, 10% test.")
+        # Baseline: split into 90% train and 10% test
+        train_df, test_df = train_test_split(
+            df,
+            test_size=0.1,
+            random_state=random_seed,
+            shuffle=True
+        )
+        update_df = None  # No update data in baseline
+        logging.info(f"Data split into 90% train, 10% test.")
 
         train_dataloader = prepare_dataloader(
             train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
@@ -460,16 +420,45 @@ def prepare_data(args, tokenizer):
         )
         logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
 
-        # Prepare update DataLoader if in update mode
-        if getattr(args, 'update', False) and update_df is not None:
-            update_dataloader = prepare_dataloader(
-                update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
-            )
-            logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} update samples.")
-        else:
-            update_dataloader = None
+        return train_dataloader, test_dataloader, None, df
+
+    elif args.mode == 'update':
+        # Handle 'update' mode
+        if not args.update:
+            raise ValueError("You must provide the --update argument when in 'update' mode.")
+        # Load new data for updating
+        update_df = get_new_data(args.update)
+        logging.info(f"Loaded new update data from {args.update}")
+
+        # Split original data into training and testing sets
+        train_df, test_df = train_test_split(
+            df,
+            test_size=0.1,
+            random_state=random_seed,
+            shuffle=True
+        )
+        logging.info(f"Data split into 90% train, 10% test.")
+
+        # Prepare DataLoaders
+        train_dataloader = prepare_dataloader(
+            train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+        )
+        logging.info(f"Prepared train DataLoader with {len(train_dataloader.dataset)} samples.")
+
+        test_dataloader = prepare_dataloader(
+            test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args
+        )
+        logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
+
+        update_dataloader = prepare_dataloader(
+            update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+        )
+        logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
 
         return train_dataloader, test_dataloader, update_dataloader, df
+
+    else:
+        raise ValueError("Invalid mode specified in args.mode")
 
 def initialize_si(model, args):
     """
@@ -638,12 +627,12 @@ def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_p
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         logging.info(f"Loaded model and optimizer state from {checkpoint_path}")
-        
+
         if ebm and ebm_optimizer and 'ebm_state_dict' in checkpoint:
             ebm.load_state_dict(checkpoint['ebm_state_dict'])
             ebm_optimizer.load_state_dict(checkpoint['ebm_optimizer_state_dict'])
             logging.info(f"Loaded EBM and EBM optimizer state from {checkpoint_path}")
-        
+
         epoch = checkpoint.get('epoch', 0)
         return epoch
     else:
@@ -712,23 +701,23 @@ def save_model_weights(model, filepath, device):
 def prepare_tasks(tokenizer, args, k=3):
     """
     Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
-    
+
     Args:
         tokenizer (AutoTokenizer): The tokenizer to use.
         args (argparse.Namespace): Command-line arguments.
         k (int): Number of sectors to randomly select for the tasks.
-        
+
     Returns:
         tasks (list): List of DataLoaders for the selected sectors.
     """
     df = get_data(percent_data=args.percent_data)  # Load your data
-    
+
     # Get unique sectors from the dataset
     unique_sectors = df['Sector'].unique()
-    
+
     # Randomly sample k sectors from the unique sectors
     selected_sectors = np.random.choice(unique_sectors, size=k, replace=False)
-    
+
     tasks = []
 
     # For each selected sector, create a DataLoader
