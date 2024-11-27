@@ -1,6 +1,7 @@
 # utils/train.py
 
 import torch
+from sklearn.metrics import mean_squared_error, r2_score
 from torch.cuda.amp import autocast, GradScaler
 import os
 from tqdm import tqdm
