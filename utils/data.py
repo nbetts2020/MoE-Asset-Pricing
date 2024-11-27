@@ -125,6 +125,7 @@ def worker_generate_samples(args):
             current_sector = current_sector_series.iloc[0] if isinstance(current_sector_series, pd.Series) else current_sector_series
             
             samples.append({
+                'original_idx': idx,  # Store the original index
                 'concatenated_articles': concatenated_articles,
                 'current_price': current_price,
                 'current_sector': current_sector
@@ -195,83 +196,89 @@ class ArticlePriceDataset(Dataset):
             # Do nothing
             pass
 
-    def generate_context_tuples(self, idx):
+    def generate_context_tuples(self, original_idx):
         """
-        Generates context tuples for a given index.
-
+        Generates context tuples for a given original index.
+    
         Args:
-            idx (int): Index of the data point.
-
+            original_idx (int): Original index of the data point in the DataFrame.
+    
         Returns:
             list: List of context strings.
         """
-        sample = self.df.iloc[idx]
+        sample = self.df.iloc[original_idx]
         target_date = sample.get('Date', pd.Timestamp('1970-01-01'))
         target_symbol = sample.get('Symbol', 'Unknown Symbol')
         target_sector = sample.get('Sector', 'Unknown Sector')
         target_industry = sample.get('Industry', 'Unknown Industry')
-
+    
         # Define a 30-day time window before the target date
         start_date = target_date - pd.Timedelta(days=30)
-
+    
         # Filter articles within the date range and before the target date
         date_filtered = self.df[
-        (self.df['Date'] >= start_date) &
-        (self.df['Date'] < target_date)
-    ]
-
+            (self.df['Date'] >= start_date) & 
+            (self.df['Date'] < target_date)
+        ]
+    
         # Helper function to sample articles
         def sample_articles_subset(dataframe, n_samples):
             if len(dataframe) >= n_samples:
                 return dataframe.sample(n_samples, random_state=42)
             else:
                 return dataframe
-
+    
         # Generate contexts from different categories
         contexts = []
-
+    
         # Broader Economic Information
         economic_articles = date_filtered[
-        date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)
-    ]
+            date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)
+        ]
         economic_contexts = sample_articles_subset(economic_articles, 2)['Article'].tolist()
-
+    
         # Industry-Specific Information
         industry_articles = date_filtered[
-        date_filtered['Industry'] == target_industry
-    ]
+            date_filtered['Industry'] == target_industry
+        ]
         industry_contexts = sample_articles_subset(industry_articles, 2)['Article'].tolist()
-
+    
         # Sector-Specific Information
         sector_articles = date_filtered[
-        date_filtered['Sector'] == target_sector
-    ]
+            date_filtered['Sector'] == target_sector
+        ]
         sector_contexts = sample_articles_subset(sector_articles, 2)['Article'].tolist()
-
+    
         # Stock-Specific Information (Top movers)
         stock_articles = self.df[
-        (self.df['Symbol'] == target_symbol) &
-        (self.df['Date'] < target_date - pd.Timedelta(days=30))
-    ].nlargest(25, 'Percentage Change')
-        stock_contexts = sample_articles_subset(stock_articles, 2)['Article'].tolist()
-
+            (self.df['Symbol'] == target_symbol) & 
+            (self.df['Date'] < target_date - pd.Timedelta(days=30))
+        ]
+    
+        if 'Percentage Change' in stock_articles.columns:
+            stock_articles = stock_articles.nlargest(25, 'Percentage Change')
+            stock_contexts = sample_articles_subset(stock_articles, 2)['Article'].tolist()
+        else:
+            logger.warning("'Percentage Change' column missing. Skipping stock-specific information.")
+            stock_contexts = []
+    
         # Last 8 Articles
         last_8_articles = self.df[
-        (self.df['Symbol'] == target_symbol) &
-        (self.df['Date'] < target_date)
-    ].sort_values(by='Date', ascending=False).head(8)
+            (self.df['Symbol'] == target_symbol) & 
+            (self.df['Date'] < target_date)
+        ].sort_values(by='Date', ascending=False).head(8)
         last_8_contexts = last_8_articles['Article'].tolist()
-
+    
         # Combine contexts into a list
         contexts.extend(economic_contexts)
         contexts.extend(industry_contexts)
         contexts.extend(sector_contexts)
         contexts.extend(stock_contexts)
         contexts.extend(last_8_contexts)
-
+    
         # Ensure all contexts are strings
         contexts = [str(context) for context in contexts]
-
+    
         return contexts
 
     def __len__(self):
@@ -290,10 +297,11 @@ class ArticlePriceDataset(Dataset):
             input_ids = encoding['input_ids'].squeeze(0)  # removing batch dimension
             label = torch.tensor(sample['current_price'], dtype=torch.float)
             sector = sample['current_sector']
-
-            # Generate context tuples
-            context_strings = self.generate_context_tuples(idx)
-
+    
+            # Use the original DataFrame index for context generation
+            original_idx = sample['original_idx']
+            context_strings = self.generate_context_tuples(original_idx)
+    
             # Tokenize contexts
             context_input_ids_list = []
             for context_str in context_strings:
@@ -306,14 +314,14 @@ class ArticlePriceDataset(Dataset):
                 )
                 context_input_ids = context_encoding['input_ids'].squeeze(0)  # removing batch dimension
                 context_input_ids_list.append(context_input_ids)
-
+    
             # Stack context input_ids
             if context_input_ids_list:
                 context_input_ids = torch.stack(context_input_ids_list)  # shape: (num_contexts, seq_len)
             else:
                 # If no contexts, create a placeholder
                 context_input_ids = torch.zeros((1, config.BLOCK_SIZE), dtype=torch.long)
-
+    
             return {
                 'input_ids': input_ids,
                 'labels': label,
@@ -323,9 +331,9 @@ class ArticlePriceDataset(Dataset):
         else:
             # Fallback to original behavior if sampling not prepared
             row = self.df.iloc[idx]
-            article = row['Article']
-            price = row['weighted_avg_720_hrs']
-            sector = row['Sector']
+            article = row.get('Article', 'N/A')
+            price = row.get('weighted_avg_720_hrs', 0.0)
+            sector = row.get('Sector', 'Unknown Sector')
             encoding = self.tokenizer(
                 article,
                 truncation=True,
