@@ -15,6 +15,7 @@ from utils.utils import (
     save_model_and_states
 )
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
+from utils.data import ArticlePriceDataset
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None,
                 replay_buffer=None, df=None):
