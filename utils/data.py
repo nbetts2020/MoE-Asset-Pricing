@@ -30,62 +30,62 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
     formatted_articles.append("Broader Economic Information:")
     for _, row in sample.iterrows():
         if 'Markets' in row.get('RelatedStocksList', ''):
-            date_str = row['Date'].strftime('%Y-%m-%d')
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
             formatted_articles.append(
                 f"Date: {date_str}\n"
-                f"Title: {row['Title']}\n"
-                f"Article: {row['Article']}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
             )
 
     # Broader Industry Information
     formatted_articles.append("\nBroader Industry Information:")
     for _, row in sample.iterrows():
-        if row['Industry'] == sample.iloc[-1]['Industry']:
-            date_str = row['Date'].strftime('%Y-%m-%d')
+        if row.get('Industry', 'Unknown Industry') == sample.iloc[-1].get('Industry', 'Unknown Industry'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
             formatted_articles.append(
                 f"Date: {date_str}\n"
-                f"Title: {row['Title']}\n"
-                f"Article: {row['Article']}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
             )
 
     # Broader Sector Information
     formatted_articles.append("\nBroader Sector Information:")
     for _, row in sample.iterrows():
-        if row['Sector'] == sample.iloc[-1]['Sector']:
-            date_str = row['Date'].strftime('%Y-%m-%d')
+        if row.get('Sector', 'Unknown Sector') == sample.iloc[-1].get('Sector', 'Unknown Sector'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
             formatted_articles.append(
                 f"Date: {date_str}\n"
-                f"Title: {row['Title']}\n"
-                f"Article: {row['Article']}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
             )
 
     # Information Indicating Significant Market Movement Related to Current Stock
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
     for _, row in sample.iterrows():
-        if row['Symbol'] == sample.iloc[-1]['Symbol'] and 'Percentage Change' in row:
-            date_str = row['Date'].strftime('%Y-%m-%d')
+        if row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol') and 'Percentage Change' in row:
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
             formatted_articles.append(
                 f"Date: {date_str}\n"
-                f"Title: {row['Title']}\n"
-                f"Article: {row['Article']}\n"
-                f"Percentage Change: {row['Percentage Change']:.2f}%\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+                f"Percentage Change: {row.get('Percentage Change', 0.0):.2f}%\n"
             )
 
     # Last 8 Articles for Current Stock
     formatted_articles.append("\nLast 8 Articles for Current Stock:")
     for _, row in sample.iterrows():
-        if row['Symbol'] == sample.iloc[-1]['Symbol']:
-            date_str = row['Date'].strftime('%Y-%m-%d')
+        if row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
             article_details = (
-                f"Symbol: {row['Symbol']}\n"
+                f"Symbol: {row.get('Symbol', 'N/A')}\n"
                 f"Security: {row.get('Security', 'N/A')}\n"
                 f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
-                f"Title: {row['Title']}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
                 f"Type: {row.get('articleType', 'N/A')}\n"
                 f"Publication: {row.get('Publication', 'N/A')}\n"
                 f"Publication Author: {row.get('Author', 'N/A')}\n"
                 f"Date: {date_str}\n"
-                f"Article: {row['Article']}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
                 f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
                 f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
                 f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
@@ -126,9 +126,9 @@ def worker_generate_samples(args):
         return []
 
 class ArticlePriceDataset(Dataset):
-    def __init__(self, articles: list, prices: list, sectors: list, dates: list, related_stocks_list: list, prices_current: list, tokenizer, total_epochs: int):
+    def __init__(self, articles: list, prices: list, sectors: list, dates: list, related_stocks_list: list, prices_current: list, symbols: list, industries: list, tokenizer, total_epochs: int, use_ebm: bool=False):
         """
-        Initializes the dataset with articles, prices, sectors, dates, related_stocks_list, prices_current, tokenizer, and total_epochs.
+        Initializes the dataset with articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, tokenizer, and total_epochs.
 
         Args:
             articles (list): List of article texts.
@@ -137,8 +137,10 @@ class ArticlePriceDataset(Dataset):
             dates (list): List of corresponding dates.
             related_stocks_list (list): List of related stocks/topics.
             prices_current (list): List of current prices at release.
+            symbols (list): List of stock symbols.
             tokenizer: Tokenizer instance for encoding text.
             total_epochs (int): Total number of training epochs.
+            use_ebm (bool): Whether to use EBM sampling logic.
         """
         # Create a DataFrame from the provided lists
         self.df = pd.DataFrame({
@@ -147,40 +149,41 @@ class ArticlePriceDataset(Dataset):
             'Sector': sectors,
             'Date': dates,
             'RelatedStocksList': related_stocks_list,
-            'weighted_avg_0_hrs': prices_current
+            'weighted_avg_0_hrs': prices_current,
+            'Symbol': symbols,
+            'Industry': industries
         })
         self.df = preprocess_data(self.df)
         self.tokenizer = tokenizer
         self.total_epochs = total_epochs
+        self.use_ebm = use_ebm
         self.sampled_articles = []
         self.current_epoch = 0
 
     def prepare_epoch(self, current_epoch: int):
-        """
-        Prepares the dataset for the current epoch by sampling articles.
-
-        Args:
-            current_epoch (int): The current epoch number.
-        """
         self.current_epoch = current_epoch
-        num_samples = self.total_epochs - current_epoch
-        if num_samples < 1:
-            num_samples = 1
-        index_list = self.df.index.tolist()
+        if self.use_ebm:
+            num_samples = self.total_epochs - current_epoch
+            if num_samples < 1:
+                num_samples = 1
+            index_list = self.df.index.tolist()
 
-        self.sampled_articles = []
+            self.sampled_articles = []
 
-        # Prepare arguments for worker_generate_samples
-        args_list = [(idx, self.df, self.total_epochs) for idx in index_list]
+            # Prepare arguments for worker_generate_samples
+            args_list = [(idx, self.df, self.total_epochs) for idx in index_list]
 
-        # Parallel processing using ProcessPoolExecutor
-        num_workers = os.cpu_count() or 1
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Use a top-level worker function instead of a lambda
-            results = executor.map(worker_generate_samples, args_list)
-            for sample_batch in results:
-                self.sampled_articles.extend(sample_batch)
-        logger.info(f"Epoch {current_epoch}: Prepared {len(self.sampled_articles)} sampled articles.")
+            # Parallel processing using ProcessPoolExecutor
+            num_workers = os.cpu_count() or 1
+            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Use a top-level worker function instead of a lambda
+                results = executor.map(worker_generate_samples, args_list)
+                for sample_batch in results:
+                    self.sampled_articles.extend(sample_batch)
+            logger.info(f"Epoch {current_epoch}: Prepared {len(self.sampled_articles)} sampled articles.")
+        else:
+            # Do nothing
+            pass
 
     def generate_context_tuples(self, idx):
         """
@@ -193,16 +196,19 @@ class ArticlePriceDataset(Dataset):
             list: List of context strings.
         """
         sample = self.df.iloc[idx]
-        target_date = sample['Date']
-        target_symbol = sample['Symbol']
-        target_sector = sample['Sector']
-        target_industry = sample['Industry']
+        target_date = sample.get('Date', pd.Timestamp('1970-01-01'))
+        target_symbol = sample.get('Symbol', 'Unknown Symbol')
+        target_sector = sample.get('Sector', 'Unknown Sector')
+        target_industry = sample.get('Industry', 'Unknown Industry')
 
         # Define a 30-day time window before the target date
         start_date = target_date - pd.Timedelta(days=30)
 
         # Filter articles within the date range and before the target date
-        date_filtered = self.df[(self.df['Date'] >= start_date) & (self.df['Date'] < target_date)]
+        date_filtered = self.df[
+        (self.df['Date'] >= start_date) &
+        (self.df['Date'] < target_date)
+    ]
 
         # Helper function to sample articles
         def sample_articles_subset(dataframe, n_samples):
@@ -215,27 +221,35 @@ class ArticlePriceDataset(Dataset):
         contexts = []
 
         # Broader Economic Information
-        economic_articles = date_filtered[date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)]
+        economic_articles = date_filtered[
+        date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)
+    ]
         economic_contexts = sample_articles_subset(economic_articles, 2)['Article'].tolist()
 
         # Industry-Specific Information
-        industry_articles = date_filtered[date_filtered['Industry'] == target_industry]
+        industry_articles = date_filtered[
+        date_filtered['Industry'] == target_industry
+    ]
         industry_contexts = sample_articles_subset(industry_articles, 2)['Article'].tolist()
 
         # Sector-Specific Information
-        sector_articles = date_filtered[date_filtered['Sector'] == target_sector]
+        sector_articles = date_filtered[
+        date_filtered['Sector'] == target_sector
+    ]
         sector_contexts = sample_articles_subset(sector_articles, 2)['Article'].tolist()
 
         # Stock-Specific Information (Top movers)
         stock_articles = self.df[
-            (self.df['Symbol'] == target_symbol) & (self.df['Date'] < target_date - pd.Timedelta(days=30))
-        ].nlargest(25, 'Percentage Change')
+        (self.df['Symbol'] == target_symbol) &
+        (self.df['Date'] < target_date - pd.Timedelta(days=30))
+    ].nlargest(25, 'Percentage Change')
         stock_contexts = sample_articles_subset(stock_articles, 2)['Article'].tolist()
 
         # Last 8 Articles
         last_8_articles = self.df[
-            (self.df['Symbol'] == target_symbol) & (self.df['Date'] < target_date)
-        ].sort_values(by='Date', ascending=False).head(8)
+        (self.df['Symbol'] == target_symbol) &
+        (self.df['Date'] < target_date)
+    ].sort_values(by='Date', ascending=False).head(8)
         last_8_contexts = last_8_articles['Article'].tolist()
 
         # Combine contexts into a list
@@ -245,13 +259,16 @@ class ArticlePriceDataset(Dataset):
         contexts.extend(stock_contexts)
         contexts.extend(last_8_contexts)
 
+        # Ensure all contexts are strings
+        contexts = [str(context) for context in contexts]
+
         return contexts
 
     def __len__(self):
-        return len(self.sampled_articles) if self.sampled_articles else len(self.df)
+        return len(self.sampled_articles) if self.use_ebm and self.sampled_articles else len(self.df)
 
     def __getitem__(self, idx):
-        if self.sampled_articles:
+        if self.use_ebm and self.sampled_articles:
             sample = self.sampled_articles[idx]
             encoding = self.tokenizer(
                 sample['concatenated_articles'],
