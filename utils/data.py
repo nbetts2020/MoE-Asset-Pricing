@@ -116,8 +116,14 @@ def worker_generate_samples(args):
             logger.debug(f"Generating sample {i+1}/{num_samples} for idx: {idx}")
             sample = sample_articles(df, [idx])[0]
             concatenated_articles = format_concatenated_articles(sample)
-            current_price = sample.get('weighted_avg_720_hrs', 0.0)
-            current_sector = sample.get('Sector', 'Unknown Sector')
+            
+            # Extract scalar values using .iloc[0]
+            current_price_series = sample.get('weighted_avg_720_hrs', 0.0)
+            current_price = current_price_series.iloc[0] if isinstance(current_price_series, pd.Series) else current_price_series
+
+            current_sector_series = sample.get('Sector', 'Unknown Sector')
+            current_sector = current_sector_series.iloc[0] if isinstance(current_sector_series, pd.Series) else current_sector_series
+            
             samples.append({
                 'concatenated_articles': concatenated_articles,
                 'current_price': current_price,
