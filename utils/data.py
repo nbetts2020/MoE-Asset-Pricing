@@ -315,13 +315,19 @@ class ArticlePriceDataset(Dataset):
                 context_input_ids = context_encoding['input_ids'].squeeze(0)  # removing batch dimension
                 context_input_ids_list.append(context_input_ids)
     
-            # Stack context input_ids
-            if context_input_ids_list:
-                context_input_ids = torch.stack(context_input_ids_list)  # shape: (num_contexts, seq_len)
-            else:
-                # If no contexts, create a placeholder
-                context_input_ids = torch.zeros((1, config.BLOCK_SIZE), dtype=torch.long)
-    
+            num_contexts = len(context_input_ids_list)
+            if num_contexts < config.BATCH_SIZE:
+                # Pad with zero tensors
+                num_to_pad = config.BATCH_SIZE - num_contexts
+                pad_tensor = torch.zeros((num_to_pad, config.BLOCK_SIZE), dtype=torch.long)
+                context_input_ids_list.extend([pad_tensor[i] for i in range(num_to_pad)])
+            elif num_contexts > config.BATCH_SIZE:
+                # Truncate the list
+                context_input_ids_list = context_input_ids_list[:config.BATCH_SIZE]
+        
+            # Stacking the context_input_ids_list
+            context_input_ids = torch.stack(context_input_ids_list)  # shape: (config.BATCH_SIZE, seq_len)
+            
             return {
                 'input_ids': input_ids,
                 'labels': label,
