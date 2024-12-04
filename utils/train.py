@@ -64,10 +64,10 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     # Load from checkpoint if specified
     start_epoch = 0
     if hasattr(args, 'checkpoint_path') and args.checkpoint_path:
-        start_epoch = load_checkpoint(model, optimizer, ebm if use_ebm else None, 
-                                     ebm_optimizer if use_ebm else None, 
+        start_epoch = load_checkpoint(model, optimizer, ebm if use_ebm else None,
+                                     ebm_optimizer if use_ebm else None,
                                      checkpoint_path=args.checkpoint_path)
-    
+
     for epoch in range(start_epoch, epochs):
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
         total_loss = 0.0
@@ -108,13 +108,13 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
                     # Compute energies
                     energies = ebm(
-                        article_embeddings.unsqueeze(1).expand(-1, num_contexts, -1),  # (batch_size, num_contexts, embedding_dim)
+                        article_embeddings.squeeze(1).squeeze(1),  # (batch_size, num_contexts, embedding_dim)
                         context_embeddings  # (batch_size, num_contexts, embedding_dim)
                     )  # (batch_size, num_contexts)
 
                     # Scale energies
                     scaled_energies = scale_energy(energies)  # (batch_size, num_contexts)
-
+                    print("energy")
                     # Compute sampling probabilities
                     probabilities = compute_sampling_probabilities(scaled_energies, temperature=args.temperature)  # (batch_size, num_contexts)
 
@@ -124,6 +124,9 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
                     # Concatenate selected contexts with input_ids
                     selected_input_ids = torch.cat([input_ids, selected_contexts], dim=1)  # (batch_size, total_seq_len)
+                    max_seq_len = config.BLOCK_SIZE
+                    if selected_input_ids.size(1) > max_seq_len:
+                        selected_input_ids = selected_input_ids[:, :max_seq_len]
                 else:
                     selected_input_ids = input_ids  # Fallback if no context provided
             else:
@@ -150,21 +153,22 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
+            print("scaler")
             if si:
                 si.update_omega()
 
             if use_ebm:
                 # Define EBM loss as predicting the scaled MSE
                 with torch.no_grad():
-                    # Compute MSE for selected contexts
-                    selected_outputs, _ = model(
+                    with autocast():
+                        # Compute MSE for selected contexts
+                        selected_outputs, _ = model(
                         input_ids=selected_input_ids,
                         targets=labels.float(),
                         use_entropy_reg=args.use_entropy_reg,
                         lambda_entropy=args.lambda_entropy
                     )
-                    mse_loss = torch.nn.functional.mse_loss(selected_outputs, labels.float(), reduction='none')  # (batch_size,)
+                        mse_loss = torch.nn.functional.mse_loss(selected_outputs, labels.float(), reduction='none')  # (batch_size,)
 
                 # Scale the MSE loss
                 scaled_mse = scale_energy(mse_loss.unsqueeze(1))  # (batch_size, 1)
