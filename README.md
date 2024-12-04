@@ -82,7 +82,7 @@ This combination enables the model to focus on the most relevant data within the
 
 As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
 
-Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - taken from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
+Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - forked from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
 
 ## Energy-Based Model and Monte Carlo Sampling for Optimal Context Selection [^6][^7][^8]
 
@@ -92,7 +92,7 @@ $$
 E(A, C) = \text{EBM}(f(A), f(C))
 $$
 
-where $f(A)$ and $f(C)$ are the embedding vectors of the article and context tuple, respectively. The EBM is implemented as a simple feedforward neural network (Multi-Layer Perceptron) that takes the concatenated embeddings of $A$ and $C$ and outputs a single scalar value representing the energy. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM, yet does not delve into more sophisticated approaches such as contrastive divergence or other advanced architectural variants commonly seen in modern EBMs, yet this deliberate simplification allows for efficient context optimization while maintaining computational tractability.
+where $f(A)$ and $f(C)$ are the embedding vectors of the article and context tuple, respectively. The EBM is implemented as a simple feedforward neural network (Multi-Layer Perceptron) that takes the concatenated embeddings of $A$ and $C$ and outputs a single scalar value representing the energy. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM, yet does not dive into more sophisticated approaches such as contrastive divergence or other advanced architectural variants commonly seen in modern EBMs, yet this deliberate simplification allows for efficient context optimization while maintaining computational tractability.
 
 ### Energy Computation and Scaling
 
