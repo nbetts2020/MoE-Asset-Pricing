@@ -116,14 +116,14 @@ def worker_generate_samples(args):
             logger.debug(f"Generating sample {i+1}/{num_samples} for idx: {idx}")
             sample = sample_articles(df, [idx])[0]
             concatenated_articles = format_concatenated_articles(sample)
-            
+
             # Extract scalar values using .iloc[0]
             current_price_series = sample.get('weighted_avg_720_hrs', 0.0)
             current_price = current_price_series.iloc[0] if isinstance(current_price_series, pd.Series) else current_price_series
 
             current_sector_series = sample.get('Sector', 'Unknown Sector')
             current_sector = current_sector_series.iloc[0] if isinstance(current_sector_series, pd.Series) else current_sector_series
-            
+
             samples.append({
                 'original_idx': idx,  # Store the original index
                 'concatenated_articles': concatenated_articles,
@@ -149,6 +149,7 @@ class ArticlePriceDataset(Dataset):
             related_stocks_list (list): List of related stocks/topics.
             prices_current (list): List of current prices at release.
             symbols (list): List of stock symbols.
+            industries (list): List of industries.
             tokenizer: Tokenizer instance for encoding text.
             total_epochs (int): Total number of training epochs.
             use_ebm (bool): Whether to use EBM sampling logic.
@@ -187,7 +188,6 @@ class ArticlePriceDataset(Dataset):
             # Parallel processing using ProcessPoolExecutor
             num_workers = os.cpu_count() or 1
             with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                # Use a top-level worker function instead of a lambda
                 results = executor.map(worker_generate_samples, args_list)
                 for sample_batch in results:
                     self.sampled_articles.extend(sample_batch)
@@ -196,90 +196,91 @@ class ArticlePriceDataset(Dataset):
             # Do nothing
             pass
 
-    def generate_context_tuples(self, original_idx):
+    def generate_context_string(self, original_idx):
         """
-        Generates context tuples for a given original index.
-    
+        Generates a concatenated context string for a given original index.
+
         Args:
             original_idx (int): Original index of the data point in the DataFrame.
-    
+
         Returns:
-            list: List of context strings.
+            str: Concatenated context string.
         """
         sample = self.df.iloc[original_idx]
         target_date = sample.get('Date', pd.Timestamp('1970-01-01'))
         target_symbol = sample.get('Symbol', 'Unknown Symbol')
         target_sector = sample.get('Sector', 'Unknown Sector')
         target_industry = sample.get('Industry', 'Unknown Industry')
-    
+
         # Define a 30-day time window before the target date
         start_date = target_date - pd.Timedelta(days=30)
-    
+
         # Filter articles within the date range and before the target date
         date_filtered = self.df[
-            (self.df['Date'] >= start_date) & 
+            (self.df['Date'] >= start_date) &
             (self.df['Date'] < target_date)
         ]
-    
+
         # Helper function to sample articles
         def sample_articles_subset(dataframe, n_samples):
             if len(dataframe) >= n_samples:
                 return dataframe.sample(n_samples, random_state=42)
             else:
                 return dataframe
-    
+
         # Generate contexts from different categories
         contexts = []
-    
+
         # Broader Economic Information
         economic_articles = date_filtered[
             date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)
         ]
         economic_contexts = sample_articles_subset(economic_articles, 2)['Article'].tolist()
-    
+
         # Industry-Specific Information
         industry_articles = date_filtered[
             date_filtered['Industry'] == target_industry
         ]
         industry_contexts = sample_articles_subset(industry_articles, 2)['Article'].tolist()
-    
+
         # Sector-Specific Information
         sector_articles = date_filtered[
             date_filtered['Sector'] == target_sector
         ]
         sector_contexts = sample_articles_subset(sector_articles, 2)['Article'].tolist()
-    
+
         # Stock-Specific Information (Top movers)
         stock_articles = self.df[
-            (self.df['Symbol'] == target_symbol) & 
+            (self.df['Symbol'] == target_symbol) &
             (self.df['Date'] < target_date - pd.Timedelta(days=30))
         ]
-    
+
         if 'Percentage Change' in stock_articles.columns:
             stock_articles = stock_articles.nlargest(25, 'Percentage Change')
             stock_contexts = sample_articles_subset(stock_articles, 2)['Article'].tolist()
         else:
             logger.warning("'Percentage Change' column missing. Skipping stock-specific information.")
             stock_contexts = []
-    
+
         # Last 8 Articles
         last_8_articles = self.df[
-            (self.df['Symbol'] == target_symbol) & 
+            (self.df['Symbol'] == target_symbol) &
             (self.df['Date'] < target_date)
         ].sort_values(by='Date', ascending=False).head(8)
         last_8_contexts = last_8_articles['Article'].tolist()
-    
-        # Combine contexts into a list
+
+        # Combine contexts into a single string
         contexts.extend(economic_contexts)
         contexts.extend(industry_contexts)
         contexts.extend(sector_contexts)
         contexts.extend(stock_contexts)
         contexts.extend(last_8_contexts)
-    
+
         # Ensure all contexts are strings
         contexts = [str(context) for context in contexts]
-    
-        return contexts
+
+        concatenated_contexts = " ".join(contexts)
+        return concatenated_contexts
 
     def __len__(self):
         return len(self.sampled_articles) if self.use_ebm and self.sampled_articles else len(self.df)
@@ -294,45 +295,29 @@ class ArticlePriceDataset(Dataset):
                 max_length=config.BLOCK_SIZE,
                 return_tensors='pt'
             )
-            input_ids = encoding['input_ids'].squeeze(0)  # removing batch dimension
+            input_ids = encoding['input_ids'].squeeze(0)  # Shape: (seq_len,)
             label = torch.tensor(sample['current_price'], dtype=torch.float)
             sector = sample['current_sector']
-    
+
             # Use the original DataFrame index for context generation
             original_idx = sample['original_idx']
-            context_strings = self.generate_context_tuples(original_idx)
-    
-            # Tokenize contexts
-            context_input_ids_list = []
-            for context_str in context_strings:
-                context_encoding = self.tokenizer(
-                    context_str,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=config.BLOCK_SIZE,
-                    return_tensors='pt'
-                )
-                context_input_ids = context_encoding['input_ids'].squeeze(0)  # removing batch dimension
-                context_input_ids_list.append(context_input_ids)
-    
-            num_contexts = len(context_input_ids_list)
-            if num_contexts < config.BATCH_SIZE:
-                # Pad with zero tensors
-                num_to_pad = config.BATCH_SIZE - num_contexts
-                pad_tensor = torch.zeros((num_to_pad, config.BLOCK_SIZE), dtype=torch.long)
-                context_input_ids_list.extend([pad_tensor[i] for i in range(num_to_pad)])
-            elif num_contexts > config.BATCH_SIZE:
-                # Truncate the list
-                context_input_ids_list = context_input_ids_list[:config.BATCH_SIZE]
-        
-            # Stacking the context_input_ids_list
-            context_input_ids = torch.stack(context_input_ids_list)  # shape: (config.BATCH_SIZE, seq_len)
-            
+            concatenated_contexts = self.generate_context_string(original_idx)
+
+            # Tokenize concatenated contexts
+            context_encoding = self.tokenizer(
+                concatenated_contexts,
+                truncation=True,
+                padding='max_length',
+                max_length=config.BLOCK_SIZE,
+                return_tensors='pt'
+            )
+            context_input_ids = context_encoding['input_ids'].squeeze(0)  # Shape: (seq_len,)
+
             return {
-                'input_ids': input_ids,
-                'labels': label,
-                'sector': sector,
-                'context_input_ids': context_input_ids  # shape: (num_contexts, seq_len)
+                'input_ids': input_ids,                     # Shape: (seq_len,)
+                'labels': label,                            # Scalar
+                'sector': sector,                           # String
+                'context_input_ids': context_input_ids      # Shape: (seq_len,)
             }
         else:
             # Fallback to original behavior if sampling not prepared
