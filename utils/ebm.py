@@ -17,16 +17,10 @@ class EnergyBasedModel(nn.Module):
         )
 
     def forward(self, article_embedding, context_embedding):
-        # article_embedding: (batch_size, embedding_dim)
-        # context_embedding: (batch_size, num_contexts, embedding_dim)
-        # Concatenate article and context embeddings
-        batch_size, num_contexts, embedding_dim = context_embedding.shape
-        article_expanded = article_embedding.unsqueeze(1).expand(-1, num_contexts, -1)
-        x = torch.cat((article_expanded, context_embedding), dim=-1)  # (batch_size, num_contexts, 2*embedding_dim)
-        x = x.view(-1, 2 * embedding_dim)  # (batch_size * num_contexts, 2*embedding_dim)
-        energy = self.fc(x)  # (batch_size * num_contexts, 1)
-        energy = energy.view(batch_size, num_contexts)  # (batch_size, num_contexts)
-        return energy  # (batch_size, num_contexts)
+        # Both embeddings have shape: (batch_size, embedding_dim)
+        x = torch.cat((article_embedding, context_embedding), dim=-1)  # Shape: (batch_size, 2 * embedding_dim)
+        energy = self.fc(x).squeeze(-1)  # Shape: (batch_size,)
+        return energy  # Shape: (batch_size,)
 
 def scale_energy(energy_values, epsilon=1e-8):
     # energy_values: (batch_size, num_contexts)
@@ -42,14 +36,14 @@ def compute_sampling_probabilities(scaled_energies, temperature):
 def select_best_context(contexts, labels, model, device, args):
     """
     Selects the context with the lowest MSE for each sample.
-    
+
     Args:
         contexts (torch.Tensor): Tensor of shape (batch_size * num_samples, seq_length).
         labels (torch.Tensor): Tensor of shape (batch_size * num_samples, ...).
         model (nn.Module): The model being trained.
         device (torch.device): The device to perform computations on.
         args (Namespace): Parsed command-line arguments.
-    
+
     Returns:
         torch.Tensor: Selected input_ids tensor of shape (batch_size, seq_length).
         torch.Tensor: Corresponding labels tensor of shape (batch_size, ...).
