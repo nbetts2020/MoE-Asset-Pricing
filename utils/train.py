@@ -74,13 +74,14 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         predictions = []
         actuals = []
 
-        # Prepare epoch data
-        dataset.prepare_epoch(current_epoch=epoch)
-
         if hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
         for batch in tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}"):
+
+            batch_indices = batch['idx']
+            dataset.prepare_epoch(current_epoch=epoch, batch_indices=batch_indices)
+
             optimizer.zero_grad()
             if use_ebm:
                 ebm_optimizer.zero_grad()
