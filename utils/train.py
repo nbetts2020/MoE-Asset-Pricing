@@ -2,7 +2,8 @@
 
 import torch
 from sklearn.metrics import mean_squared_error, r2_score
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
+from torch.cuda.amp import GradScaler
 import os
 from tqdm import tqdm
 import logging
@@ -15,7 +16,7 @@ from utils.utils import (
     load_checkpoint,
     save_model_and_states
 )
-from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
+from utils.ebm import EnergyBasedModel
 from utils.data import ArticlePriceDataset
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None,
@@ -55,7 +56,6 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     if use_ebm:
         ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
         ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
-        ebm_loss_fn = torch.nn.MSELoss()
 
     # Directory to save checkpoints
     checkpoint_dir = args.checkpoint_dir if hasattr(args, 'checkpoint_dir') else './checkpoints'
@@ -65,8 +65,8 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     start_epoch = 0
     if hasattr(args, 'checkpoint_path') and args.checkpoint_path:
         start_epoch = load_checkpoint(model, optimizer, ebm if use_ebm else None,
-                                     ebm_optimizer if use_ebm else None,
-                                     checkpoint_path=args.checkpoint_path)
+                                      ebm_optimizer if use_ebm else None,
+                                      checkpoint_path=args.checkpoint_path)
 
     for epoch in range(start_epoch, epochs):
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
@@ -85,54 +85,42 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             if use_ebm:
                 ebm_optimizer.zero_grad()
 
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
+            input_ids = batch['input_ids'].to(device)                 # Shape: (batch_size, seq_len)
+            labels = batch['labels'].to(device)                       # Shape: (batch_size,)
             sectors = batch['sector']
 
             if use_ebm:
-                # EBM and Monte Carlo Sampling logic
                 context_input_ids = batch.get('context_input_ids', None)
                 if context_input_ids is not None:
-                    context_input_ids = context_input_ids.to(device)  # shape: (batch_size, num_contexts, seq_len)
-                    num_contexts = context_input_ids.shape[1]
-                    batch_size = input_ids.shape[0]
+                    context_input_ids = context_input_ids.to(device)  # Shape: (batch_size, seq_len_context)
 
-                    # Flatten context_input_ids for embedding
-                    flat_context_ids = context_input_ids.view(-1, context_input_ids.size(-1))  # (batch_size * num_contexts, seq_len)
+                    # Concatenate input_ids and context_input_ids
+                    selected_input_ids = torch.cat([input_ids, context_input_ids], dim=1)  # Shape: (batch_size, total_seq_len)
 
-                    # Generate embeddings
-                    with torch.no_grad():
-                        article_embeddings = model.get_embeddings(input_ids)  # (batch_size, embedding_dim)
-                        context_embeddings = model.get_embeddings(flat_context_ids)  # (batch_size * num_contexts, embedding_dim)
-                        context_embeddings = context_embeddings.view(batch_size, num_contexts, -1)  # (batch_size, num_contexts, embedding_dim)
-
-                    # Compute energies
-                    energies = ebm(
-                        article_embeddings.squeeze(1).squeeze(1),  # (batch_size, num_contexts, embedding_dim)
-                        context_embeddings  # (batch_size, num_contexts, embedding_dim)
-                    )  # (batch_size, num_contexts)
-
-                    # Scale energies
-                    scaled_energies = scale_energy(energies)  # (batch_size, num_contexts)
-                    print("energy")
-                    # Compute sampling probabilities
-                    probabilities = compute_sampling_probabilities(scaled_energies, temperature=args.temperature)  # (batch_size, num_contexts)
-
-                    # Sample contexts
-                    sampled_indices = torch.multinomial(probabilities, num_samples=1).squeeze(-1)  # (batch_size,)
-                    selected_contexts = context_input_ids[torch.arange(batch_size), sampled_indices, :]  # (batch_size, seq_len)
-
-                    # Concatenate selected contexts with input_ids
-                    selected_input_ids = torch.cat([input_ids, selected_contexts], dim=1)  # (batch_size, total_seq_len)
+                    # Truncate to max_seq_len if necessary
                     max_seq_len = config.BLOCK_SIZE
                     if selected_input_ids.size(1) > max_seq_len:
                         selected_input_ids = selected_input_ids[:, :max_seq_len]
-                else:
-                    selected_input_ids = input_ids  # Fallback if no context provided
-            else:
-                selected_input_ids = input_ids  # if ebm arg not set, use input_ids as is
 
-            with autocast():
+                    # Get embeddings
+                    with torch.no_grad():
+                        article_embeddings = model.get_embeddings(input_ids)          # Shape: (batch_size, embedding_dim)
+                        context_embeddings = model.get_embeddings(context_input_ids)  # Shape: (batch_size, embedding_dim)
+
+                    # Compute energies using EBM
+                    energies = ebm(article_embeddings, context_embeddings)  # Shape: (batch_size,)
+
+                    # Compute EBM loss (e.g., minimize energies)
+                    ebm_loss = energies.mean()
+                else:
+                    selected_input_ids = input_ids  # No context provided
+                    ebm_loss = 0.0
+            else:
+                selected_input_ids = input_ids  # Standard training without EBM
+                ebm_loss = 0.0
+
+            # Forward pass through the model
+            with amp.autocast('cuda'):
                 outputs, loss = model(
                     input_ids=selected_input_ids,
                     targets=labels.float(),
@@ -149,43 +137,22 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             if getattr(args, 'use_l2', False):
                 loss += args.lambda_l2 * compute_l2_loss(model)
 
+            # Combine losses
+            if use_ebm and context_input_ids is not None:
+                total_batch_loss = loss + 1 * ebm_loss
+            else:
+                total_batch_loss = loss
+
             # Backward and optimization
-            scaler.scale(loss).backward()
+            scaler.scale(total_batch_loss).backward()
+
+            # Step optimizers
             scaler.step(optimizer)
-            scaler.update()
-            print("scaler")
-            if si:
-                si.update_omega()
-
-            if use_ebm:
-                # Define EBM loss as predicting the scaled MSE
-                with torch.no_grad():
-                    with autocast():
-                        # Compute MSE for selected contexts
-                        selected_outputs, _ = model(
-                        input_ids=selected_input_ids,
-                        targets=labels.float(),
-                        use_entropy_reg=args.use_entropy_reg,
-                        lambda_entropy=args.lambda_entropy
-                    )
-                        mse_loss = torch.nn.functional.mse_loss(selected_outputs, labels.float(), reduction='none')  # (batch_size,)
-
-                # Scale the MSE loss
-                scaled_mse = scale_energy(mse_loss.unsqueeze(1))  # (batch_size, 1)
-
-                # EBM predictions for the selected contexts
-                selected_context_embeddings = context_embeddings[torch.arange(batch_size), sampled_indices]  # (batch_size, embedding_dim)
-                ebm_predictions = ebm(article_embeddings, selected_context_embeddings)  # (batch_size, 1)
-
-                # Compute EBM loss
-                ebm_loss = torch.nn.functional.mse_loss(ebm_predictions.squeeze(1), scaled_mse.squeeze(1))  # (batch_size,)
-
-                # Backward and optimize EBM
-                scaler.scale(ebm_loss).backward()
+            if use_ebm and context_input_ids is not None:
                 scaler.step(ebm_optimizer)
-                scaler.update()
+            scaler.update()
 
-            total_loss += loss.item()
+            total_loss += total_batch_loss.item()
             predictions.extend(outputs.detach().cpu().numpy())
             actuals.extend(labels.cpu().numpy())
 
@@ -196,7 +163,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                     'labels': labels[i].detach().cpu(),
                     'sector': sectors[i]
                 } for i in range(len(labels))]
-                replay_buffer.add_examples(replay_samples, [0]*len(labels))
+                replay_buffer.add_examples(replay_samples, [0] * len(labels))
 
         # Compute metrics
         avg_loss = total_loss / len(dataloader)
@@ -239,7 +206,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device)
 
                 # Forward pass on replayed samples
-                with autocast():
+                with amp.autocast('cuda'):
                     replay_outputs, replay_loss = model(
                         input_ids=replay_input_ids,
                         targets=replay_labels.float(),
