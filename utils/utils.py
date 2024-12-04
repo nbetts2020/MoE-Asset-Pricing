@@ -50,7 +50,7 @@ def get_data(percent_data=100.0):
 
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k")
-    df = dataset['train'].to_pandas().dropna(how='any')
+    df = dataset['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
 
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
