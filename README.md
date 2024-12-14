@@ -101,6 +101,7 @@ The energy $E(A, C)$ directly correlates with the MSE of the model's prediction 
 <p align="center">
   <img src="https://latex.codecogs.com/svg.latex?\text{Scaled%20Energy}%20=%20\frac{\text{MSE}%20-%20\text{MSE}_{\text{min}}}{\text{MSE}_{\text{max}}%20-%20\text{MSE}_{\text{min}}%20+%20\epsilon}">
 </p>
+
 where $\epsilon$ is a small constant to prevent division by zero. This scaling transforms the energy values to a standardized range, facilitating a more balanced and meaningful probability distribution for sampling.
 
 ### Monte Carlo Sampling Based on Energy Values
