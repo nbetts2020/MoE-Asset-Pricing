@@ -105,20 +105,6 @@ where $\epsilon$ is a small constant to prevent division by zero. This scaling t
 
 ### Monte Carlo Sampling Based on Energy Values
 
-Once the energy values for all article-context pairs are computed, they are stored in a dictionary where each entry maps a unique article identifier to a nested dictionary of context tuples and their corresponding scaled energy values. This structure allows for quick and memory-manageable retrieval of energy scores for each possible context, facilitating optimal context selection during Monte Carlo Sampling. Specifically, for each article, the dictionary format is:
-
-```python
-energy_dict = {
-    article_id: {
-        context_tuple: scaled_energy_value,
-        ...
-    },
-    ...
-}
-```
-
-In this format, `article_id` is the unique identifier for each article, while `context_tuple` is a deformatted tuple of article IDs that represents selected articles for broader market, industry, sector, and stock information. This deformatted tuple provides a reference back to the specific articles, allowing the model to reconstruct each context efficiently by fetching the original content.
-
 **Monte Carlo Sampling** is employed to select the most useful contexts for training. The sampling probability $P(C)$ for each context tuple $C$ is defined using the Boltzmann distribution:
 
 $$
@@ -130,7 +116,7 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
 **Sampling Process:**
 
 1. **Energy Evaluation:**  
-   For each article $A$, the EBM evaluates and assigns energy scores to all possible context tuples $C$.
+   For each article $A$ in a batch, the EBM evaluates and assigns energy scores to all possible context tuples $C$.
 
 2. **Probability Computation:**  
    The scaled energy values are transformed into sampling probabilities using the Boltzmann distribution.
