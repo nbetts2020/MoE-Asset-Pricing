@@ -127,7 +127,7 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
    training while maintaining computational efficiency.
 
 4. **Integration with Training Loop:**  
-   The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to allocate computational resources towards processing the most pertinent information, enhancing prediction accuracy.
+   The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to allocate computational resources towards processing the most pertinent information, improving prediction accuracy.
 
 ### EBM Loss
 
