@@ -117,7 +117,7 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
 **Sampling Process:**
 
 1. **Energy Evaluation:**  
-   For each article $A$ in a batch, the EBM evaluates and assigns energy scores to all possible context tuples $C$.
+   For each article $A$ in a batch, the EBM evaluates and assigns energy scores to generated contexts.
 
 2. **Probability Computation:**  
    The scaled energy values are transformed into sampling probabilities using the Boltzmann distribution.
