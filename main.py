@@ -17,7 +17,6 @@ from utils.utils import (
 )
 from utils.config import config
 from torch.utils.data import DataLoader
-from utils.data import ArticlePriceDataset
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
 import torch.distributed as dist
@@ -170,6 +169,33 @@ def main():
         # Prepare data
         train_dataloader, test_dataloader, update_dataloader, df = prepare_data(args, tokenizer)
 
+        # Initialize EBM if using
+        ebm = None
+        ebm_optimizer = None
+        if args.use_ebm:
+            from utils.ebm import EnergyBasedModel
+            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
+
+            from functools import partial
+            from utils.data import custom_collate_fn
+            train_dataset = train_dataloader.dataset
+            # Re-create train_dataloader with custom_collate_fn
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=partial(
+                    custom_collate_fn,
+                    df=train_dataset.df,
+                    ebm=ebm,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    use_ebm=args.use_ebm
+                )
+            )
+
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
 
@@ -194,7 +220,9 @@ def main():
             si=si,
             ewc=ewc_list,
             replay_buffer=replay_buffer,
-            df=df  # Pass the DataFrame for sampling
+            df=df,
+            ebm=ebm,
+            ebm_optimizer=ebm_optimizer
         )
         logging.info("Training completed.")
 
@@ -228,6 +256,33 @@ def main():
 
         # Prepare data
         train_dataloader, test_dataloader, update_dataloader, _ = prepare_data(args, tokenizer)
+
+        # Initialize EBM if using
+        ebm = None
+        ebm_optimizer = None
+        if args.use_ebm:
+            from utils.ebm import EnergyBasedModel
+            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
+
+            from functools import partial
+            from utils.data import custom_collate_fn
+            train_dataset = train_dataloader.dataset
+            # Re-create train_dataloader with custom_collate_fn
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=partial(
+                    custom_collate_fn,
+                    df=train_dataset.df,
+                    ebm=ebm,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    use_ebm=args.use_ebm
+                )
+            )
 
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
@@ -267,7 +322,9 @@ def main():
             si=si,
             ewc=ewc_list,
             replay_buffer=replay_buffer,
-            df=df
+            df=df,
+            ebm=ebm,
+            ebm_optimizer=ebm_optimizer
         )
         logging.info("Updating completed.")
 
@@ -291,8 +348,21 @@ def main():
             df = pd.read_csv(args.csv_path)
             logging.info(f"Loaded dataset with {len(df)} rows for testing.")
 
-            # Prepare dataset and dataloader
-            dataset = ArticlePriceDataset(df, tokenizer, total_epochs=1)
+            from utils.data import ArticlePriceDataset
+            dataset = ArticlePriceDataset(
+                articles=df['Article'].tolist(),
+                prices=df['weighted_avg_720_hrs'].tolist(),
+                sectors=df['Sector'].tolist(),
+                dates=df['Date'].tolist(),
+                related_stocks_list=df['RelatedStocksList'].tolist(),
+                prices_current=df['weighted_avg_0_hrs'].tolist(),
+                symbols=df['Symbol'].tolist(),
+                industries=df['Industry'].tolist(),
+                tokenizer=tokenizer,
+                total_epochs=1,
+                use_ebm=False
+            )
+
             dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
             # Evaluate on the test set
@@ -346,7 +416,9 @@ def main():
         # Initialize replay buffer if required
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
 
-        # Perform catastrophic forgetting test
+        # Note: EBM not necessarily needed for test_forgetting, but if you wanted you could initialize similarly.
+
+        from utils.test import test_forgetting
         test_results = test_forgetting(
             model=model,
             optimizer=optimizer,
@@ -372,4 +444,6 @@ def main():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     main()
