@@ -123,7 +123,8 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
    The scaled energy values are transformed into sampling probabilities using the Boltzmann distribution.
 
 3. **Context Selection:**  
-   Perform Monte Carlo Sampling using the computed probabilities to select the top $k$, where $k$ is defined as the total number of epochs minus the current epoch, contexts for each article. This ensures that the most useful contexts are prioritized during training.
+   Perform Monte Carlo Sampling using the computed probabilities to select the top $k$, where $k$ is defined as max between the total number of epochs minus the current epoch and 5, contexts for each article. This pyramid-down approach ensures that the EBM focuses on capturing the most relevant knowledge during 
+   training while maintaining computational efficiency.
 
 4. **Integration with Training Loop:**  
    The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to allocate computational resources towards processing the most pertinent information, enhancing prediction accuracy.
