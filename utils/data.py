@@ -196,7 +196,7 @@ class ArticlePriceDataset(Dataset):
         """
         self.current_epoch = current_epoch
         if self.use_ebm:
-            num_samples = self.total_epochs - current_epoch
+            num_samples = max(self.total_epochs - current_epoch, 5)
             if num_samples < 1:
                 num_samples = 1
             # Convert batch_indices to integers and ensure they are within bounds
