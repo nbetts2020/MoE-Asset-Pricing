@@ -13,28 +13,16 @@ from utils.config import config
 from utils.utils import (
     compute_l2_loss,
     evaluate_model,
-    load_checkpoint,
-    save_model_and_states
+    load_checkpoint
 )
-from utils.ebm import EnergyBasedModel
-from utils.data import ArticlePriceDataset
+
+logging.basicConfig(level=logging.INFO)
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None,
-                replay_buffer=None, df=None):
+                replay_buffer=None, df=None, ebm=None, ebm_optimizer=None):
     """
     Train the transformer model with optional EBM integration.
-
-    Args:
-        model (nn.Module): The transformer model.
-        optimizer (torch.optim.Optimizer): Optimizer for the transformer model.
-        epochs (int): Number of training epochs.
-        device (torch.device): Device to perform computations on.
-        dataloader (DataLoader): DataLoader for the training set.
-        args (Namespace): Parsed command-line arguments.
-        si (optional): Synaptic Intelligence (SI) regularizer.
-        ewc (optional): Elastic Weight Consolidation (EWC) regularizer.
-        replay_buffer (optional): Replay buffer for experience replay.
-        df (optional): DataFrame containing the dataset.
+    EBM and EBM optimizer are now passed as arguments from main.py.
     """
     model.train()
     scaler = GradScaler()
@@ -49,15 +37,9 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     use_ddp = getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1
     rank = dist.get_rank() if use_ddp else 0
 
-    dataset = dataloader.dataset
-
-    # Initialize EBM if specified
     use_ebm = getattr(args, 'use_ebm', False)
-    if use_ebm:
-        ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
-        ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
 
-    # Directory to save checkpoints
+    # Create checkpoint directory if needed
     checkpoint_dir = args.checkpoint_dir if hasattr(args, 'checkpoint_dir') else './checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -74,53 +56,39 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         predictions = []
         actuals = []
 
+        # If using DDP with DistributedSampler, set epoch
         if hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
         for batch in tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}"):
-
-            batch_indices = batch['idx']
-            dataset.prepare_epoch(current_epoch=epoch, batch_indices=batch_indices)
-
             optimizer.zero_grad()
-            if use_ebm:
+            if use_ebm and ebm_optimizer is not None:
                 ebm_optimizer.zero_grad()
 
-            input_ids = batch['input_ids'].to(device)                 # Shape: (batch_size, seq_len)
-            labels = batch['labels'].to(device)                       # Shape: (batch_size,)
-            sectors = batch['sector']
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
 
-            if use_ebm:
-                context_input_ids = batch.get('context_input_ids', None)
-                if context_input_ids is not None:
-                    context_input_ids = context_input_ids.to(device)  # Shape: (batch_size, seq_len_context)
+            if use_ebm and ebm is not None and 'context_input_ids' in batch:
+                context_input_ids = batch['context_input_ids'].to(device)
+                # Concatenate input_ids and context_input_ids
+                selected_input_ids = torch.cat([input_ids, context_input_ids], dim=1)
+                # If sequence exceeds BLOCK_SIZE, truncate
+                max_seq_len = config.BLOCK_SIZE
+                if selected_input_ids.size(1) > max_seq_len:
+                    selected_input_ids = selected_input_ids[:, :max_seq_len]
 
-                    # Concatenate input_ids and context_input_ids
-                    selected_input_ids = torch.cat([input_ids, context_input_ids], dim=1)  # Shape: (batch_size, total_seq_len)
+                # Get embeddings for EBM
+                with torch.no_grad():
+                    article_embeddings = model.get_embeddings(input_ids)          # (batch, embed_dim)
+                    context_embeddings = model.get_embeddings(context_input_ids)  # (batch, embed_dim)
 
-                    # Truncate to max_seq_len if necessary
-                    max_seq_len = config.BLOCK_SIZE
-                    if selected_input_ids.size(1) > max_seq_len:
-                        selected_input_ids = selected_input_ids[:, :max_seq_len]
-
-                    # Get embeddings
-                    with torch.no_grad():
-                        article_embeddings = model.get_embeddings(input_ids)          # Shape: (batch_size, embedding_dim)
-                        context_embeddings = model.get_embeddings(context_input_ids)  # Shape: (batch_size, embedding_dim)
-
-                    # Compute energies using EBM
-                    energies = ebm(article_embeddings, context_embeddings)  # Shape: (batch_size,)
-
-                    # Compute EBM loss (e.g., minimize energies)
-                    ebm_loss = energies.mean()
-                else:
-                    selected_input_ids = input_ids  # No context provided
-                    ebm_loss = 0.0
+                # Compute energies for EBM
+                energies = ebm(article_embeddings, context_embeddings)
+                ebm_loss = energies.mean()
             else:
-                selected_input_ids = input_ids  # Standard training without EBM
+                selected_input_ids = input_ids
                 ebm_loss = 0.0
 
-            # Forward pass through the model
             with amp.autocast('cuda'):
                 outputs, loss = model(
                     input_ids=selected_input_ids,
@@ -129,7 +97,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                     lambda_entropy=args.lambda_entropy
                 )
 
-            # Regularization
+            # Add regularizations
             if si:
                 loss += si.penalty()
             if ewc:
@@ -139,17 +107,14 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 loss += args.lambda_l2 * compute_l2_loss(model)
 
             # Combine losses
-            if use_ebm and context_input_ids is not None:
-                total_batch_loss = loss + 1 * ebm_loss
+            if use_ebm and ebm is not None and 'context_input_ids' in batch:
+                total_batch_loss = loss + ebm_loss
             else:
                 total_batch_loss = loss
 
-            # Backward and optimization
             scaler.scale(total_batch_loss).backward()
-
-            # Step optimizers
             scaler.step(optimizer)
-            if use_ebm and context_input_ids is not None:
+            if use_ebm and ebm is not None and 'context_input_ids' in batch and ebm_optimizer is not None:
                 scaler.step(ebm_optimizer)
             scaler.update()
 
@@ -162,7 +127,7 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 replay_samples = [{
                     'input_ids': input_ids[i].detach().cpu(),
                     'labels': labels[i].detach().cpu(),
-                    'sector': sectors[i]
+                    'sector': batch['sector'][i]
                 } for i in range(len(labels))]
                 replay_buffer.add_examples(replay_samples, [0] * len(labels))
 
@@ -181,9 +146,10 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }
-            if use_ebm:
+            if use_ebm and ebm is not None:
                 checkpoint['ebm_state_dict'] = ebm.state_dict()
-                checkpoint['ebm_optimizer_state_dict'] = ebm_optimizer.state_dict()
+                if ebm_optimizer is not None:
+                    checkpoint['ebm_optimizer_state_dict'] = ebm_optimizer.state_dict()
             torch.save(checkpoint, checkpoint_path)
             logging.info(f"Saved checkpoint: {checkpoint_path}")
 
@@ -206,7 +172,6 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device)
                 replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device)
 
-                # Forward pass on replayed samples
                 with amp.autocast('cuda'):
                     replay_outputs, replay_loss = model(
                         input_ids=replay_input_ids,
@@ -215,7 +180,6 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                         lambda_entropy=args.lambda_entropy
                     )
 
-                # Backward pass and optimization on replayed samples
                 replay_loss = replay_loss * getattr(args, 'replay_buffer_weight', 1.0)
                 scaler.scale(replay_loss).backward()
                 scaler.step(optimizer)
