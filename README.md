@@ -210,12 +210,6 @@ Elastic Weight Consolidation (EWC) estimates the importance of each parameter by
 4. **Integration with Training Loop**:
     - The EWC regularization term is added to the task-specific loss, guiding the optimizer to make balanced updates that are far more aware of the importance of each parameter.
 
-$L(\theta) = L_B(\theta) + \sum_i \frac{\lambda}{2} F_i (\theta_i - \theta_{A,i}^*)^2$
-
-- $\lambda$: Regularization strength
-- $\theta_{A,i}^*$: Optimal parameter values after Task A
-- $F_i$: Fisher Information for parameter $\theta_i$
-
 This method borrows from a Bayesian learning perspective, where EWC leverages the Fisher Information Matrix to regularize the learning of new tasks while retaining important information from previous tasks. By prioritizing the preservation of critical parameters, EWC ensures that the model maintains its performance on older data while effectively adapting to new information.
 
 ### Memory Replay Buffer[^18][^22][^23]
@@ -241,7 +235,7 @@ Differing from its 'regularization' counterparts, Memory Replay Buffers tackle c
 
 **Error-Based Sampling**
 
-An Error-Based Sampling strategy is implemented to enhance the effectiveness of the Memory Replay Buffer. In this approach, each sector (e.g., Finance, Technology, Utilities) is treated as a distinct task. The model continuously monitors its prediction performance across these sectors by tracking the average prediction error for each. During the sampling process, sectors with higher average errors are assigned a higher probability of their samples being replayed. This ensures that the model allocates more training resources to sectors where it is underperforming, thereby improving its predictive accuracy in those areas. By focusing on sectors with greater prediction challenges, the model becomes more robust and adaptable to handle diverse market conditions.
+An Error-Based Sampling strategy is implemented to enhance the effectiveness of the Memory Replay Buffer. In this approach, each sector (e.g., Finance, Technology, Utilities) is treated as a distinct task. The model continuously monitors its prediction performance across these sectors by tracking the average prediction error for each. During the sampling process, sectors with higher average errors are assigned a higher probability of their samples being replayed. This ensures that the model allocates more training resources to sectors that are underperforming, thereby improving its predictive accuracy in those areas. By focusing on sectors with greater prediction challenges, the model becomes more robust and adaptable to handle diverse market conditions.
 
 **Fixed Limit on New Data per Batch**
 
