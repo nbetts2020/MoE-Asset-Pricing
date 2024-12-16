@@ -214,7 +214,8 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             ebm=ebm,
-            ebm_optimizer=ebm_optimizer
+            ebm_optimizer=ebm_optimizer,
+            tokenizer=tokenizer
         )
         logging.info("Training completed.")
 
@@ -307,7 +308,8 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             ebm=ebm,
-            ebm_optimizer=ebm_optimizer
+            ebm_optimizer=ebm_optimizer,
+            tokenizer=tokenizer
         )
         logging.info("Updating completed.")
 
