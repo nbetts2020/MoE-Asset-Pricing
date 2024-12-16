@@ -14,13 +14,88 @@ from utils.config import config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def format_concatenated_articles(sample_df):
-    # Your previously defined function that formats the sampled articles into a single string.
-    # Ensure this function returns a single string of concatenated articles from sample_df.
+def format_concatenated_articles(sample: pd.DataFrame) -> str:
+    """
+    Formats the concatenated articles from a sample DataFrame.
+
+    Args:
+        sample (pd.DataFrame): Sampled DataFrame for a single data point.
+
+    Returns:
+        str: Concatenated and formatted article string.
+    """
     formatted_articles = []
-    # ... (implementation not shown, use your existing code)
-    # This must return a string
-    return "\n".join(formatted_articles)
+    idx = sample.iloc[-1].name  # Current index
+
+    # Broader Economic Information (Markets Articles)
+    formatted_articles.append("Broader Economic Information:")
+    for _, row in sample.iterrows():
+        if 'Markets' in row.get('RelatedStocksList', ''):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+            )
+
+    # Broader Industry Information
+    formatted_articles.append("\nBroader Industry Information:")
+    for _, row in sample.iterrows():
+        if row.get('Industry', 'Unknown Industry') == sample.iloc[-1].get('Industry', 'Unknown Industry'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+            )
+
+    # Broader Sector Information
+    formatted_articles.append("\nBroader Sector Information:")
+    for _, row in sample.iterrows():
+        if row.get('Sector', 'Unknown Sector') == sample.iloc[-1].get('Sector', 'Unknown Sector'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+            )
+
+    # Information Indicating Significant Market Movement Related to Current Stock
+    formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
+    for _, row in sample.iterrows():
+        if (row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol')) and ('Percentage Change' in row):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+                f"Percentage Change: {row.get('Percentage Change', 0.0):.2f}%\n"
+            )
+
+    # Last 8 Articles for Current Stock
+    formatted_articles.append("\nLast 8 Articles for Current Stock:")
+    for _, row in sample.iterrows():
+        if row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            article_details = (
+                f"Symbol: {row.get('Symbol', 'N/A')}\n"
+                f"Security: {row.get('Security', 'N/A')}\n"
+                f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Type: {row.get('articleType', 'N/A')}\n"
+                f"Publication: {row.get('Publication', 'N/A')}\n"
+                f"Publication Author: {row.get('Author', 'N/A')}\n"
+                f"Date: {date_str}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+                f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
+                f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
+                f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
+                f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
+            )
+            formatted_articles.append(article_details)
+
+    concatenated_articles = "\n".join(formatted_articles)
+    return concatenated_articles
 
 def parallel_context_generation_worker(args):
     """
