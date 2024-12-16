@@ -17,6 +17,7 @@ from utils.utils import (
 )
 from utils.config import config
 from torch.utils.data import DataLoader
+from utils.data import ArticlePriceDataset, custom_collate_fn
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
 import torch.distributed as dist
@@ -185,16 +186,7 @@ def main():
                 train_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
-                collate_fn=partial(
-                    custom_collate_fn,
-                    df=train_dataset.df,
-                    ebm=ebm,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    use_ebm=args.use_ebm
-                )
-            )
+                collate_fn=custom_collate_fn)
 
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
@@ -222,8 +214,7 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             ebm=ebm,
-            ebm_optimizer=ebm_optimizer,
-            tokenizer=tokenizer
+            ebm_optimizer=ebm_optimizer
         )
         logging.info("Training completed.")
 
@@ -274,16 +265,7 @@ def main():
                 train_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
-                collate_fn=partial(
-                    custom_collate_fn,
-                    df=train_dataset.df,
-                    ebm=ebm,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    use_ebm=args.use_ebm
-                )
-            )
+                collate_fn=custom_collate_fn)
 
         # Initialize SI - if --use_si is True
         si = initialize_si(model, args) if args.use_si else None
@@ -325,8 +307,7 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             ebm=ebm,
-            ebm_optimizer=ebm_optimizer,
-            tokenizer=tokenizer
+            ebm_optimizer=ebm_optimizer
         )
         logging.info("Updating completed.")
 
