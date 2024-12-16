@@ -16,6 +16,9 @@ from utils.utils import (
     load_checkpoint
 )
 
+from utils.data import custom_collate_fn
+from functools import partial
+
 logging.basicConfig(level=logging.INFO)
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None,
@@ -52,6 +55,19 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
     for epoch in range(start_epoch, epochs):
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
+
+        dataloader.collate_fn = partial(
+            custom_collate_fn,
+            df=df,
+            ebm=ebm,
+            model=model,
+            tokenizer=None,  # If you need tokenizer, pass it here
+            device=device,
+            use_ebm=use_ebm,
+            total_epochs=epochs,      # Passing total_epochs
+            current_epoch=epoch       # Passing current_epoch
+        )
+
         total_loss = 0.0
         predictions = []
         actuals = []
