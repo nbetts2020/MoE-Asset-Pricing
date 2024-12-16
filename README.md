@@ -126,7 +126,7 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
    Perform Monte Carlo Sampling using the computed probabilities to select a singular article to pass to the Mixture of Experts for training. Monte Carlo Sampling is performed here as opposed to something like a **greedy selection** (select context with lowest MSE) to promote diversity in context selection, thus mitigating overfitting to a specific subset of contexts.
 
 4. **Integration with Training Loop:**  
-  The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to minimize the allocation of resources towards processing the most pertinent information while improving prediction accuracy.
+  The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to minimize the allocation of resources towards processing the most pertinent information.
 
 ### EBM Loss
 
