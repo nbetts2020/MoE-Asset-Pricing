@@ -11,6 +11,8 @@ import numpy as np
 from utils.sampling import preprocess_data, sample_articles
 from utils.config import config
 
+from concurrent.futures import ProcessPoolExecutor
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,7 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
     current_symbol = sample.iloc[-1].get('Symbol', 'Unknown Symbol')
     for _, row in sample.iterrows():
+        print(row, "row")
         symbol = row.get('Symbol', 'Unknown Symbol')
         percentage_change = row.get('Percentage Change', 0.0)
         if (symbol == current_symbol) and (not pd.isna(percentage_change)):
@@ -101,7 +104,7 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
                 if pd.isna(date):
                     date = pd.Timestamp('1970-01-01')
             date_str = date.strftime('%Y-%m-%d')
-
+            print(percentage_change, "lll")
             formatted_articles.append(
                 f"Date: {date_str}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
@@ -138,40 +141,31 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
             )
 
     concatenated_articles = "\n".join(formatted_articles)
-    print(concatenated_articles, "wow")
+
     return concatenated_articles
 
 def parallel_context_generation_worker(args):
     """
-    Worker function that generates N contexts for a single sample (idx).
-    It returns the current_article_str and a list of N context strings.
+    Worker function that generates context on CPU only.
+    No GPU operations or model calls here.
     """
-    idx, df, N = args
-    # We'll generate N contexts by calling sample_articles N times
-    contexts = []
-    current_article_str = None
+    idx, df, tokenizer, total_epochs, current_epoch = args
+    # Generate sampled articles
+    sampled = sample_articles(df, [idx])[0]
+    # Format concatenated articles as a CPU-only string
+    context_str = format_concatenated_articles(sampled)
+    # Tokenize on CPU
+    encoding = tokenizer(
+        context_str,
+        truncation=True,
+        padding='max_length',
+        max_length=512,  # Adjust as needed
+        return_tensors='pt'
+    )
 
-    for i in range(N):
-        sampled = sample_articles(df, [idx])[0]  # returns one sampled DataFrame for that idx
-        context_str = format_concatenated_articles(sampled)
-        contexts.append(context_str)
-
-        if current_article_str is None:
-            # Extract current article info from sampled
-            target_row = sampled.iloc[-1]
-            current_article_str = (
-                f"Symbol: {target_row.get('Symbol', 'N/A')}\n"
-                f"Security: {target_row.get('Security', 'N/A')}\n"
-                f"Related Stocks/Topics: {target_row.get('RelatedStocksList', 'N/A')}\n"
-                f"Title: {target_row.get('Title', 'N/A')}\n"
-                f"Type: {target_row.get('articleType', 'N/A')}\n"
-                f"Publication: {target_row.get('Publication', 'N/A')}\n"
-                f"Publication Author: {target_row.get('Author', 'N/A')}\n"
-                f"Date: {target_row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')}\n"
-                f"Article: {target_row.get('Article', 'N/A')}\n"
-            )
-
-    return current_article_str, contexts
+    # Return CPU tensors only (no GPU ops)
+    # Just return input_ids from encoding on CPU
+    return encoding['input_ids'].squeeze(0)  # Still on CPU
 
 class ArticlePriceDataset(Dataset):
     def __init__(self,
@@ -226,48 +220,85 @@ class ArticlePriceDataset(Dataset):
         }
         return sample
 
+def worker_wrapper(args):
+    return parallel_context_generation_worker(*args)
+
 def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_epochs, current_epoch):
     """
-    Custom collate function:
-    - If use_ebm: generate N contexts per sample (CPU-only) and return them as raw strings
-      along with the current_article_str.
-    - Do NOT run EBM or select the best context here. Just return all contexts.
-
-    We'll handle EBM scoring and context selection in train_model.
+    Custom collate function.
+    CPU only in parallel processes.
+    GPU ops (model.get_embeddings(), ebm) in the main process.
     """
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    labels = torch.stack([item['labels'] for item in batch])
-    sectors = [item['sector'] for item in batch]
-    idxs = [item['idx'] for item in batch]
+    input_ids = []
+    labels = []
+    # If use_ebm, we need to generate contexts using parallel workers
+    # but no GPU ops inside workers
+    context_input_ids = [] if use_ebm else None
 
-    N = max(total_epochs - current_epoch, 5)
+    # Collect indices for parallel processing if use_ebm
+    args_list = []
+    if use_ebm:
+        for sample in batch:
+            idx = sample['idx']
+            # Note: Passing only CPU related args, no GPU ops
+            args_list.append((idx, df, tokenizer, total_epochs, current_epoch))
+
+    # Run parallel context generation (CPU only)
+    if use_ebm:
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(parallel_context_generation_worker, args_list))
+        # results is a list of CPU tensors (context input_ids), one per sample
+    else:
+        results = None
+
+    # Now construct the main batch
+    for i, sample in enumerate(batch):
+        # input_ids and labels are presumably CPU tensors or arrays
+        inp = sample['input_ids']
+        lbl = sample['labels']
+        # Ensure they are tensors
+        if not isinstance(inp, torch.Tensor):
+            inp = torch.tensor(inp, dtype=torch.long)
+        if not isinstance(lbl, torch.Tensor):
+            lbl = torch.tensor(lbl, dtype=torch.float)
+
+        input_ids.append(inp)
+        labels.append(lbl)
+
+        if use_ebm:
+            # Append the CPU result for context_input_ids
+            context_input_ids.append(results[i])
+
+    # Pad sequences on CPU
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    labels_tensor = torch.stack(labels)
 
     if use_ebm:
-        # Generate contexts in parallel
-        args_list = [(idx, df, N) for idx in idxs]
-        num_workers = os.cpu_count() or 1
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            results = list(executor.map(parallel_context_generation_worker, args_list))
+        context_input_ids_padded = torch.nn.utils.rnn.pad_sequence(context_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
 
-        # results: list of (current_article_str, [context1, context2, ..., contextN]) per sample
-        # Just return them as is. We'll handle EBM scoring and selection in train_model.
+        # NOW move data to GPU and do GPU operations
+        input_ids_padded = input_ids_padded.to(device)
+        labels_tensor = labels_tensor.to(device)
+        context_input_ids_padded = context_input_ids_padded.to(device)
+
+        # Now run model.get_embeddings() here
+        with torch.no_grad():
+            article_embeddings = model.get_embeddings(input_ids_padded)        # GPU op
+            context_embeddings = model.get_embeddings(context_input_ids_padded) # GPU op
+
+        # Compute energies with EBM here if needed, store them in batch if you want.
+        # Or just return and handle EBM in train loop. Typically done in the train loop.
         return {
-            'input_ids': input_ids,
-            'labels': labels,
-            'sector': sectors,
-            'idx': idxs,
-            'current_articles': [r[0] for r in results],   # list of current_article_str
-            'all_contexts': [r[1] for r in results],       # list of lists of context strings
-            'N': N
+            'input_ids': input_ids_padded,
+            'labels': labels_tensor,
+            'context_input_ids': context_input_ids_padded,
+            'article_embeddings': article_embeddings,  # If needed
+            'context_embeddings': context_embeddings   # If needed
         }
     else:
-        # No EBM, just return normal batch
+        # If no EBM, just return CPU (or move to GPU in train loop)
+        # Usually you'd want to move them to GPU in train loop anyway
         return {
-            'input_ids': input_ids,
-            'labels': labels,
-            'sector': sectors,
-            'idx': idxs,
-            'all_contexts': None,
-            'current_articles': None,
-            'N': 0
+            'input_ids': input_ids_padded,
+            'labels': labels_tensor
         }
