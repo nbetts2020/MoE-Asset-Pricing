@@ -263,9 +263,7 @@ Assessing catastrophic forgetting involves systematically evaluating the model's
 
 2. **Parameter Definitions**: In our case, let's say $k=3$ and our sectors are "Technology", "Finance", and "Utilities". The data from each sector is treated as a distinct task.
 
-3. **Training and Evaluation Process**:
-
-    For each Catastrophic Forgetting mitigation method (or combination of a them):
+3. **Training and Evaluation Process**: For each Catastrophic Forgetting mitigation method (or combination of a them):
 
     - The model is first trained on the Task 1 dataset (e.g., Technology sector).
     - After completing the training on Task 1, the model’s performance is evaluated on the Task 1 test set to establish a baseline.
