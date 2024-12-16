@@ -1,291 +1,229 @@
-# utils/train.py
+# utils/data.py
 
 import torch
-from sklearn.metrics import mean_squared_error, r2_score
-from torch import amp
-from torch.cuda.amp import GradScaler
-import os
-from tqdm import tqdm
+from torch.utils.data import Dataset
+import pandas as pd
 import logging
-import torch.distributed as dist
-from functools import partial
+import os
+import concurrent.futures
 import numpy as np
 
+from utils.sampling import preprocess_data, sample_articles
 from utils.config import config
-from utils.utils import (
-    compute_l2_loss,
-    evaluate_model,
-    load_checkpoint
-)
-from utils.data import custom_collate_fn
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def train_model(model,
-                optimizer,
-                epochs,
-                device,
-                dataloader,
-                args,
-                si=None,
-                ewc=None,
-                replay_buffer=None,
-                df=None,
-                ebm=None,
-                ebm_optimizer=None,
-                tokenizer=None):
-    model.train()
-    scaler = GradScaler()
-    logging.info("Starting training loop.")
+def format_concatenated_articles(sample: pd.DataFrame) -> str:
+    """
+    Formats the concatenated articles from a sample DataFrame.
 
-    patience = args.early_stopping_patience
-    best_loss = float('inf')
-    epochs_no_improve = 0
+    Args:
+        sample (pd.DataFrame): Sampled DataFrame for a single data point.
 
-    use_ddp = getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1
-    rank = dist.get_rank() if use_ddp else 0
-    use_ebm = getattr(args, 'use_ebm', False)
+    Returns:
+        str: Concatenated and formatted article string.
+    """
+    formatted_articles = []
+    idx = sample.iloc[-1].name  # Current index
 
-    # If using EBM, consider gradient clipping
-    # We'll apply clipping before each optimizer step if ebm is used.
-    def clip_ebm_gradients():
-        if use_ebm and ebm is not None:
-            torch.nn.utils.clip_grad_norm_(ebm.parameters(), max_norm=1.0)
+    # Broader Economic Information (Markets Articles)
+    formatted_articles.append("Broader Economic Information:")
+    for _, row in sample.iterrows():
+        if 'Markets' in row.get('RelatedStocksList', ''):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+            )
 
-    checkpoint_dir = args.checkpoint_dir if hasattr(args, 'checkpoint_dir') else './checkpoints'
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Broader Industry Information
+    formatted_articles.append("\nBroader Industry Information:")
+    for _, row in sample.iterrows():
+        if row.get('Industry', 'Unknown Industry') == sample.iloc[-1].get('Industry', 'Unknown Industry'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+            )
 
-    start_epoch = 0
-    if hasattr(args, 'checkpoint_path') and args.checkpoint_path:
-        start_epoch = load_checkpoint(model, optimizer,
-                                      ebm if use_ebm else None,
-                                      ebm_optimizer if use_ebm else None,
-                                      checkpoint_path=args.checkpoint_path)
+    # Broader Sector Information
+    formatted_articles.append("\nBroader Sector Information:")
+    for _, row in sample.iterrows():
+        if row.get('Sector', 'Unknown Sector') == sample.iloc[-1].get('Sector', 'Unknown Sector'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+            )
 
-    # Set temperature if args has temperature
-    ebm_temperature = getattr(args, 'temperature', 1.0)
-    if ebm is not None:
-        ebm.temperature = ebm_temperature
+    # Information Indicating Significant Market Movement Related to Current Stock
+    formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
+    for _, row in sample.iterrows():
+        if (row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol')) and ('Percentage Change' in row):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+                f"Percentage Change: {row.get('Percentage Change', 0.0):.2f}%\n"
+            )
 
-    for epoch in range(start_epoch, epochs):
-        logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
+    # Last 8 Articles for Current Stock
+    formatted_articles.append("\nLast 8 Articles for Current Stock:")
+    for _, row in sample.iterrows():
+        if row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol'):
+            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+            article_details = (
+                f"Symbol: {row.get('Symbol', 'N/A')}\n"
+                f"Security: {row.get('Security', 'N/A')}\n"
+                f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Type: {row.get('articleType', 'N/A')}\n"
+                f"Publication: {row.get('Publication', 'N/A')}\n"
+                f"Publication Author: {row.get('Author', 'N/A')}\n"
+                f"Date: {date_str}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+                f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
+                f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
+                f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
+                f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
+            )
+            formatted_articles.append(article_details)
 
-        dataloader.collate_fn = partial(
-            custom_collate_fn,
-            df=dataloader.dataset.df,
-            ebm=ebm,
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            use_ebm=use_ebm,
-            total_epochs=epochs,
-            current_epoch=epoch
+    concatenated_articles = "\n".join(formatted_articles)
+    return concatenated_articles
+
+def parallel_context_generation_worker(args):
+    """
+    Worker function that generates N contexts for a single sample (idx).
+    It returns the current_article_str and a list of N context strings.
+    """
+    idx, df, N = args
+    # We'll generate N contexts by calling sample_articles N times
+    contexts = []
+    current_article_str = None
+
+    for i in range(N):
+        sampled = sample_articles(df, [idx])[0]  # returns one sampled DataFrame for that idx
+        context_str = format_concatenated_articles(sampled)
+        contexts.append(context_str)
+
+        if current_article_str is None:
+            # Extract current article info from sampled
+            target_row = sampled.iloc[-1]
+            current_article_str = (
+                f"Symbol: {target_row.get('Symbol', 'N/A')}\n"
+                f"Security: {target_row.get('Security', 'N/A')}\n"
+                f"Related Stocks/Topics: {target_row.get('RelatedStocksList', 'N/A')}\n"
+                f"Title: {target_row.get('Title', 'N/A')}\n"
+                f"Type: {target_row.get('articleType', 'N/A')}\n"
+                f"Publication: {target_row.get('Publication', 'N/A')}\n"
+                f"Publication Author: {target_row.get('Author', 'N/A')}\n"
+                f"Date: {target_row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')}\n"
+                f"Article: {target_row.get('Article', 'N/A')}\n"
+            )
+
+    return current_article_str, contexts
+
+class ArticlePriceDataset(Dataset):
+    def __init__(self,
+                 articles: list,
+                 prices: list,
+                 sectors: list,
+                 dates: list,
+                 related_stocks_list: list,
+                 prices_current: list,
+                 symbols: list,
+                 industries: list,
+                 tokenizer,
+                 total_epochs: int,
+                 use_ebm: bool=False):
+        self.df = pd.DataFrame({
+            'Article': articles,
+            'weighted_avg_720_hrs': prices,
+            'Sector': sectors,
+            'Date': dates,
+            'RelatedStocksList': related_stocks_list,
+            'weighted_avg_0_hrs': prices_current,
+            'Symbol': symbols,
+            'Industry': industries
+        })
+        self.df = preprocess_data(self.df)
+        self.tokenizer = tokenizer
+        self.total_epochs = total_epochs
+        self.use_ebm = use_ebm
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        article = row.get('Article', 'N/A')
+        price = row.get('weighted_avg_720_hrs', 0.0)
+        sector = row.get('Sector', 'Unknown Sector')
+        input_encoding = self.tokenizer(
+            article,
+            truncation=True,
+            padding='max_length',
+            max_length=config.BLOCK_SIZE,
+            return_tensors='pt'
         )
+        input_ids = input_encoding['input_ids'].squeeze(0)
 
-        total_loss = 0.0
-        predictions = []
-        actuals = []
+        sample = {
+            'input_ids': input_ids,
+            'labels': torch.tensor(price, dtype=torch.float),
+            'sector': sector,
+            'idx': int(idx)
+        }
+        return sample
 
-        if hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
-            dataloader.sampler.set_epoch(epoch)
+def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_epochs, current_epoch):
+    """
+    Custom collate function:
+    - If use_ebm: generate N contexts per sample (CPU-only) and return them as raw strings
+      along with the current_article_str.
+    - Do NOT run EBM or select the best context here. Just return all contexts.
+    
+    We'll handle EBM scoring and context selection in train_model.
+    """
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+    sectors = [item['sector'] for item in batch]
+    idxs = [item['idx'] for item in batch]
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}")):
-            optimizer.zero_grad()
-            if use_ebm and ebm_optimizer:
-                ebm_optimizer.zero_grad()
+    N = max(total_epochs - current_epoch, 5)
 
-            input_ids = batch['input_ids'].to(device, dtype=torch.long)
-            labels = batch['labels'].to(device)
-            selected_input_ids = input_ids
-            ebm_loss = 0.0
+    if use_ebm:
+        # Generate contexts in parallel
+        args_list = [(idx, df, N) for idx in idxs]
+        num_workers = os.cpu_count() or 1
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            results = list(executor.map(parallel_context_generation_worker, args_list))
 
-            if use_ebm and ebm is not None and batch['all_contexts'] is not None:
-                current_articles = batch['current_articles']
-                all_contexts = batch['all_contexts']
-                N = batch['N']
-
-                best_contexts_input_ids = []
-                for i in range(len(all_contexts)):
-                    contexts = all_contexts[i]
-                    current_article_str = current_articles[i]
-
-                    article_enc = tokenizer(
-                        current_article_str,
-                        truncation=True,
-                        padding='max_length',
-                        max_length=config.BLOCK_SIZE,
-                        return_tensors='pt'
-                    ).to(device)
-
-                    with torch.no_grad():
-                        article_embedding = model.get_embeddings(article_enc['input_ids'].long())
-                        article_embedding = article_embedding.squeeze(0)
-
-                    encodings = tokenizer(
-                        contexts,
-                        truncation=True,
-                        padding=True,
-                        max_length=config.BLOCK_SIZE,
-                        return_tensors='pt'
-                    ).to(device)
-
-                    context_input_ids = encodings['input_ids'].to(dtype=torch.long, device=device)
-
-                    with torch.no_grad():
-                        context_embeddings = model.get_embeddings(context_input_ids)
-                        if torch.isnan(context_embeddings).any() or torch.isinf(context_embeddings).any():
-                            logging.error("NaN or Inf in context_embeddings. Stopping training.")
-                            break
-
-                    energies = ebm(article_embedding.unsqueeze(0).repeat(len(contexts), 1), context_embeddings)
-
-                    # Check energies for NaN/Inf
-                    if torch.isnan(energies).any() or torch.isinf(energies).any():
-                        logging.error("NaN or Inf in energies before softmax. Stopping training.")
-                        break
-
-                    ebm_loss += energies.mean() / len(all_contexts)
-
-                    # Clamp energies to avoid overflow
-                    energies = torch.clamp(energies, -1e6, 1e6)
-                    energies_neg = -energies
-                    probabilities = torch.softmax(energies_neg, dim=0)
-
-                    # Check probabilities
-                    if torch.isnan(probabilities).any() or torch.isinf(probabilities).any() or (probabilities < 0).any():
-                        logging.error("NaN, Inf, or negative values in probabilities. Stopping training.")
-                        break
-
-                    sampled_idx = torch.multinomial(probabilities, num_samples=1).item()
-                    sampled_context = contexts[sampled_idx]
-
-                    sampled_context_encoding = tokenizer(
-                        sampled_context,
-                        truncation=True,
-                        padding='max_length',
-                        max_length=config.BLOCK_SIZE,
-                        return_tensors='pt'
-                    )
-                    sampled_context_input_ids_single = sampled_context_encoding['input_ids'].squeeze(0).to(dtype=torch.long)
-                    best_contexts_input_ids.append(sampled_context_input_ids_single)
-
-                best_contexts_input_ids = torch.stack(best_contexts_input_ids).to(device, dtype=torch.long)
-
-                combined_input_ids = []
-                for i in range(input_ids.size(0)):
-                    art_tokens = input_ids[i].long()
-                    ctx_tokens = best_contexts_input_ids[i].long()
-                    combined = torch.cat([art_tokens, ctx_tokens], dim=0)
-                    if combined.size(0) > config.BLOCK_SIZE:
-                        combined = combined[:config.BLOCK_SIZE]
-                    combined_input_ids.append(combined.unsqueeze(0))
-
-                selected_input_ids = torch.cat(combined_input_ids, dim=0).to(device, dtype=torch.long)
-
-                pad_token_id = tokenizer.pad_token_id
-                num_tokens_per_sample = (selected_input_ids != pad_token_id).sum(dim=1)
-                logging.info(f"Epoch {epoch + 1}, Batch {batch_idx + 1}: Tokens per sample: {num_tokens_per_sample.tolist()}")
-
-                if torch.isnan(selected_input_ids).any() or torch.isinf(selected_input_ids).any():
-                    logging.error(f"NaN/Inf in selected_input_ids at Epoch {epoch+1}, Batch {batch_idx+1}. Stopping training.")
-                    break
-
-            with amp.autocast('cuda'):
-                outputs, loss = model(
-                    input_ids=selected_input_ids,
-                    targets=labels.float(),
-                    use_entropy_reg=args.use_entropy_reg,
-                    lambda_entropy=args.lambda_entropy
-                )
-
-            if si:
-                loss += si.penalty()
-            if ewc:
-                for ewc_instance in ewc:
-                    loss += args.lambda_ewc * ewc_instance.penalty(model)
-            if getattr(args, 'use_l2', False):
-                loss += args.lambda_l2 * compute_l2_loss(model)
-
-            total_batch_loss = loss
-            if use_ebm and ebm is not None and batch['all_contexts'] is not None:
-                total_batch_loss += ebm_loss
-
-            if torch.isnan(total_batch_loss) or torch.isinf(total_batch_loss):
-                logging.error(f"NaN/Inf in total_batch_loss at Epoch {epoch+1}, Batch {batch_idx+1}. Stopping training.")
-                break
-
-            scaler.scale(total_batch_loss).backward()
-
-            # Clip EBM gradients if EBM is used
-            if use_ebm and ebm is not None:
-                torch.nn.utils.clip_grad_norm_(ebm.parameters(), max_norm=1.0)
-
-            scaler.step(optimizer)
-            if use_ebm and ebm is not None and ebm_optimizer is not None and batch['all_contexts'] is not None:
-                scaler.step(ebm_optimizer)
-            scaler.update()
-
-            total_loss += total_batch_loss.item()
-            predictions.extend(outputs.detach().cpu().numpy())
-            actuals.extend(labels.cpu().numpy())
-
-            if replay_buffer:
-                replay_samples = [{
-                    'input_ids': input_ids[i].detach().cpu(),
-                    'labels': labels[i].detach().cpu(),
-                    'sector': batch['sector'][i]
-                } for i in range(len(labels))]
-                replay_buffer.add_examples(replay_samples, [0] * len(labels))
-
-        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
-        if len(predictions) > 0:
-            mse = mean_squared_error(actuals, predictions)
-            r2 = r2_score(actuals, predictions)
-        else:
-            mse, r2 = 0.0, 0.0
-
-        if rank == 0:
-            logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2: {r2:.4f}")
-
-            checkpoint_path = os.path.join(checkpoint_dir, f'epoch_{epoch + 1}.pt')
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            if use_ebm and ebm is not None:
-                checkpoint['ebm_state_dict'] = ebm.state_dict()
-                if ebm_optimizer is not None:
-                    checkpoint['ebm_optimizer_state_dict'] = ebm_optimizer.state_dict()
-            torch.save(checkpoint, checkpoint_path)
-            logging.info(f"Saved checkpoint: {checkpoint_path}")
-
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    logging.info(f"No improvement in loss for {patience} consecutive epochs. Stopping early.")
-                    break
-
-        if replay_buffer:
-            replay_batch_size = getattr(args, 'replay_batch_size', labels.size(0))
-            replay_samples = replay_buffer.sample(replay_batch_size)
-            if len(replay_samples) > 0:
-                replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device, dtype=torch.long)
-                replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device)
-
-                with amp.autocast('cuda'):
-                    replay_outputs, replay_loss = model(
-                        input_ids=replay_input_ids,
-                        targets=replay_labels.float(),
-                        use_entropy_reg=args.use_entropy_reg,
-                        lambda_entropy=args.lambda_entropy
-                    )
-
-                replay_loss = replay_loss * getattr(args, 'replay_buffer_weight', 1.0)
-                scaler.scale(replay_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+        # results: list of (current_article_str, [context1, context2, ..., contextN]) per sample
+        # Just return them as is. We'll handle EBM scoring and selection in train_model.
+        return {
+            'input_ids': input_ids,
+            'labels': labels,
+            'sector': sectors,
+            'idx': idxs,
+            'current_articles': [r[0] for r in results],   # list of current_article_str
+            'all_contexts': [r[1] for r in results],       # list of lists of context strings
+            'N': N
+        }
+    else:
+        # No EBM, just return normal batch
+        return {
+            'input_ids': input_ids,
+            'labels': labels,
+            'sector': sectors,
+            'idx': idxs,
+            'all_contexts': None,
+            'current_articles': None,
+            'N': 0
+        }
