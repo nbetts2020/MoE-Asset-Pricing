@@ -3,24 +3,41 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import logging
 from utils.config import config
 
 class EnergyBasedModel(nn.Module):
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim, temperature=1.0):
         super(EnergyBasedModel, self).__init__()
         self.fc = nn.Sequential(
             nn.Linear(2 * embedding_dim, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, 1)
         )
+        self.temperature = temperature
+
+        # Initialize weights to small values for stability
+        for m in self.fc:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, article_embedding, context_embedding):
         # Both embeddings have shape: (batch_size, embedding_dim)
-        x = torch.cat((article_embedding, context_embedding), dim=-1)  # Shape: (batch_size, 2 * embedding_dim)
-        energy = self.fc(x).squeeze(-1)  # Shape: (batch_size,)
-        return energy  # Shape: (batch_size,)
+        x = torch.cat((article_embedding, context_embedding), dim=-1)  # (batch_size, 2 * embedding_dim)
+        energy = self.fc(x).squeeze(-1)  # (batch_size,)
+
+        # Divide by temperature to control scale
+        energy = energy / self.temperature
+
+        # Debug checks
+        if torch.isnan(energy).any():
+            logging.error("EBM forward produced NaN energies.")
+        if torch.isinf(energy).any():
+            logging.error("EBM forward produced Inf energies.")
+
+        return energy  # (batch_size,)
 
 def scale_energy(energy_values, epsilon=1e-8):
     # energy_values: (batch_size, num_contexts)
@@ -62,19 +79,13 @@ def select_best_context(contexts, labels, model, device, args):
         else:
             outputs, _ = model(input_ids=contexts, targets=labels.float(), use_entropy_reg=args.use_entropy_reg, lambda_entropy=args.lambda_entropy)
 
-    # Compute MSE for each context
     mse_loss = torch.nn.MSELoss(reduction='none')
-    losses = mse_loss(outputs, labels.float())  # Shape: (batch_size * num_samples, ...)
+    losses = mse_loss(outputs, labels.float())  # (batch_size * num_samples, ...)
+    losses = losses.mean(dim=1)  # (batch_size * num_samples,)
 
-    losses = losses.mean(dim=1)  # Shape: (batch_size * num_samples,)
-
-    # Reshape losses to (batch_size, num_samples)
     losses = losses.view(batch_size, num_samples)
+    _, min_indices = torch.min(losses, dim=1)  # (batch_size,)
 
-    # Find the index of the minimum loss for each sample
-    _, min_indices = torch.min(losses, dim=1)  # Shape: (batch_size,)
-
-    # Select the best contexts and corresponding labels
     selected_contexts = []
     selected_labels = []
     for i in range(batch_size):
@@ -82,7 +93,7 @@ def select_best_context(contexts, labels, model, device, args):
         selected_contexts.append(contexts[i * num_samples + idx].unsqueeze(0))
         selected_labels.append(labels[i * num_samples + idx].unsqueeze(0))
 
-    selected_contexts = torch.cat(selected_contexts, dim=0)  # Shape: (batch_size, seq_length)
-    selected_labels = torch.cat(selected_labels, dim=0)      # Shape: (batch_size, ...)
+    selected_contexts = torch.cat(selected_contexts, dim=0)  # (batch_size, seq_length)
+    selected_labels = torch.cat(selected_labels, dim=0)      # (batch_size, ...)
 
     return selected_contexts, selected_labels
