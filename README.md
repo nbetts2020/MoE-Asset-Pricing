@@ -117,17 +117,16 @@ where $T$ is the temperature parameter that controls the randomness of the sampl
 **Sampling Process:**
 
 1. **Energy Evaluation:**  
-   For each article $A$ in a batch, the EBM evaluates and assigns energy scores to generated contexts.
+  For each article $A$ in a batch, the EBM evaluates and assigns energy scores to $k$ generated contexts, where $k$ is defined as the max between the total number of epochs minus the current epoch and 5. This pyramid-down approach ensures that the EBM focuses on capturing the most relevant knowledge during training while maintaining computational efficiency.
 
 2. **Probability Computation:**  
    The scaled energy values are transformed into sampling probabilities using the Boltzmann distribution.
-
+   
 3. **Context Selection:**  
-   Perform Monte Carlo Sampling using the computed probabilities to select the top $k$, where $k$ is defined as max between the total number of epochs minus the current epoch and 5, contexts for each article. This pyramid-down approach ensures that the EBM focuses on capturing the most relevant knowledge during 
-   training while maintaining computational efficiency.
+   Perform Monte Carlo Sampling using the computed probabilities to select a singular article to pass to the Mixture of Experts for training. Monte Carlo Sampling is performed here as opposed to something like a **greedy selection** (select context with lowest MSE) to promote diversity in context selection, thus mitigating overfitting to a specific subset of contexts.
 
 4. **Integration with Training Loop:**  
-   The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to allocate computational resources towards processing the most pertinent information, improving prediction accuracy.
+  The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to minimize the allocation of resources towards processing the most pertinent information while improving prediction accuracy.
 
 ### EBM Loss
 
