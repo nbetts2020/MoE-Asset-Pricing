@@ -30,8 +30,20 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
     # Broader Economic Information (Markets Articles)
     formatted_articles.append("Broader Economic Information:")
     for _, row in sample.iterrows():
-        if 'Markets' in row.get('RelatedStocksList', ''):
-            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+        related_stocks = row.get("RelatedStocksList", "")
+        if related_stocks is None:
+            related_stocks = ""
+        logging.debug(f"RelatedStocksList: {related_stocks}")  # Debugging
+
+        if 'Markets' in related_stocks:
+            # Ensure 'Date' is a datetime object
+            date = row.get('Date', pd.Timestamp('1970-01-01'))
+            if not isinstance(date, pd.Timestamp):
+                date = pd.to_datetime(date, errors='coerce')
+                if pd.isna(date):
+                    date = pd.Timestamp('1970-01-01')
+            date_str = date.strftime('%Y-%m-%d')
+
             formatted_articles.append(
                 f"Date: {date_str}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
@@ -40,9 +52,17 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
 
     # Broader Industry Information
     formatted_articles.append("\nBroader Industry Information:")
+    current_industry = sample.iloc[-1].get('Industry', 'Unknown Industry')
     for _, row in sample.iterrows():
-        if row.get('Industry', 'Unknown Industry') == sample.iloc[-1].get('Industry', 'Unknown Industry'):
-            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+        industry = row.get('Industry', 'Unknown Industry')
+        if industry == current_industry:
+            date = row.get('Date', pd.Timestamp('1970-01-01'))
+            if not isinstance(date, pd.Timestamp):
+                date = pd.to_datetime(date, errors='coerce')
+                if pd.isna(date):
+                    date = pd.Timestamp('1970-01-01')
+            date_str = date.strftime('%Y-%m-%d')
+
             formatted_articles.append(
                 f"Date: {date_str}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
@@ -51,9 +71,17 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
 
     # Broader Sector Information
     formatted_articles.append("\nBroader Sector Information:")
+    current_sector = sample.iloc[-1].get('Sector', 'Unknown Sector')
     for _, row in sample.iterrows():
-        if row.get('Sector', 'Unknown Sector') == sample.iloc[-1].get('Sector', 'Unknown Sector'):
-            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+        sector = row.get('Sector', 'Unknown Sector')
+        if sector == current_sector:
+            date = row.get('Date', pd.Timestamp('1970-01-01'))
+            if not isinstance(date, pd.Timestamp):
+                date = pd.to_datetime(date, errors='coerce')
+                if pd.isna(date):
+                    date = pd.Timestamp('1970-01-01')
+            date_str = date.strftime('%Y-%m-%d')
+
             formatted_articles.append(
                 f"Date: {date_str}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
@@ -62,23 +90,39 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
 
     # Information Indicating Significant Market Movement Related to Current Stock
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
+    current_symbol = sample.iloc[-1].get('Symbol', 'Unknown Symbol')
     for _, row in sample.iterrows():
-        if (row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol')) and ('Percentage Change' in row):
-            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
+        symbol = row.get('Symbol', 'Unknown Symbol')
+        percentage_change = row.get('Percentage Change', 0.0)
+        if (symbol == current_symbol) and (not pd.isna(percentage_change)):
+            date = row.get('Date', pd.Timestamp('1970-01-01'))
+            if not isinstance(date, pd.Timestamp):
+                date = pd.to_datetime(date, errors='coerce')
+                if pd.isna(date):
+                    date = pd.Timestamp('1970-01-01')
+            date_str = date.strftime('%Y-%m-%d')
+
             formatted_articles.append(
                 f"Date: {date_str}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
                 f"Article: {row.get('Article', 'N/A')}\n"
-                f"Percentage Change: {row.get('Percentage Change', 0.0):.2f}%\n"
+                f"Percentage Change: {percentage_change:.2f}%\n"
             )
 
     # Last 8 Articles for Current Stock
     formatted_articles.append("\nLast 8 Articles for Current Stock:")
     for _, row in sample.iterrows():
-        if row.get('Symbol', 'Unknown Symbol') == sample.iloc[-1].get('Symbol', 'Unknown Symbol'):
-            date_str = row.get('Date', pd.Timestamp('1970-01-01')).strftime('%Y-%m-%d')
-            article_details = (
-                f"Symbol: {row.get('Symbol', 'N/A')}\n"
+        symbol = row.get('Symbol', 'Unknown Symbol')
+        if symbol == current_symbol:
+            date = row.get('Date', pd.Timestamp('1970-01-01'))
+            if not isinstance(date, pd.Timestamp):
+                date = pd.to_datetime(date, errors='coerce')
+                if pd.isna(date):
+                    date = pd.Timestamp('1970-01-01')
+            date_str = date.strftime('%Y-%m-%d')
+
+            formatted_articles.append(
+                f"Symbol: {symbol}\n"
                 f"Security: {row.get('Security', 'N/A')}\n"
                 f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
@@ -92,9 +136,9 @@ def format_concatenated_articles(sample: pd.DataFrame) -> str:
                 f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
                 f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
             )
-            formatted_articles.append(article_details)
 
     concatenated_articles = "\n".join(formatted_articles)
+    print(concatenated_articles, "wow")
     return concatenated_articles
 
 def parallel_context_generation_worker(args):
@@ -188,7 +232,7 @@ def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_e
     - If use_ebm: generate N contexts per sample (CPU-only) and return them as raw strings
       along with the current_article_str.
     - Do NOT run EBM or select the best context here. Just return all contexts.
-    
+
     We'll handle EBM scoring and context selection in train_model.
     """
     input_ids = torch.stack([item['input_ids'] for item in batch])
