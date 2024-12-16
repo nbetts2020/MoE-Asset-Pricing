@@ -2,8 +2,7 @@
 
 import torch
 from sklearn.metrics import mean_squared_error, r2_score
-from torch import amp
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler, autocast
 import os
 from tqdm import tqdm
 import logging
@@ -22,7 +21,7 @@ from functools import partial
 logging.basicConfig(level=logging.INFO)
 
 def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None,
-                replay_buffer=None, df=None, ebm=None, ebm_optimizer=None):
+               replay_buffer=None, df=None, ebm=None, ebm_optimizer=None, tokenizer=None):
     """
     Train the transformer model with optional EBM integration.
     EBM and EBM optimizer are now passed as arguments from main.py.
@@ -56,16 +55,17 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
     for epoch in range(start_epoch, epochs):
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
 
+        # Update collate_fn with current_epoch and tokenizer
         dataloader.collate_fn = partial(
             custom_collate_fn,
             df=df,
             ebm=ebm,
             model=model,
-            tokenizer=None,  # If you need tokenizer, pass it here
+            tokenizer=tokenizer,  # Pass actual tokenizer here
             device=device,
             use_ebm=use_ebm,
-            total_epochs=epochs,      # Passing total_epochs
-            current_epoch=epoch       # Passing current_epoch
+            total_epochs=epochs,
+            current_epoch=epoch
         )
 
         total_loss = 0.0
@@ -76,16 +76,16 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         if hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
-        for batch in tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}"):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}")):
             optimizer.zero_grad()
             if use_ebm and ebm_optimizer is not None:
                 ebm_optimizer.zero_grad()
 
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
+            input_ids = batch['input_ids'].to(device, dtype=torch.long)
+            labels = batch['labels'].to(device, dtype=torch.float)
 
             if use_ebm and ebm is not None and 'context_input_ids' in batch:
-                context_input_ids = batch['context_input_ids'].to(device)
+                context_input_ids = batch['context_input_ids'].to(device, dtype=torch.long)
                 # Concatenate input_ids and context_input_ids
                 selected_input_ids = torch.cat([input_ids, context_input_ids], dim=1)
                 # If sequence exceeds BLOCK_SIZE, truncate
@@ -99,16 +99,17 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                     context_embeddings = model.get_embeddings(context_input_ids)  # (batch, embed_dim)
 
                 # Compute energies for EBM
-                energies = ebm(article_embeddings, context_embeddings)
+                energies = ebm(article_embeddings, context_embeddings)  # (batch,)
+                print(energies, "energy!!!")
                 ebm_loss = energies.mean()
             else:
                 selected_input_ids = input_ids
                 ebm_loss = 0.0
 
-            with amp.autocast('cuda'):
+            with autocast():
                 outputs, loss = model(
                     input_ids=selected_input_ids,
-                    targets=labels.float(),
+                    targets=labels,
                     use_entropy_reg=args.use_entropy_reg,
                     lambda_entropy=args.lambda_entropy
                 )
@@ -136,21 +137,24 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
 
             total_loss += total_batch_loss.item()
             predictions.extend(outputs.detach().cpu().numpy())
-            actuals.extend(labels.cpu().numpy())
+            actuals.extend(labels.detach().cpu().numpy())
 
             # Add to replay buffer if necessary
             if replay_buffer:
                 replay_samples = [{
-                    'input_ids': input_ids[i].detach().cpu(),
-                    'labels': labels[i].detach().cpu(),
+                    'input_ids': input_ids[i].clone().detach(),
+                    'labels': labels[i].clone().detach(),
                     'sector': batch['sector'][i]
                 } for i in range(len(labels))]
                 replay_buffer.add_examples(replay_samples, [0] * len(labels))
 
         # Compute metrics
-        avg_loss = total_loss / len(dataloader)
-        mse = mean_squared_error(actuals, predictions)
-        r2 = r2_score(actuals, predictions)
+        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+        if len(predictions) > 0:
+            mse = mean_squared_error(actuals, predictions)
+            r2 = r2_score(actuals, predictions)
+        else:
+            mse, r2 = 0.0, 0.0
 
         if rank == 0:
             logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2: {r2:.4f}")
@@ -166,8 +170,11 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
                 checkpoint['ebm_state_dict'] = ebm.state_dict()
                 if ebm_optimizer is not None:
                     checkpoint['ebm_optimizer_state_dict'] = ebm_optimizer.state_dict()
-            torch.save(checkpoint, checkpoint_path)
-            logging.info(f"Saved checkpoint: {checkpoint_path}")
+            try:
+                torch.save(checkpoint, checkpoint_path)
+                logging.info(f"Saved checkpoint: {checkpoint_path}")
+            except RuntimeError as e:
+                logging.error(f"Error saving checkpoint at Epoch {epoch + 1}: {e}")
 
             # Early Stopping Logic
             if avg_loss < best_loss:
@@ -185,13 +192,13 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
             replay_samples = replay_buffer.sample(replay_batch_size)
             if len(replay_samples) > 0:
                 # Prepare replay batch
-                replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device)
-                replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device)
+                replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device, dtype=torch.long)
+                replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device, dtype=torch.float)
 
-                with amp.autocast('cuda'):
+                with autocast():
                     replay_outputs, replay_loss = model(
                         input_ids=replay_input_ids,
-                        targets=replay_labels.float(),
+                        targets=replay_labels,
                         use_entropy_reg=args.use_entropy_reg,
                         lambda_entropy=args.lambda_entropy
                     )
