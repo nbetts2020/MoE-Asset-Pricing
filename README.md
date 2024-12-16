@@ -235,7 +235,7 @@ Differing from its 'regularization' counterparts, Memory Replay Buffers tackle c
 
 **Error-Based Sampling**
 
-An Error-Based Sampling strategy is implemented to enhance the effectiveness of the Memory Replay Buffer. In this approach, each sector (e.g., Finance, Technology, Utilities) is treated as a distinct task. The model continuously monitors its prediction performance across these sectors by tracking the average prediction error for each. During the sampling process, sectors with higher average errors are assigned a higher probability of their samples being replayed. This ensures that the model allocates more training resources to sectors that are underperforming, thereby improving its predictive accuracy in those areas. By focusing on sectors with greater prediction challenges, the model becomes more robust and adaptable to handle diverse market conditions.
+An Error-Based Sampling strategy is implemented to enhance the effectiveness of the Memory Replay Buffer. In this approach, each sector (e.g., Finance, Technology, Utilities) is treated as a distinct task. The model continuously monitors its prediction performance across these sectors by tracking the average prediction error for each. During the sampling process, sectors with higher average errors are assigned a higher probability of their samples being replayed. This ensures that the model allocates more training resources to sectors that are underperforming, thereby improving its predictive accuracy in those areas. By focusing on sectors with greater prediction challenges, the model becomes more robust and adaptable to handle diverse, new market conditions.
 
 **Fixed Limit on New Data per Batch**
 
