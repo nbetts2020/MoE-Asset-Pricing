@@ -175,7 +175,7 @@ def main():
         if args.use_ebm:
             from utils.ebm import EnergyBasedModel
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
 
             from functools import partial
             from utils.data import custom_collate_fn
@@ -222,7 +222,8 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             ebm=ebm,
-            ebm_optimizer=ebm_optimizer
+            ebm_optimizer=ebm_optimizer,
+            tokenizer=tokenizer
         )
         logging.info("Training completed.")
 
@@ -324,7 +325,8 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             ebm=ebm,
-            ebm_optimizer=ebm_optimizer
+            ebm_optimizer=ebm_optimizer,
+            tokenizer=tokenizer
         )
         logging.info("Updating completed.")
 
