@@ -159,7 +159,7 @@ def parallel_context_generation_worker(args):
         context_str,
         truncation=True,
         padding='max_length',
-        max_length=512,  # Adjust as needed
+        max_length=config.BLOCK_SIZE,
         return_tensors='pt'
     )
 
