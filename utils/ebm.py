@@ -7,7 +7,7 @@ import logging
 from utils.config import config
 
 class EnergyBasedModel(nn.Module):
-    def __init__(self, embedding_dim, temperature=1.0):
+    def __init__(self, embedding_dim, temperature=0.7):
         super(EnergyBasedModel, self).__init__()
         self.fc = nn.Sequential(
             nn.Linear(2 * embedding_dim, embedding_dim),
