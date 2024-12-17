@@ -7,11 +7,15 @@ import random
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - df['weighted_avg_720_hrs']) / df['weighted_avg_720_hrs']) * 100
+
+    # Avoid division by zero if 'weighted_avg_720_hrs' could be zero
+    safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
+    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div) * 100
+
     df.sort_values(by='Date', inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
-
+    
 def sample_articles(df: pd.DataFrame, index_list):
     # Ensure df['Date'] is datetime
     if not pd.api.types.is_datetime64_any_dtype(df['Date']):
