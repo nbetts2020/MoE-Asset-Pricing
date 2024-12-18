@@ -20,6 +20,8 @@ def sample_articles(df: pd.DataFrame, index_list):
     # Ensure df['Date'] is datetime
     if not pd.api.types.is_datetime64_any_dtype(df['Date']):
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
+        df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div) * 100
         df.sort_values(by='Date', inplace=True)
         df.reset_index(drop=True, inplace=True)
 
