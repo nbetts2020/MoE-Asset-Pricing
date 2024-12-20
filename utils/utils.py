@@ -56,6 +56,15 @@ def get_data(percent_data=100.0):
     num_samples = int((percent_data / 100.0) * total_samples)
     df = df.head(num_samples)
 
+    safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
+    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div) * 100
+
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+
+    df.sort_values(by='Date', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
     return df
 
 def get_new_data(new_data_url):
@@ -491,6 +500,20 @@ def initialize_replay_buffer(args):
         else:
             logging.info("No existing Memory Replay Buffer found. Starting fresh.")
     return replay_buffer
+
+def save_ebm_model(ebm, epoch, save_dir="models"):
+    """
+    Saves the EBM model's state dictionary.
+
+    Args:
+        ebm (torch.nn.Module): The Energy-Based Model to save.
+        epoch (int): The current epoch number.
+        save_dir (str): Directory where the model will be saved.
+    """
+    os.makedirs(save_dir, exist_ok=True)  # Ensure the directory exists
+    save_path = os.path.join(save_dir, f"ebm_epoch_{epoch}.pt")
+    torch.save(ebm.state_dict(), save_path)
+    print(f"EBM model saved to {save_path}")
 
 def save_model_and_states(model, si, replay_buffer, ewc_list, args):
     """
