@@ -13,7 +13,8 @@ from utils.utils import (
     initialize_replay_buffer,
     save_model_and_states,
     kaiming_init_weights,
-    prepare_data
+    prepare_data,
+    save_ebm_model
 )
 from utils.config import config
 from torch.utils.data import DataLoader
@@ -219,6 +220,9 @@ def main():
         )
         logging.info("Training completed.")
 
+        if ebm is not None and rank == 0:
+            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
+
         # Save model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
@@ -313,6 +317,9 @@ def main():
         )
         logging.info("Updating completed.")
 
+        if ebm is not None and rank == 0:
+            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
+
         # Save model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
@@ -400,8 +407,6 @@ def main():
 
         # Initialize replay buffer if required
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
-
-        # Note: EBM not necessarily needed for test_forgetting, but if you wanted you could initialize similarly.
 
         from utils.test import test_forgetting
         test_results = test_forgetting(
