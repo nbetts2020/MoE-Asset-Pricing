@@ -4,29 +4,14 @@ import pandas as pd
 import numpy as np
 import random
 
-def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-
-    # Avoid division by zero if 'weighted_avg_720_hrs' could be zero
-    safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
-    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div) * 100
-
-    df.sort_values(by='Date', inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-    
 def sample_articles(df: pd.DataFrame, index_list):
-    # Ensure df['Date'] is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
-        df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div) * 100
-        df.sort_values(by='Date', inplace=True)
-        df.reset_index(drop=True, inplace=True)
 
     samples = []
     for idx in index_list:
+        if idx >= len(df) or idx < 0:
+            logging.error(f"Index {idx} is out of bounds. Skipping.")
+            continue
+
         target_row = df.loc[idx]
         target_date = target_row['Date']
         if pd.isna(target_date):
@@ -55,38 +40,37 @@ def sample_articles(df: pd.DataFrame, index_list):
             return data.sample(n=min(n, len(data)), random_state=random.randint(0, 10000))
 
         markets_articles = safe_sample(
-            date_filtered[date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)],
+            date_filtered[(date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)) & (date_filtered['Symbol'] != target_symbol)],
             5
         )
         industry_articles = safe_sample(
-            date_filtered[date_filtered['Industry'] == target_industry],
+            date_filtered[(date_filtered['Industry'] == target_industry) & (date_filtered['Symbol'] != target_symbol)],
             5
         )
         sector_articles = safe_sample(
-            date_filtered[date_filtered['Sector'] == target_sector],
+            date_filtered[(date_filtered['Sector'] == target_sector) & (date_filtered['Symbol'] != target_symbol)],
             5
         )
         stock_articles = df[
             (df['Symbol'] == target_symbol) & (df['Date'] < target_date - pd.Timedelta(days=30))
         ]
-        if 'Percentage Change' in stock_articles.columns:
-            stock_articles = stock_articles.nlargest(25, 'Percentage Change').head(5)
-        else:
-            stock_articles = stock_articles.head(5)
+        stock_articles = stock_articles.dropna(subset=['Percentage Change'])
+        stock_articles = stock_articles.nlargest(25, 'Percentage Change').head(5)
 
         last_8_articles = df[
             (df['Symbol'] == target_symbol) & (df['Date'] < target_date)
         ].sort_values(by='Date', ascending=False).head(8).sort_values(by='Date', ascending=True)
 
-        combined_samples = pd.concat([
-            markets_articles, industry_articles, sector_articles,
-            stock_articles, last_8_articles
-        ]).drop_duplicates()
+        # Create a dictionary for each category
+        sample_dict = {
+            'markets': markets_articles,
+            'industry': industry_articles,
+            'sector': sector_articles,
+            'stock': stock_articles,
+            'last_8': last_8_articles,
+            'current': pd.DataFrame([target_row])
+        }
 
-        current_article = pd.DataFrame([target_row])
-        combined_samples = pd.concat([combined_samples, current_article], ignore_index=False)
-
-        combined_samples = combined_samples.head(28)
-        samples.append(combined_samples)
+        samples.append(sample_dict)
 
     return samples
