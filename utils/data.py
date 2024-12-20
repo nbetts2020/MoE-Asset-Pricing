@@ -8,7 +8,7 @@ import os
 import concurrent.futures
 import numpy as np
 
-from utils.sampling import preprocess_data, sample_articles
+from utils.sampling import sample_articles
 from utils.config import config
 
 from concurrent.futures import ProcessPoolExecutor
@@ -16,132 +16,115 @@ from concurrent.futures import ProcessPoolExecutor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def format_concatenated_articles(sample: pd.DataFrame) -> str:
+def format_concatenated_articles(sample: dict) -> str:
     """
-    Formats the concatenated articles from a sample DataFrame.
+    Formats the concatenated articles from a sample dictionary.
 
     Args:
-        sample (pd.DataFrame): Sampled DataFrame for a single data point.
+        sample (dict): Sampled DataFrames for each category.
 
     Returns:
         str: Concatenated and formatted article string.
     """
     formatted_articles = []
-    idx = sample.iloc[-1].name  # Current index
 
     # Broader Economic Information (Markets Articles)
     formatted_articles.append("Broader Economic Information:")
-    for _, row in sample.iterrows():
-        related_stocks = row.get("RelatedStocksList", "")
-        if related_stocks is None:
-            related_stocks = ""
-        logging.debug(f"RelatedStocksList: {related_stocks}")  # Debugging
+    markets = sample.get('markets', pd.DataFrame()).head(5)
+    for _, row in markets.iterrows():
+        date = row.get('Date', pd.Timestamp('1970-01-01'))
+        if not isinstance(date, pd.Timestamp):
+            date = pd.to_datetime(date, errors='coerce')
+            if pd.isna(date):
+                date = pd.Timestamp('1970-01-01')
+        date_str = date.strftime('%Y-%m-%d')
 
-        if 'Markets' in related_stocks:
-            # Ensure 'Date' is a datetime object
-            date = row.get('Date', pd.Timestamp('1970-01-01'))
-            if not isinstance(date, pd.Timestamp):
-                date = pd.to_datetime(date, errors='coerce')
-                if pd.isna(date):
-                    date = pd.Timestamp('1970-01-01')
-            date_str = date.strftime('%Y-%m-%d')
-
-            formatted_articles.append(
-                f"Date: {date_str}\n"
-                f"Title: {row.get('Title', 'N/A')}\n"
-                f"Article: {row.get('Article', 'N/A')}\n"
-            )
+        formatted_articles.append(
+            f"Date: {date_str}\n"
+            f"Title: {row.get('Title', 'N/A')}\n"
+            f"Article: {row.get('Article', 'N/A')}\n"
+        )
 
     # Broader Industry Information
     formatted_articles.append("\nBroader Industry Information:")
-    current_industry = sample.iloc[-1].get('Industry', 'Unknown Industry')
-    for _, row in sample.iterrows():
-        industry = row.get('Industry', 'Unknown Industry')
-        if industry == current_industry:
-            date = row.get('Date', pd.Timestamp('1970-01-01'))
-            if not isinstance(date, pd.Timestamp):
-                date = pd.to_datetime(date, errors='coerce')
-                if pd.isna(date):
-                    date = pd.Timestamp('1970-01-01')
-            date_str = date.strftime('%Y-%m-%d')
+    industry = sample.get('industry', pd.DataFrame()).head(5)
+    for _, row in industry.iterrows():
+        date = row.get('Date', pd.Timestamp('1970-01-01'))
+        if not isinstance(date, pd.Timestamp):
+            date = pd.to_datetime(date, errors='coerce')
+            if pd.isna(date):
+                date = pd.Timestamp('1970-01-01')
+        date_str = date.strftime('%Y-%m-%d')
 
-            formatted_articles.append(
-                f"Date: {date_str}\n"
-                f"Title: {row.get('Title', 'N/A')}\n"
-                f"Article: {row.get('Article', 'N/A')}\n"
-            )
+        formatted_articles.append(
+            f"Date: {date_str}\n"
+            f"Title: {row.get('Title', 'N/A')}\n"
+            f"Article: {row.get('Article', 'N/A')}\n"
+        )
 
     # Broader Sector Information
     formatted_articles.append("\nBroader Sector Information:")
-    current_sector = sample.iloc[-1].get('Sector', 'Unknown Sector')
-    for _, row in sample.iterrows():
-        sector = row.get('Sector', 'Unknown Sector')
-        if sector == current_sector:
-            date = row.get('Date', pd.Timestamp('1970-01-01'))
-            if not isinstance(date, pd.Timestamp):
-                date = pd.to_datetime(date, errors='coerce')
-                if pd.isna(date):
-                    date = pd.Timestamp('1970-01-01')
-            date_str = date.strftime('%Y-%m-%d')
+    sector = sample.get('sector', pd.DataFrame()).head(5)
+    for _, row in sector.iterrows():
+        date = row.get('Date', pd.Timestamp('1970-01-01'))
+        if not isinstance(date, pd.Timestamp):
+            date = pd.to_datetime(date, errors='coerce')
+            if pd.isna(date):
+                date = pd.Timestamp('1970-01-01')
+        date_str = date.strftime('%Y-%m-%d')
 
-            formatted_articles.append(
-                f"Date: {date_str}\n"
-                f"Title: {row.get('Title', 'N/A')}\n"
-                f"Article: {row.get('Article', 'N/A')}\n"
-            )
+        formatted_articles.append(
+            f"Date: {date_str}\n"
+            f"Title: {row.get('Title', 'N/A')}\n"
+            f"Article: {row.get('Article', 'N/A')}\n"
+        )
 
     # Information Indicating Significant Market Movement Related to Current Stock
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
-    current_symbol = sample.iloc[-1].get('Symbol', 'Unknown Symbol')
-    for _, row in sample.iterrows():
-        print(row, "row")
-        symbol = row.get('Symbol', 'Unknown Symbol')
+    stock = sample.get('stock', pd.DataFrame()).nlargest(5, 'Percentage Change')
+    for _, row in stock.iterrows():
+        date = row.get('Date', pd.Timestamp('1970-01-01'))
+        if not isinstance(date, pd.Timestamp):
+            date = pd.to_datetime(date, errors='coerce')
+            if pd.isna(date):
+                date = pd.Timestamp('1970-01-01')
+        date_str = date.strftime('%Y-%m-%d')
         percentage_change = row.get('Percentage Change', 0.0)
-        if (symbol == current_symbol) and (not pd.isna(percentage_change)):
-            date = row.get('Date', pd.Timestamp('1970-01-01'))
-            if not isinstance(date, pd.Timestamp):
-                date = pd.to_datetime(date, errors='coerce')
-                if pd.isna(date):
-                    date = pd.Timestamp('1970-01-01')
-            date_str = date.strftime('%Y-%m-%d')
-            print(percentage_change, "lll")
-            formatted_articles.append(
-                f"Date: {date_str}\n"
-                f"Title: {row.get('Title', 'N/A')}\n"
-                f"Article: {row.get('Article', 'N/A')}\n"
-                f"Percentage Change: {percentage_change:.2f}%\n"
-            )
+        formatted_articles.append(
+            f"Date: {date_str}\n"
+            f"Title: {row.get('Title', 'N/A')}\n"
+            f"Article: {row.get('Article', 'N/A')}\n"
+            f"Percentage Change: {percentage_change:.2f}%\n"
+        )
 
     # Last 8 Articles for Current Stock
     formatted_articles.append("\nLast 8 Articles for Current Stock:")
-    for _, row in sample.iterrows():
-        symbol = row.get('Symbol', 'Unknown Symbol')
-        if symbol == current_symbol:
-            date = row.get('Date', pd.Timestamp('1970-01-01'))
-            if not isinstance(date, pd.Timestamp):
-                date = pd.to_datetime(date, errors='coerce')
-                if pd.isna(date):
-                    date = pd.Timestamp('1970-01-01')
-            date_str = date.strftime('%Y-%m-%d')
+    last_8 = sample.get('last_8', pd.DataFrame()).head(8)
+    for _, row in last_8.iterrows():
+        date = row.get('Date', pd.Timestamp('1970-01-01'))
+        if not isinstance(date, pd.Timestamp):
+            date = pd.to_datetime(date, errors='coerce')
+            if pd.isna(date):
+                date = pd.Timestamp('1970-01-01')
+        date_str = date.strftime('%Y-%m-%d')
 
-            formatted_articles.append(
-                f"Symbol: {symbol}\n"
-                f"Security: {row.get('Security', 'N/A')}\n"
-                f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
-                f"Title: {row.get('Title', 'N/A')}\n"
-                f"Type: {row.get('articleType', 'N/A')}\n"
-                f"Publication: {row.get('Publication', 'N/A')}\n"
-                f"Publication Author: {row.get('Author', 'N/A')}\n"
-                f"Date: {date_str}\n"
-                f"Article: {row.get('Article', 'N/A')}\n"
-                f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
-                f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
-                f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
-                f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
-            )
+        formatted_articles.append(
+            f"Symbol: {row.get('Symbol', 'Unknown Symbol')}\n"
+            f"Security: {row.get('Security', 'N/A')}\n"
+            f"Related Stocks/Topics: {row.get('RelatedStocksList', 'N/A')}\n"
+            f"Title: {row.get('Title', 'N/A')}\n"
+            f"Type: {row.get('articleType', 'N/A')}\n"
+            f"Publication: {row.get('Publication', 'N/A')}\n"
+            f"Publication Author: {row.get('Author', 'N/A')}\n"
+            f"Date: {date_str}\n"
+            f"Article: {row.get('Article', 'N/A')}\n"
+            f"Stock Price 4 days before: {row.get('weighted_avg_-96_hrs', 'N/A')}\n"
+            f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
+            f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
+            f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
+        )
 
     concatenated_articles = "\n".join(formatted_articles)
-
     return concatenated_articles
 
 def parallel_context_generation_worker(args):
@@ -151,20 +134,22 @@ def parallel_context_generation_worker(args):
     """
     idx, df, tokenizer, total_epochs, current_epoch = args
     # Generate sampled articles
-    sampled = sample_articles(df, [idx])[0]
+    print(idx, current_epoch, df, "ea")
+    sampled = sample_articles(df, [idx])
+    sampled_dict = sampled[0]
     # Format concatenated articles as a CPU-only string
-    context_str = format_concatenated_articles(sampled)
-    # Tokenize on CPU
+    context_str = format_concatenated_articles(sampled_dict)
+    print(context_str, idx, "llk")
+    # Tokenize on CPU with half BLOCK_SIZE
     encoding = tokenizer(
         context_str,
         truncation=True,
         padding='max_length',
-        max_length=config.BLOCK_SIZE,
+        max_length= config.BLOCK_SIZE,
         return_tensors='pt'
     )
 
     # Return CPU tensors only (no GPU ops)
-    # Just return input_ids from encoding on CPU
     return encoding['input_ids'].squeeze(0)  # Still on CPU
 
 class ArticlePriceDataset(Dataset):
@@ -190,7 +175,6 @@ class ArticlePriceDataset(Dataset):
             'Symbol': symbols,
             'Industry': industries
         })
-        self.df = preprocess_data(self.df)
         self.tokenizer = tokenizer
         self.total_epochs = total_epochs
         self.use_ebm = use_ebm
@@ -242,7 +226,7 @@ def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_e
             idx = sample['idx']
             # Note: Passing only CPU related args, no GPU ops
             args_list.append((idx, df, tokenizer, total_epochs, current_epoch))
-
+    print("aaaA")
     # Run parallel context generation (CPU only)
     if use_ebm:
         with ProcessPoolExecutor() as executor:
@@ -250,7 +234,7 @@ def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_e
         # results is a list of CPU tensors (context input_ids), one per sample
     else:
         results = None
-
+    print("bbbb")
     # Now construct the main batch
     for i, sample in enumerate(batch):
         # input_ids and labels are presumably CPU tensors or arrays
@@ -292,8 +276,8 @@ def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_e
             'input_ids': input_ids_padded,
             'labels': labels_tensor,
             'context_input_ids': context_input_ids_padded,
-            'article_embeddings': article_embeddings,  # If needed
-            'context_embeddings': context_embeddings   # If needed
+            'article_embeddings': article_embeddings,
+            'context_embeddings': context_embeddings
         }
     else:
         # If no EBM, just return CPU (or move to GPU in train loop)
