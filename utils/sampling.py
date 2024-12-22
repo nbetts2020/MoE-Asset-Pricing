@@ -4,29 +4,42 @@ import pandas as pd
 import numpy as np
 import random
 
-def sample_articles(df: pd.DataFrame, index_list):
+def sample_articles(df: pd.DataFrame, index_list=None, symbol=None):
 
     samples = []
-    for idx in index_list:
-        if idx >= len(df) or idx < 0:
-            logging.error(f"Index {idx} is out of bounds. Skipping.")
-            continue
-
-        target_row = df.loc[idx]
-        target_date = target_row['Date']
-        if pd.isna(target_date):
-            logging.error(f"Index {idx} has invalid Date. Skipping.")
-            continue
-        if not isinstance(target_date, pd.Timestamp):
-            # Attempt conversion if still string for some reason
-            target_date = pd.to_datetime(target_date, errors='coerce')
-            if pd.isna(target_date):
-                logging.error(f"Could not convert target_date for idx {idx}. Skipping.")
+    if index_list is not None:
+        for idx in index_list:
+            if idx >= len(df) or idx < 0:
+                logging.error(f"Index {idx} is out of bounds. Skipping.")
                 continue
+    
+            target_row = df.loc[idx]
+            target_date = target_row['Date']
+            if pd.isna(target_date):
+                logging.error(f"Index {idx} has invalid Date. Skipping.")
+                continue
+            if not isinstance(target_date, pd.Timestamp):
+                # Attempt conversion if still string for some reason
+                target_date = pd.to_datetime(target_date, errors='coerce')
+                if pd.isna(target_date):
+                    logging.error(f"Could not convert target_date for idx {idx}. Skipping.")
+                    continue
 
+            target_symbol = target_row['Symbol']
+            target_sector = target_row['Sector']
+            target_industry = target_row['Industry']
+    else:
         target_symbol = target_row['Symbol']
-        target_sector = target_row['Sector']
-        target_industry = target_row['Industry']
+        target_sector = (
+            df[df['Symbol'] == target_symbol]['Sector']
+            .value_counts()
+            .idxmax()
+        )
+        target_industry = (
+            df[df['Symbol'] == target_symbol]['Industry']
+            .value_counts()
+            .idxmax()
+        )
 
         # Define a 30-day time window before the target date
         start_date = target_date - pd.Timedelta(days=30)
