@@ -92,6 +92,9 @@ def main():
     # Initialize small model for testing
     parser.add_argument('--test_model', action='store_true', help='Use a smaller model configuration for quick testing.')
 
+    # Name of Hugging Face update data
+    parser.add_argument('--update_url', type=str, required=False, help="Hugging Face dataset URL for new data in 'update' mode.")
+
     # Manually setting configs
     parser.add_argument('--n_embed', type=int, help='Embedding dimension')
     parser.add_argument('--n_head', type=int, help='Number of attention heads')
@@ -177,7 +180,7 @@ def main():
         optimizer = prepare_optimizer(model, args)
 
         # Prepare data
-        train_dataloader, test_dataloader, update_dataloader, df = prepare_data(args, tokenizer)
+        train_dataloader, df = prepare_data(args, tokenizer)
 
         # Initialize EBM if using
         ebm = None
@@ -236,21 +239,28 @@ def main():
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
     elif args.mode == 'update':
-        if not args.update:
-            raise ValueError("You must provide the --update argument when in 'update' mode.")
-        # Load DataFrame
-        df = pd.read_csv(args.csv_path)
-        logging.info(f"Loaded dataset with {len(df)} rows for update.")
+        update_dataloader, df = prepare_data(args, tokenizer)
 
-        # Initialize model
-        try:
-            model, _ = initialize_model(args, device, init_from_scratch=False)
-            logging.info("Loaded pre-trained model for updating.")
-            logging.info(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
-        except RuntimeError as e:
-            logging.error(str(e))
-            print("Error: Could not load model for updating.")
-            return
+        if not all([args.bucket]):
+            raise ValueError("When using EBM sampling, --bucket must be provided.")
+    
+        download_models_from_s3(bucket=args.bucket)
+
+        # Load main model
+        model_path = os.path.join("model", "model_weights.pth")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+        logging.info("Main transformer model loaded from S3.")
+
+        if args.use_ebm:
+            # Load EBM model
+            ebm_path = os.path.join("models", "ebm_model.pt")
+            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
+            ebm.load_state_dict(torch.load(ebm_path, map_location=device))
+            ebm.to(device)
+            ebm.eval()
+            logging.info("EBM model loaded from S3.")
 
         # Wrap model with DDP if necessary
         if use_ddp:
@@ -258,9 +268,6 @@ def main():
 
         # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
-
-        # Prepare data
-        train_dataloader, test_dataloader, update_dataloader, _ = prepare_data(args, tokenizer)
 
         # Initialize EBM if using
         ebm = None
@@ -272,10 +279,10 @@ def main():
 
             from functools import partial
             from utils.data import custom_collate_fn
-            train_dataset = train_dataloader.dataset
+            update_dataset = update_dataloader.dataset
             # Re-create train_dataloader with custom_collate_fn
-            train_dataloader = DataLoader(
-                train_dataset,
+            update_dataloader = DataLoader(
+                update_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
                 collate_fn=custom_collate_fn)
@@ -398,10 +405,9 @@ def main():
             print(f"Predicted Price: {prediction.item()}")
         
         if args.test:
-            # Load DataFrame
-            df = pd.read_csv(args.csv_path)
-            logging.info(f"Loaded dataset with {len(df)} rows for testing.")
-
+            
+            run_dataloader, df = prepare_data(args, tokenizer)
+            
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
                 prices=df['weighted_avg_720_hrs'].tolist(),
@@ -416,34 +422,15 @@ def main():
                 use_ebm=False
             )
 
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
             # Evaluate on the test set
-            mse, r2, sector_metrics = evaluate_model(model, dataloader, device)
+            mse, r2, sector_metrics = evaluate_model(model, run_dataloader, device)
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print("Per-Sector Metrics:")
             for sector, metrics in sector_metrics.items():
                 print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
                 logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
-        else:
-            if not args.input_text:
-                raise ValueError("You must provide input text when mode is 'run' without --test")
-            encoding = tokenizer(
-                args.input_text,
-                truncation=True,
-                padding='max_length',
-                max_length=config.BLOCK_SIZE,
-                return_tensors='pt'
-            ).to(device)
-            input_ids = encoding["input_ids"]
-            # Inference
-            model.eval()
-            with torch.no_grad():
-                with torch.cuda.amp.autocast():
-                    prediction, _ = model(input_ids=input_ids)
-            print(f"Predicted Price: {prediction.item()}")
-
+                
     elif args.mode == 'test_forgetting':
         # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
