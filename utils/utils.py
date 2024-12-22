@@ -503,8 +503,7 @@ def prepare_data(args, tokenizer):
     """
     percent_data = args.percent_data  # get percentage of data to use
     df = get_data(percent_data=percent_data)
-    df = df.sort_values('Date')
-
+    
     random_seed = args.random_seed
 
     if args.mode == 'train':
