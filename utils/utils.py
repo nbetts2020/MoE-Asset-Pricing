@@ -32,6 +32,7 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from torch.utils.data.distributed import DistributedSampler
 
 import logging
+import subprocess
 
 import inspect
 import numpy as np
@@ -85,6 +86,41 @@ def load_model_weights(model, weights_path, device):
         raise FileNotFoundError(f"Weights file '{weights_path}' not found.")
     model.to(device)
     return model
+
+def download_models_from_s3(bucket):
+    """
+    Downloads the 'model' and 'models' directories from the specified S3 bucket.
+    
+    Args:
+        bucket (str): Name of the S3 bucket.
+    """
+    try:
+        logging.info(f"Starting download of 'model' directory from s3://{bucket}/model")
+        result = subprocess.run(
+            ["aws", "s3", "sync", f"s3://{bucket}/model", "model"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        logging.info(f"'model' directory synchronized successfully.\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error syncing 'model' directory: {e.stderr}")
+        raise
+
+    try:
+        logging.info(f"Starting download of 'models' directory from s3://{bucket}/models")
+        result = subprocess.run(
+            ["aws", "s3", "sync", f"s3://{bucket}/models", "models"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        logging.info(f"'models' directory synchronized successfully.\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error syncing 'models' directory: {e.stderr}")
+        raise
 
 def get_model_from_hf(model_repo_id, device):
     """
