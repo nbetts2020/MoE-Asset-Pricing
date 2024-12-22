@@ -419,7 +419,7 @@ def main():
                 industries=df['Industry'].tolist(),
                 tokenizer=tokenizer,
                 total_epochs=1,
-                use_ebm=False
+                use_ebm=args.use_ebm
             )
 
             # Evaluate on the test set
