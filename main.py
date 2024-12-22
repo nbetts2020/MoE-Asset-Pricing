@@ -243,7 +243,7 @@ def main():
 
         if not all([args.bucket]):
             raise ValueError("When using EBM sampling, --bucket must be provided.")
-    
+
         download_models_from_s3(bucket=args.bucket)
 
         # Load main model
@@ -342,7 +342,7 @@ def main():
     elif args.mode == 'run':
         if not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("When using EBM sampling, --stock, --date, --text, and --bucket must be provided.")
-    
+
         download_models_from_s3(bucket=args.bucket)
 
         # Load main model
@@ -361,13 +361,13 @@ def main():
             ebm.eval()
             logging.info("EBM model loaded from S3.")
 
-        selected_context = ebm_select_contexts(
-                df=df, 
-                stock=args.stock, 
-                date=args.date, 
-                sample_count=args.ebm_sample, 
-                model=model, 
-                ebm=ebm, 
+            selected_context = ebm_select_contexts(
+                df=df,
+                stock=args.stock,
+                date=args.date,
+                sample_count=args.ebm_sample,
+                model=model,
+                ebm=ebm,
                 tokenizer=tokenizer
             )
 
@@ -388,7 +388,7 @@ def main():
                 prediction, _ = model(input_ids=input_ids)
 
             print(f"Predicted Price: {prediction.item()}")
-    else:
+        else:
         # Tokenize and run inference
             encoding = tokenizer(
                 text,
@@ -403,11 +403,11 @@ def main():
                 prediction, _ = model(input_ids=input_ids)
 
             print(f"Predicted Price: {prediction.item()}")
-        
+
         if args.test:
-            
+
             run_dataloader, df = prepare_data(args, tokenizer)
-            
+
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
                 prices=df['weighted_avg_720_hrs'].tolist(),
@@ -430,7 +430,7 @@ def main():
             for sector, metrics in sector_metrics.items():
                 print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
                 logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
-                
+
     elif args.mode == 'test_forgetting':
         # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
