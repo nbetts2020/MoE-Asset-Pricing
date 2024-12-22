@@ -31,6 +31,9 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 
 from torch.utils.data.distributed import DistributedSampler
 
+from utils.sampling import sample_articles
+from utils.data import format_concatenated_articles
+
 import logging
 import subprocess
 
@@ -121,6 +124,67 @@ def download_models_from_s3(bucket):
     except subprocess.CalledProcessError as e:
         logging.error(f"Error syncing 'models' directory: {e.stderr}")
         raise
+
+def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_samples):
+    """
+    Generates and selects the best context based on EBM scoring.
+    
+    Args:
+        df (pd.DataFrame): The entire dataset to sample from.
+        stock (str): Stock symbol to filter relevant articles.
+        date (str): Date to filter relevant articles.
+        sample_count (int): Number of samples to generate.
+        model (torch.nn.Module): The main transformer model.
+        ebm (torch.nn.Module): The Energy-Based Model.
+        tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
+    
+    Returns:
+        str: The selected context string.
+    """
+    # Filter the dataframe based on stock and date
+    filtered_df = df[df['Date'] <= pd.to_datetime(date)]
+    
+    if filtered_df.empty:
+        raise ValueError("No data available for the specified stock and date.")
+    
+    candidates = []
+    for _ in range(ebm_samples):
+        # sample_articles(...) returns a list of sample_dicts; grab the first
+        sampled_list = sample_articles(filtered_df, index_list=None, symbol=stock)
+        if not sampled_list:
+            continue  # skip if no samples returned
+        sample_dict = sampled_list[0]  # typically you get only one item
+
+        # Convert sample_dict into a single string
+        context_str = format_concatenated_articles(sample_dict)
+        candidates.append(context_str)
+
+    if not candidates:
+        raise ValueError("No candidate contexts could be generated.")
+
+    # Score each candidate with EBM 
+    scores = [] # embed each article and context together???
+    device = next(model.parameters()).device  # or e.g. torch.device('cuda')
+    for ctx in candidates:
+        encoding = tokenizer(
+            ctx + text,
+            truncation=True,
+            padding='max_length',
+            max_length=config.BLOCK_SIZE,
+            return_tensors='pt'
+        ).to(device)
+
+        with torch.no_grad():
+            # Get embeddings from the main model
+            embeddings = model.get_embeddings(encoding['input_ids'])  # shape: [1, embed_dim]
+            # Score with EBM
+            score = ebm(embeddings).item()  # single float
+        scores.append(score)
+
+    Pick the best (lowest-scoring) context
+    min_idx = scores.index(min(scores))
+    best_context = candidates[min_idx]
+    return best_context
 
 def get_model_from_hf(model_repo_id, device):
     """
