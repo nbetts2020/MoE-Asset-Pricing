@@ -72,7 +72,12 @@ def main():
     parser.add_argument('--use_ebm', action='store_true', help='Use energy-based model for prompt optimization.')
     parser.add_argument('--ebm_learning_rate', type=float, default=1e-4, help='Learning rate for the EBM')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature parameter for Monte Carlo Sampling')
+
+    # Run Params
     parser.add_argument('--ebm_num_samples', type=int, default=25, help="Number of samples for the EBM to generate when 'run' is active")
+    parser.add_argument('--stock', type=str, required=False, help='Stock symbol related to the input text when 'run' is active.')
+    parser.add_argument('--date', type=str, required=False, help='Date related to the input text when 'run' is active.')
+    parser.add_argument('--text', type=str, required=False, help='Input article text for inference when 'run' is active.')
 
     # Replay buffer training args
     parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
