@@ -14,7 +14,8 @@ from utils.utils import (
     save_model_and_states,
     kaiming_init_weights,
     prepare_data,
-    save_ebm_model
+    save_ebm_model,
+    download_models_from_s3
 )
 from utils.config import config
 from torch.utils.data import DataLoader
@@ -75,9 +76,10 @@ def main():
 
     # Run Params
     parser.add_argument('--ebm_num_samples', type=int, default=25, help="Number of samples for the EBM to generate when 'run' is active")
-    parser.add_argument('--stock', type=str, required=False, help='Stock symbol related to the input text when 'run' is active.')
-    parser.add_argument('--date', type=str, required=False, help='Date related to the input text when 'run' is active.')
-    parser.add_argument('--text', type=str, required=False, help='Input article text for inference when 'run' is active.')
+    parser.add_argument('--stock', type=str, required=False, help="Stock symbol related to the input text when 'run' is active.")
+    parser.add_argument('--date', type=str, required=False, help="Date related to the input text when 'run' is active.")
+    parser.add_argument('--text', type=str, required=False, help="Input article text for inference when 'run' is active.")
+    parser.add_argument('--bucket', type=str, required=False, help="Name of model's S3 bucket when 'run' is active.")
 
     # Replay buffer training args
     parser.add_argument('--replay_batch_size', type=int, default=32, help='Batch size for replay buffer samples.')
@@ -331,22 +333,75 @@ def main():
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
     elif args.mode == 'run':
-        # Initialize model
-        try:
-            model, _ = initialize_model(args, device, init_from_scratch=False)
-            logging.info("Model is ready for inference.")
-            logging.info(f"Model has {sum(p.numel() for p in model.parameters()) / 1e6:.2f} million parameters")
-        except RuntimeError as e:
-            logging.error(str(e))
-            print("Error: Could not load model for inference.")
-            return
+        if not all([args.stock, args.date, args.text, args.bucket]):
+            raise ValueError("When using EBM sampling, --stock, --date, --text, and --bucket must be provided.")
+    
+        download_models_from_s3(bucket=args.bucket)
 
+        # Load main model
+        model_path = os.path.join("model", "model_weights.pth")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+        logging.info("Main transformer model loaded from S3.")
+
+        if args.use_ebm:
+            # Load EBM model
+            ebm_path = os.path.join("models", "ebm_model.pt")
+            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
+            ebm.load_state_dict(torch.load(ebm_path, map_location=device))
+            ebm.to(device)
+            ebm.eval()
+            logging.info("EBM model loaded from S3.")
+
+        selected_context = ebm_select_contexts(
+                df=df, 
+                stock=args.stock, 
+                date=args.date, 
+                sample_count=args.ebm_sample, 
+                model=model, 
+                ebm=ebm, 
+                tokenizer=tokenizer
+            )
+
+            # Combine selected context with input text
+            final_input = f"{selected_context}\n{args.text}"
+
+            # Tokenize and run inference
+            encoding = tokenizer(
+                final_input,
+                truncation=True,
+                padding='max_length',
+                max_length=config.BLOCK_SIZE,
+                return_tensors='pt'
+            ).to(device)
+            input_ids = encoding["input_ids"]
+
+            with torch.no_grad():
+                prediction, _ = model(input_ids=input_ids)
+
+            print(f"Predicted Price: {prediction.item()}")
+    else:
+        # Tokenize and run inference
+            encoding = tokenizer(
+                text,
+                truncation=True,
+                padding='max_length',
+                max_length=config.BLOCK_SIZE,
+                return_tensors='pt'
+            ).to(device)
+            input_ids = encoding["input_ids"]
+
+            with torch.no_grad():
+                prediction, _ = model(input_ids=input_ids)
+
+            print(f"Predicted Price: {prediction.item()}")
+        
         if args.test:
             # Load DataFrame
             df = pd.read_csv(args.csv_path)
             logging.info(f"Loaded dataset with {len(df)} rows for testing.")
 
-            from utils.data import ArticlePriceDataset
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
                 prices=df['weighted_avg_720_hrs'].tolist(),
