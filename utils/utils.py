@@ -190,7 +190,7 @@ def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_sample
             score = ebm(embeddings).item()  # single float
         scores.append(score)
 
-    Pick the best (lowest-scoring) context
+    # Pick the best (lowest-scoring) context
     min_idx = scores.index(min(scores))
     best_context = candidates[min_idx]
     return best_context
