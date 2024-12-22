@@ -48,7 +48,7 @@ def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
 
-def get_data(percent_data=100.0):
+def get_data(percent_data=100.0, run=False, update=False):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
 
@@ -58,6 +58,7 @@ def get_data(percent_data=100.0):
 
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
+    df.sort_values(by='Date', inplace=True)
     df = df.head(num_samples)
 
     safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
@@ -66,9 +67,17 @@ def get_data(percent_data=100.0):
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
 
-    df.sort_values(by='Date', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
+    split1 = int(len(df) * 0.8)
+    split2 = int(len(df) * 0.9)
+
+    if run:
+        df = df[split1:split2]
+    elif update:
+        df = df[split2:]
+    else:
+        df = df[:split1]
     return df
 
 def get_new_data(new_data_url):
@@ -502,69 +511,40 @@ def prepare_data(args, tokenizer):
     Prepares the data for training or updating.
     """
     percent_data = args.percent_data  # get percentage of data to use
-    df = get_data(percent_data=percent_data)
     
     random_seed = args.random_seed
 
     if args.mode == 'train':
-        # Baseline: split into 90% train and 10% test
-        train_df, test_df = train_test_split(
-            df,
-            test_size=0.1,
-            random_state=random_seed,
-            shuffle=True
-        )
-        update_df = None  # No update data in baseline
-        logging.info(f"Data split into 90% train, 10% test.")
+        df = get_data(percent_data=percent_data)
 
         train_dataloader = prepare_dataloader(
-            train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
         )
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
-        # Prepare test DataLoader
-        test_dataloader = prepare_dataloader(
-            test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args
+        return train_dataloader, df
+    elif args.mode == 'run':
+        df = get_data(percent_data=percent_data, run=True)
+
+        run_dataloader = prepare_dataloader(
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
         )
-        logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
-
-        return train_dataloader, test_dataloader, None, df
-
+        logging.info(f"Prepared update DataLoader with {len(run_dataloader.dataset)} samples.")
+        
+        return run_dataloader, df
     elif args.mode == 'update':
-        # Handle 'update' mode
-        if not args.update:
-            raise ValueError("You must provide the --update argument when in 'update' mode.")
         # Load new data for updating
-        update_df = get_new_data(args.update)
-        logging.info(f"Loaded new update data from {args.update}")
-
-        # Split original data into training and testing sets
-        train_df, test_df = train_test_split(
-            df,
-            test_size=0.1,
-            random_state=random_seed,
-            shuffle=True
-        )
-        logging.info(f"Data split into 90% train, 10% test.")
-
-        # Prepare DataLoaders
-        train_dataloader = prepare_dataloader(
-            train_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
-        )
-        logging.info(f"Prepared train DataLoader with {len(train_dataloader.dataset)} samples.")
-
-        test_dataloader = prepare_dataloader(
-            test_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args
-        )
-        logging.info(f"Prepared test DataLoader with {len(test_dataloader.dataset)} samples.")
+        if args.update_url:
+            df = get_new_data(args.update_url)
+        else:
+            df = get_data(percent_data=percent_data, update=True)
 
         update_dataloader = prepare_dataloader(
-            update_df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
         )
         logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
 
-        return train_dataloader, test_dataloader, update_dataloader, df
-
+        return update_dataloader, df
     else:
         raise ValueError("Invalid mode specified in args.mode")
 
