@@ -547,7 +547,7 @@ def save_ebm_model(ebm, epoch, save_dir="models"):
         save_dir (str): Directory where the model will be saved.
     """
     os.makedirs(save_dir, exist_ok=True)  # Ensure the directory exists
-    save_path = os.path.join(save_dir, f"ebm_epoch_{epoch}.pt")
+    save_path = os.path.join(save_dir, f"ebm.pt")
     torch.save(ebm.state_dict(), save_path)
     print(f"EBM model saved to {save_path}")
 
@@ -818,53 +818,3 @@ def initialize_replay_buffer(args):
         else:
             logging.info("No existing Memory Replay Buffer found. Starting fresh.")
     return replay_buffer
-
-def save_model_and_states(model, si, replay_buffer, ewc_list, args):
-    """
-    Saves the model weights and states of SI, EWC, and Replay Buffer.
-
-    Args:
-        model (nn.Module): The transformer model.
-        si (SynapticIntelligence, optional): The SI instance.
-        replay_buffer (MemoryReplayBuffer, optional): The replay buffer instance.
-        ewc_list (list, optional): List of EWC instances.
-        args (argparse.Namespace): Command-line arguments.
-    """
-    if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
-        rank = dist.get_rank()
-    else:
-        rank = 0
-
-    if rank == 0:
-        os.makedirs(args.save_dir, exist_ok=True)
-        # Save model weights
-        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
-            state_dict = model.module.state_dict()
-        else:
-            state_dict = model.state_dict()
-        torch.save(state_dict, os.path.join(args.save_dir, 'model_weights.pth'))
-        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
-
-        # Save EWC state
-        if getattr(args, 'use_ewc', False) and ewc_list is not None:
-            ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
-            ewc_states = []
-            for ewc_instance in ewc_list:
-                ewc_states.append({
-                    'params': {n: p.cpu() for n, p in ewc_instance.params.items()},
-                    'fisher': {n: f.cpu() for n, f in ewc_instance.fisher.items()}
-                })
-            torch.save(ewc_states, ewc_state_path)
-            logging.info(f"EWC state saved to '{ewc_state_path}'.")
-
-    # Save SI state for each rank
-    if getattr(args, 'use_si', False) and si is not None:
-        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
-        si.save_state(si_state_path)
-        logging.info(f"Rank {rank}: Synaptic Intelligence (SI) state saved to '{si_state_path}'.")
-
-    # Save Replay Buffer for each rank
-    if getattr(args, 'use_replay_buffer', False) and replay_buffer is not None:
-        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
-        replay_buffer.save(replay_buffer_path)
-        logging.info(f"Rank {rank}: Replay Buffer saved to '{replay_buffer_path}'.")
