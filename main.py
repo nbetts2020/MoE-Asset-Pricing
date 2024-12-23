@@ -422,14 +422,15 @@ def main():
                 use_ebm=args.use_ebm
             )
 
-            # Evaluate on the test set
-            mse, r2, sector_metrics = evaluate_model(model, run_dataloader, device)
+            mse, r2, sector_metrics, overall_trend_acc = evaluate_model(model, run_dataloader, device)
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+            print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
+            logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             print("Per-Sector Metrics:")
             for sector, metrics in sector_metrics.items():
-                print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
-                logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}")
+                print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}, Trend Accuracy: {metrics['trend_acc']:.4f}")
+                logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}, Trend Accuracy: {metrics['trend_acc']:.4f}")
 
     elif args.mode == 'test_forgetting':
         # Initialize model from scratch
