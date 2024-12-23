@@ -15,7 +15,8 @@ from utils.utils import (
     kaiming_init_weights,
     prepare_data,
     save_ebm_model,
-    download_models_from_s3
+    download_models_from_s3,
+    evaluate_model
 )
 from utils.config import config
 from torch.utils.data import DataLoader
@@ -32,7 +33,6 @@ from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
 from utils.test import test_forgetting
-from utils.train import evaluate_model
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
