@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
 import pandas as pd
 
