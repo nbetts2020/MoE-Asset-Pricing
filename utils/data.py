@@ -237,7 +237,7 @@ def custom_collate_fn(batch):
     # Pad input_ids
     input_ids_padded = torch.nn.utils.rnn.pad_sequence(
         input_ids_list, batch_first=True,
-        padding_value = 50256
+        padding_value = 50256 # hardcoded padding id token for gpt2 tokenizer
     )
     labels_tensor    = torch.stack(labels_list)
     old_price_tensor = torch.stack(old_price_list)
