@@ -34,6 +34,8 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
 from utils.test import test_forgetting
 
+from utils.ebm import EnergyBasedModel
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
@@ -186,7 +188,6 @@ def main():
         ebm = None
         ebm_optimizer = None
         if args.use_ebm:
-            from utils.ebm import EnergyBasedModel
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
 
@@ -245,7 +246,8 @@ def main():
             raise ValueError("When using EBM sampling, --bucket must be provided.")
 
         download_models_from_s3(bucket=args.bucket)
-
+        model, _ = initialize_model(args, device, init_from_scratch=True)
+        model.to(device)
         # Load main model
         model_path = os.path.join("model", "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -340,11 +342,14 @@ def main():
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
     elif args.mode == 'run':
-        if not all([args.stock, args.date, args.text, args.bucket]):
+        if not all([args.stock, args.date, args.text, args.bucket]) and args.test == False:
             raise ValueError("When using EBM sampling, --stock, --date, --text, and --bucket must be provided.")
+        elif args.bucket == False:
+            raise ValueError("When evaluating on test set, --bucket must be provided.")
 
         download_models_from_s3(bucket=args.bucket)
-
+        model, _ = initialize_model(args, device, init_from_scratch=True)
+        model.to(device)
         # Load main model
         model_path = os.path.join("model", "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -354,6 +359,7 @@ def main():
 
         if args.use_ebm:
             # Load EBM model
+            from utils.ebm import EnergyBasedModel
             ebm_path = os.path.join("models", "ebm_model.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
