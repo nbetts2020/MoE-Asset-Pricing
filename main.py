@@ -16,7 +16,8 @@ from utils.utils import (
     prepare_data,
     save_ebm_model,
     download_models_from_s3,
-    evaluate_model
+    evaluate_model,
+    ebm_select_contexts
 )
 from utils.config import config
 from torch.utils.data import DataLoader
@@ -188,6 +189,7 @@ def main():
         ebm = None
         ebm_optimizer = None
         if args.use_ebm:
+            from utils.ebm import EnergyBasedModel
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
 
@@ -257,7 +259,7 @@ def main():
 
         if args.use_ebm:
             # Load EBM model
-            ebm_path = os.path.join("models", "ebm_model.pt")
+            ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
@@ -347,6 +349,8 @@ def main():
         elif args.bucket == False:
             raise ValueError("When evaluating on test set, --bucket must be provided.")
 
+        run_dataloader, df = prepare_data(args, tokenizer)
+
         download_models_from_s3(bucket=args.bucket)
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.to(device)
@@ -357,21 +361,23 @@ def main():
         model.eval()
         logging.info("Main transformer model loaded from S3.")
 
-        if args.use_ebm:
+        if args.use_ebm and args.test == False:
             # Load EBM model
             from utils.ebm import EnergyBasedModel
-            ebm_path = os.path.join("models", "ebm_model.pt")
+            ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
             ebm.eval()
             logging.info("EBM model loaded from S3.")
 
+            num_samples = args.test if args.test else 25
+
             selected_context = ebm_select_contexts(
                 df=df,
                 stock=args.stock,
                 date=args.date,
-                sample_count=args.ebm_sample,
+                sample_count=num_samples,
                 model=model,
                 ebm=ebm,
                 tokenizer=tokenizer
@@ -394,7 +400,7 @@ def main():
                 prediction, _ = model(input_ids=input_ids)
 
             print(f"Predicted Price: {prediction.item()}")
-        else:
+        elif args.test == False:
         # Tokenize and run inference
             encoding = tokenizer(
                 text,
@@ -410,9 +416,7 @@ def main():
 
             print(f"Predicted Price: {prediction.item()}")
 
-        if args.test:
-
-            run_dataloader, df = prepare_data(args, tokenizer)
+        elif args.test:
 
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
