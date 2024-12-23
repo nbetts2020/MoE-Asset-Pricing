@@ -182,26 +182,18 @@ def test_forgetting(model, optimizer, epochs, device, tokenizer, args, si=None, 
 def evaluate_task(model, dataloader, device):
     """
     Evaluate the model on a given task (dataloader).
-
-    Args:
-        model (nn.Module): The model to evaluate.
-        dataloader (DataLoader): Dataloader for the task to evaluate.
-        device (torch.device): Device (CPU or GPU).
-
-    Returns:
-        mse (float): Mean Squared Error.
-        rmse (float): Root Mean Squared Error.
-        mae (float): Mean Absolute Error.
-        r2 (float): R-squared score.
+    Returns MSE, RMSE, MAE, R2, plus trend_accuracy
     """
     model.eval()
     predictions = []
     actuals = []
+    old_prices = []   # we'll store these to compute direction
 
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
+            old_price = batch['old_price'].to(device)  # from your dataset
 
             if device.type == 'cuda':
                 with torch.cuda.amp.autocast():
@@ -209,20 +201,38 @@ def evaluate_task(model, dataloader, device):
             else:
                 outputs, _ = model(input_ids=input_ids)
 
-            outputs_np = outputs.detach().cpu().numpy()
-            labels_np = labels.detach().cpu().numpy()
-
-            # Ensure outputs_np and labels_np are 1D arrays
-            outputs_np = outputs_np.reshape(-1)
-            labels_np = labels_np.reshape(-1)
+            outputs_np = outputs.detach().cpu().numpy()   # shape [batch]
+            labels_np = labels.detach().cpu().numpy()     # shape [batch]
+            old_price_np = old_price.detach().cpu().numpy()
 
             predictions.extend(outputs_np.tolist())
             actuals.extend(labels_np.tolist())
+            old_prices.extend(old_price_np.tolist())
 
+    # Standard MSE, RMSE, MAE, R2
     mse = mean_squared_error(actuals, predictions)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
 
-    model.train()  # set the model back to train mode
-    return mse, rmse, mae, r2
+    # 3. Compute "trend correctness"
+    #   sign_of_future = (labels - old_price) => + if price went up, - if price went down
+    #   sign_of_pred   = (prediction - old_price)
+    #   If both have same sign => correct trend
+    trend_correct = 0
+    total = len(predictions)
+    for i in range(total):
+        actual_direction = (actuals[i] - old_prices[i])  # could be + or -
+        pred_direction   = (predictions[i] - old_prices[i])
+
+        # We'll say "trend correct" if actual_direction * pred_direction > 0
+        #   (that is, both positive or both negative)
+        #   You might handle the "exact zero" case if needed
+        if actual_direction * pred_direction > 0:
+            trend_correct += 1
+
+    trend_accuracy = float(trend_correct) / float(total) if total > 0 else 0.0
+
+    # Return everything you want
+    model.train()  # set back to train mode
+    return mse, rmse, mae, r2, trend_accuracy
