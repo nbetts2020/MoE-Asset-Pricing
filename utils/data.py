@@ -158,7 +158,7 @@ class ArticlePriceDataset(Dataset):
                  sectors: list,
                  dates: list,
                  related_stocks_list: list,
-                 prices_current: list,
+                 prices_current: list,       # old/current price
                  symbols: list,
                  industries: list,
                  tokenizer,
@@ -166,11 +166,11 @@ class ArticlePriceDataset(Dataset):
                  use_ebm: bool=False):
         self.df = pd.DataFrame({
             'Article': articles,
-            'weighted_avg_720_hrs': prices,
+            'weighted_avg_720_hrs': prices,  # future price
             'Sector': sectors,
             'Date': dates,
             'RelatedStocksList': related_stocks_list,
-            'weighted_avg_0_hrs': prices_current,
+            'weighted_avg_0_hrs': prices_current,  # old/current price
             'Symbol': symbols,
             'Industry': industries
         })
@@ -184,146 +184,68 @@ class ArticlePriceDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         article = row.get('Article', 'N/A')
-        price = row.get('weighted_avg_720_hrs', 0.0)
+
+        # The label is the future price after 720 hours:
+        future_price = row.get('weighted_avg_720_hrs', 0.0)
+
+        # The old/current price we also want for e.g. trend calc:
+        old_price = row.get('weighted_avg_0_hrs', 0.0)
+
         sector = row.get('Sector', 'Unknown Sector')
+
         input_encoding = self.tokenizer(
             article,
             truncation=True,
             padding='max_length',
-            max_length=config.BLOCK_SIZE,
+            max_length= 1024, #config.BLOCK_SIZE,
             return_tensors='pt'
         )
         input_ids = input_encoding['input_ids'].squeeze(0)
 
         sample = {
             'input_ids': input_ids,
-            'labels': torch.tensor(price, dtype=torch.float),
+            'labels': torch.tensor(future_price, dtype=torch.float),
             'sector': sector,
-            'idx': int(idx)
+            'idx': int(idx),
+
+            # Provide the old/current price explicitly:
+            'old_price': torch.tensor(old_price, dtype=torch.float)
         }
         return sample
 
 def worker_wrapper(args):
     return parallel_context_generation_worker(*args)
 
-def custom_collate_fn(
-    batch,
-    df,
-    ebm,
-    model,
-    tokenizer,
-    device,
-    use_ebm,
-    total_epochs,
-    current_epoch,
-    context_count=5,
-    temperature=0.7  # for Boltzmann
-):
+def custom_collate_fn(batch):
     """
-    CPU parallel for multiple contexts, then select one via Monte Carlo on GPU.
+    Minimal collate function: merges CPU data into a single batch,
+    but does NOT do large GPU calls or EBM logic.
     """
-    input_ids = []
-    labels = []
+    input_ids_list = []
+    labels_list    = []
+    old_price_list = []
+    sector_list    = []
+    idx_list       = []
 
-    # We'll store final chosen contexts here, if use_ebm is True
-    chosen_context_ids = [] if use_ebm else None
+    for sample in batch:
+        input_ids_list.append(sample['input_ids'])
+        labels_list.append(sample['labels'])
+        old_price_list.append(sample['old_price'])
+        sector_list.append(sample['sector'])
+        idx_list.append(sample['idx'])
 
-    # Step A: Gather CPU-worker args if EBM is used
-    if use_ebm:
-        args_list = []
-        for sample in batch:
-            idx = sample['idx']
-            args_list.append((idx, df, tokenizer, total_epochs, current_epoch, context_count))
-        # Launch CPU worker to get multiple context strings
-        with ProcessPoolExecutor() as executor:
-            # results => list of [candidate_str1, candidate_str2, ...] per sample
-            all_candidates = list(executor.map(parallel_context_generation_worker, args_list))
-    else:
-        all_candidates = None
+    # Pad input_ids
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(
+        input_ids_list, batch_first=True,
+        padding_value = 50256
+    )
+    labels_tensor    = torch.stack(labels_list)
+    old_price_tensor = torch.stack(old_price_list)
 
-    print(all_candidates[0][0], len(all_candidates), len(all_candidates[0]), "ahhhh!")
-
-    # Step B: Convert main article input to Tensors
-    for i, sample in enumerate(batch):
-        inp = sample['input_ids']
-        lbl = sample['labels']
-        if not isinstance(inp, torch.Tensor):
-            inp = torch.tensor(inp, dtype=torch.long)
-        if not isinstance(lbl, torch.Tensor):
-            lbl = torch.tensor(lbl, dtype=torch.float)
-        input_ids.append(inp)
-        labels.append(lbl)
-
-    # Step C: If EBM, handle multiple contexts per sample
-    if use_ebm:
-        # We'll do the entire selection on GPU
-        # Build final (per-sample) chosen context
-        for i, candidate_strings in enumerate(all_candidates):
-            if not candidate_strings:
-                # Fallback if no candidate contexts
-                chosen_context_ids.append(torch.zeros(1, dtype=torch.long))
-                continue
-
-            # 1) Tokenize each candidate -> shape [num_candidates, seq_len]
-            candidate_tensors = []
-            for ctx_str in candidate_strings:
-                enc = tokenizer(
-                    ctx_str,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=config.BLOCK_SIZE,
-                    return_tensors='pt'
-                )
-                candidate_tensors.append(enc['input_ids'].squeeze(0))
-
-            candidate_tensors = torch.stack(candidate_tensors, dim=0).to(device)
-              # shape: [num_candidates, seq_len]
-
-            # 2) Compute EBM energies
-            with torch.no_grad():
-                article_emb = model.get_embeddings(input_ids[i].unsqueeze(0).to(device))
-                  # shape [1, embed_dim], expand to match
-                # Compute embeddings for each candidate context
-                context_emb = model.get_embeddings(candidate_tensors) # [num_candidates, embed_dim]
-
-                # EBM => shape [num_candidates]
-                # Expand article_emb to match
-                expanded_article_emb = article_emb.expand(context_emb.size(0), -1)
-                energies = ebm(expanded_article_emb, context_emb) # [num_candidates]
-
-            # 3) Scale energies (min-max) then transform into probabilities
-            e_min = energies.min()
-            e_max = energies.max()
-            scaled = (energies - e_min) / ( (e_max - e_min) + 1e-8 )  # in [0..1]
-            # Boltzmann
-            probs = F.softmax(-scaled / temperature, dim=0)  # shape [num_candidates]
-
-            # 4) Sample exactly 1 context
-            sampled_idx = torch.multinomial(probs, 1).item()
-
-            # 5) Chosen context tokens -> store
-            chosen_context = candidate_tensors[sampled_idx]  # shape [seq_len]
-            chosen_context_ids.append(chosen_context)
-    # else no EBM => skip
-
-    # Step D: pad sequences on CPU
-    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-    labels_tensor = torch.stack(labels)
-
-    # Step E: If no EBM, just return
-    if not use_ebm:
-        return {
-            'input_ids': input_ids_padded.to(device),
-            'labels': labels_tensor.to(device)
-        }
-
-    # If EBM => also pad the single chosen contexts
-    # shape => [batch_size, chosen_seq_len]
-    context_input_ids_padded = torch.nn.utils.rnn.pad_sequence(chosen_context_ids, batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
-
-    # Return final
     return {
-        'input_ids': input_ids_padded.to(device),
-        'labels': labels_tensor.to(device),
-        'context_input_ids': context_input_ids_padded
+        'input_ids':    input_ids_padded,
+        'labels':       labels_tensor,
+        'old_price':    old_price_tensor,
+        'sector':       sector_list,  # CPU list of strings
+        'idx':          idx_list
     }
