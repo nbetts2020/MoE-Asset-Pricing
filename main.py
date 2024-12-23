@@ -258,6 +258,7 @@ def main():
         logging.info("Main transformer model loaded from S3.")
 
         if args.use_ebm:
+            from utils.ebm import EnergyBasedModel
             # Load EBM model
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
@@ -274,17 +275,15 @@ def main():
         optimizer = prepare_optimizer(model, args)
 
         # Initialize EBM if using
-        ebm = None
         ebm_optimizer = None
         if args.use_ebm:
             from utils.ebm import EnergyBasedModel
-            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
 
             from functools import partial
             from utils.data import custom_collate_fn
             update_dataset = update_dataloader.dataset
-            # Re-create train_dataloader with custom_collate_fn
+            # Re-create update_dataloader with custom_collate_fn
             update_dataloader = DataLoader(
                 update_dataset,
                 batch_size=args.batch_size,
@@ -324,7 +323,7 @@ def main():
             optimizer=optimizer,
             epochs=config.EPOCHS,
             device=device,
-            dataloader=train_dataloader,
+            dataloader=update_dataloader,
             args=args,
             si=si,
             ewc=ewc_list,
