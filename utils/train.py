@@ -1,213 +1,309 @@
 # utils/train.py
 
 import torch
-from sklearn.metrics import mean_squared_error, r2_score
-from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
+import numpy as np
 import os
 from tqdm import tqdm
 import logging
-import torch.distributed as dist
+from concurrent.futures import ProcessPoolExecutor
 
+from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
-from utils.utils import (
-    compute_l2_loss,
-    evaluate_model,
-    load_checkpoint
-)
-
-from utils.data import custom_collate_fn
-from functools import partial
+from utils.data import parallel_context_generation_worker
+from utils.utils import compute_l2_loss, load_checkpoint
 
 logging.basicConfig(level=logging.INFO)
 
-def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc=None,
-               replay_buffer=None, df=None, ebm=None, ebm_optimizer=None, tokenizer=None):
+def train_model(
+    model,
+    optimizer,
+    epochs,
+    device,
+    dataloader,
+    args,
+    si=None,              # optional Synaptic Intelligence
+    ewc=None,             # optional EWC list
+    replay_buffer=None,   # optional replay buffer
+    df=None,              # entire DataFrame for sampling contexts
+    ebm=None,             # EBM model
+    ebm_optimizer=None,   # EBM optimizer
+    tokenizer=None
+):
     """
-    Train the transformer model with optional EBM integration.
-    EBM and EBM optimizer are now passed as arguments from main.py.
+    Multi-context EBM approach in half precision for flash-attn.
+
+    Workflow:
+      1) Possibly load from checkpoint.
+      2) If not use_ebm: standard forward/back pass for each batch.
+      3) If use_ebm:
+         (A) For each sample, gather multiple contexts (CPU parallel).
+         (B) For each candidate context => compute MSE => EBM regresses MSE => backward EBM loss => step.
+         (C) Monte Carlo sample exactly 1 context => feed to main model => backward main model loss.
+      4) Replay buffer is updated after main forward pass.
+      5) EWC / SI / L2 are optionally applied.
+
+    This code expects:
+      - 'labels' field in batch => future price
+      - 'input_ids' => main article tokens as long dtype
+      - 'idx' => row index in df
+      - 'sector' => optional string
+      - If old price is used => 'old_price' in batch
     """
-    model.train()
-    scaler = GradScaler()
-    logging.info("Starting training loop.")
 
-    # Early Stopping parameters
-    patience = args.early_stopping_patience
-    best_loss = float('inf')
-    epochs_no_improve = 0
-
-    # Determine if using DDP
-    use_ddp = getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1
-    rank = dist.get_rank() if use_ddp else 0
-
-    use_ebm = getattr(args, 'use_ebm', False)
-
-    # Create checkpoint directory if needed
-    checkpoint_dir = args.checkpoint_dir if hasattr(args, 'checkpoint_dir') else './checkpoints'
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Load from checkpoint if specified
+    # -------------------------------------------------------------------------
+    # 1) Optionally load from checkpoint
+    # -------------------------------------------------------------------------
     start_epoch = 0
-    if hasattr(args, 'checkpoint_path') and args.checkpoint_path:
-        start_epoch = load_checkpoint(model, optimizer, ebm if use_ebm else None,
-                                      ebm_optimizer if use_ebm else None,
-                                      checkpoint_path=args.checkpoint_path)
-
-    for epoch in range(start_epoch, epochs):
-        logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
-
-        # Update collate_fn with current_epoch and tokenizer
-        context_count = max(epochs - epoch, 5)
-
-        dataloader.collate_fn = partial(
-            custom_collate_fn,
-            df=df,
-            ebm=ebm,
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            use_ebm=use_ebm,
-            total_epochs=epochs,
-            current_epoch=epoch,
-            context_count=context_count
+    if args.checkpoint_path and os.path.isfile(args.checkpoint_path):
+        start_epoch = load_checkpoint(
+            model,
+            optimizer,
+            ebm if (ebm and args.use_ebm) else None,
+            ebm_optimizer if (ebm and args.use_ebm) else None,
+            args.checkpoint_path
         )
 
+    use_ebm = (ebm is not None) and getattr(args, 'use_ebm', False)
+    if use_ebm:
+        ebm.train()  # EBM in train mode
+
+    # We'll run the main model in train mode
+    model.train()
+
+    scaler = GradScaler()
+    best_loss = float('inf')
+    epochs_no_improve = 0
+    patience = args.early_stopping_patience
+
+    # -------------------------------------------------------------------------
+    # 2) Training Loop
+    # -------------------------------------------------------------------------
+    for epoch in range(start_epoch, epochs):
+        logging.info(f"==== Epoch {epoch+1}/{epochs} ====")
         total_loss = 0.0
-        predictions = []
-        actuals = []
+        total_count = 0
 
-        # If using DDP with DistributedSampler, set epoch
-        if hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
-            dataloader.sampler.set_epoch(epoch)
+        # Example: dynamic # of contexts => pyramid: e.g. max(epochs - epoch, 5)
+        context_count = max(epochs - epoch, 5)
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Rank {rank} - Epoch {epoch + 1}/{epochs}")):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+            # Zero out grads
             optimizer.zero_grad()
-            if use_ebm and ebm_optimizer is not None:
+            if use_ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
-            input_ids = batch['input_ids'].to(device, dtype=torch.long)
-            labels = batch['labels'].to(device, dtype=torch.float)
+            # Basic fields from collate_fn
+            # Make sure 'input_ids' stays long for embeddings
+            main_ids     = batch['input_ids'].to(device, dtype=torch.long)
+            future_vals  = batch['labels'].to(device, dtype=torch.float16)  # half
+            sector_list  = batch.get('sector', None)
+            idx_list     = batch.get('idx', None)
+            B = main_ids.size(0)
 
-            if use_ebm and ebm is not None and 'context_input_ids' in batch:
-                context_input_ids = batch['context_input_ids'].to(device, dtype=torch.long)
-                # Concatenate input_ids and context_input_ids
-                selected_input_ids = torch.cat([input_ids, context_input_ids], dim=1)
-                # If sequence exceeds BLOCK_SIZE, truncate
-                max_seq_len = config.BLOCK_SIZE
-                if selected_input_ids.size(1) > max_seq_len:
-                    selected_input_ids = selected_input_ids[:, :max_seq_len]
+            # (a) If not using EBM => normal forward/back pass
+            if not use_ebm:
+                with autocast(dtype=torch.float16):
+                    preds, main_loss = model(input_ids=main_ids, targets=future_vals)
 
-                # Get embeddings for EBM
-                with torch.no_grad():
-                    article_embeddings = model.get_embeddings(input_ids)          # (batch, embed_dim)
-                    context_embeddings = model.get_embeddings(context_input_ids)  # (batch, embed_dim)
+                    # add SI, EWC, L2
+                    if si:
+                        main_loss += si.penalty()
+                    if ewc:
+                        for ewc_inst in ewc:
+                            main_loss += args.lambda_ewc * ewc_inst.penalty(model)
+                    if getattr(args, 'use_l2', False):
+                        main_loss += args.lambda_l2 * compute_l2_loss(model)
 
-                # Compute energies for EBM
-                energies = ebm(article_embeddings, context_embeddings)  # (batch,)
-                print(energies, "energy!!!")
-                ebm_loss = energies.mean()
-            else:
-                selected_input_ids = input_ids
-                ebm_loss = 0.0
-
-            with autocast():
-                outputs, loss = model(
-                    input_ids=selected_input_ids,
-                    targets=labels,
-                    use_entropy_reg=args.use_entropy_reg,
-                    lambda_entropy=args.lambda_entropy
-                )
-
-            # Add regularizations
-            if si:
-                loss += si.penalty()
-            if ewc:
-                for ewc_instance in ewc:
-                    loss += args.lambda_ewc * ewc_instance.penalty(model)
-            if getattr(args, 'use_l2', False):
-                loss += args.lambda_l2 * compute_l2_loss(model)
-
-            # Combine losses
-            if use_ebm and ebm is not None and 'context_input_ids' in batch:
-                total_batch_loss = loss + ebm_loss
-            else:
-                total_batch_loss = loss
-
-            scaler.scale(total_batch_loss).backward()
-            scaler.step(optimizer)
-            if use_ebm and ebm is not None and 'context_input_ids' in batch and ebm_optimizer is not None:
-                scaler.step(ebm_optimizer)
-            scaler.update()
-
-            total_loss += total_batch_loss.item()
-            predictions.extend(outputs.detach().cpu().numpy())
-            actuals.extend(labels.detach().cpu().numpy())
-
-            # Add to replay buffer if necessary
-            if replay_buffer:
-                replay_samples = [{
-                    'input_ids': input_ids[i].clone().detach(),
-                    'labels': labels[i].clone().detach(),
-                    'sector': batch['sector'][i]
-                } for i in range(len(labels))]
-                replay_buffer.add_examples(replay_samples, [0] * len(labels))
-
-        # Compute metrics
-        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
-        if len(predictions) > 0:
-            mse = mean_squared_error(actuals, predictions)
-            r2 = r2_score(actuals, predictions)
-        else:
-            mse, r2 = 0.0, 0.0
-
-        if rank == 0:
-            logging.info(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, MSE: {mse:.4f}, R2: {r2:.4f}")
-
-            # Save checkpoint
-            checkpoint_path = os.path.join(checkpoint_dir, f'epoch_{epoch + 1}.pt')
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            if use_ebm and ebm is not None:
-                checkpoint['ebm_state_dict'] = ebm.state_dict()
-                if ebm_optimizer is not None:
-                    checkpoint['ebm_optimizer_state_dict'] = ebm_optimizer.state_dict()
-            try:
-                torch.save(checkpoint, checkpoint_path)
-                logging.info(f"Saved checkpoint: {checkpoint_path}")
-            except RuntimeError as e:
-                logging.error(f"Error saving checkpoint at Epoch {epoch + 1}: {e}")
-
-            # Early Stopping Logic
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    logging.info(f"No improvement in loss for {patience} consecutive epochs. Stopping early.")
-                    break
-
-        # Sample from the replay buffer and train on replayed samples
-        if replay_buffer:
-            replay_batch_size = getattr(args, 'replay_batch_size', labels.size(0))
-            replay_samples = replay_buffer.sample(replay_batch_size)
-            if len(replay_samples) > 0:
-                # Prepare replay batch
-                replay_input_ids = torch.stack([s['input_ids'] for s in replay_samples]).to(device, dtype=torch.long)
-                replay_labels = torch.stack([s['labels'] for s in replay_samples]).to(device, dtype=torch.float)
-
-                with autocast():
-                    replay_outputs, replay_loss = model(
-                        input_ids=replay_input_ids,
-                        targets=replay_labels,
-                        use_entropy_reg=args.use_entropy_reg,
-                        lambda_entropy=args.lambda_entropy
-                    )
-
-                replay_loss = replay_loss * getattr(args, 'replay_buffer_weight', 1.0)
-                scaler.scale(replay_loss).backward()
+                scaler.scale(main_loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+
+                total_loss += main_loss.item() * B
+                total_count += B
+
+                # Replay buffer
+                if replay_buffer:
+                    replay_samples = []
+                    for i in range(B):
+                        replay_samples.append({
+                            'input_ids': main_ids[i].detach().cpu(),
+                            'labels': future_vals[i].detach().cpu(),
+                            'sector': sector_list[i] if sector_list else 'Unknown'
+                        })
+                    replay_buffer.add_examples(replay_samples, [0]*B)
+
+                continue  # next batch
+
+            # -----------------------------------------------------------------
+            # (b) If use EBM => multi-context approach
+            # -----------------------------------------------------------------
+            # CPU gather contexts
+            cpu_args_list = []
+            for i in range(B):
+                cpu_args_list.append((
+                    idx_list[i],
+                    df,
+                    tokenizer,
+                    epochs,
+                    epoch,
+                    context_count
+                ))
+            # parallel gather
+            with ProcessPoolExecutor() as executor:
+                all_contexts_batch = list(executor.map(parallel_context_generation_worker, cpu_args_list))
+                # shape => list[B], each => list-of-strings
+
+            chosen_contexts_toks = []
+            ebm_count = 0
+            ebm_batch_loss_accum = 0.0
+
+            # Step A) For each sample in the batch
+            for i in range(B):
+                main_article = main_ids[i].unsqueeze(0)    # [1, seq_len_main]
+                label_future = future_vals[i].unsqueeze(0) # [1,]
+                context_str_list = all_contexts_batch[i]
+                if not context_str_list:
+                    # fallback => no contexts
+                    chosen_contexts_toks.append(None)
+                    continue
+
+                # build candidate_tensors
+                candidate_tensors = []
+                for c_str in context_str_list:
+                    c_str = c_str.strip()
+                    if not c_str:
+                        continue
+                    enc = tokenizer(
+                        c_str,
+                        truncation=True,
+                        padding='max_length',
+                        max_length=config.BLOCK_SIZE,
+                        return_tensors='pt'
+                    )
+                    candidate_tensors.append(enc['input_ids'].squeeze(0))
+                if not candidate_tensors:
+                    chosen_contexts_toks.append(None)
+                    continue
+
+                candidate_tensors = torch.stack(candidate_tensors, dim=0).to(device, dtype=torch.long)
+                num_candidates = candidate_tensors.size(0)
+
+                # Step B) compute MSE for each candidate
+                # (no grad for main model here)
+                mse_vals = []
+                with torch.no_grad(), autocast(dtype=torch.float16):
+                    for c_idx in range(num_candidates):
+                        combined_tokens = torch.cat([
+                            main_article,
+                            candidate_tensors[c_idx].unsqueeze(0)
+                        ], dim=1)
+                        if combined_tokens.size(1) > config.BLOCK_SIZE:
+                            combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
+
+                        pred_val_i, _ = model(input_ids=combined_tokens)
+                        # MSE => (pred_val - label)**2
+                        mse_i = (pred_val_i - label_future)**2
+                        mse_vals.append(mse_i.squeeze())
+
+                mse_vals_tensor = torch.stack(mse_vals, dim=0).float()  # shape => [num_candidates], as float
+
+                # Step C) EBM forward => predicted MSE => L2 to actual MSE
+                with autocast(dtype=torch.float16):
+                    # embed the main article once
+                    main_emb = model.get_embeddings(main_article).half()  # [1, embed_dim]
+                    context_embs = []
+                    for c_idx in range(num_candidates):
+                        ctx_ids = candidate_tensors[c_idx].unsqueeze(0)
+                        ctx_emb = model.get_embeddings(ctx_ids).half()  # [1, embed_dim]
+                        context_embs.append(ctx_emb.squeeze(0))
+                    context_embs = torch.stack(context_embs, dim=0)  # [num_candidates, embed_dim]
+
+                    main_emb_exp = main_emb.expand(num_candidates, -1)       # [num_candidates, embed_dim]
+                    pred_mse = ebm(main_emb_exp, context_embs).float().squeeze()
+                    # L2 difference with actual MSE
+                    ebm_loss_i = torch.mean((pred_mse - mse_vals_tensor)**2)
+
+                scaler.scale(ebm_loss_i).backward(retain_graph=True)
+                ebm_batch_loss_accum += ebm_loss_i.item() * num_candidates
+                ebm_count += num_candidates
+
+                # Step D) sample exactly 1 context => use predicted MSE => energies
+                energies = pred_mse.detach()  # shape => [num_candidates]
+                e_min, e_max = energies.min(), energies.max()
+                scaled_energies = (energies - e_min) / ((e_max - e_min) + 1e-8)
+                temperature = getattr(args, 'temperature', 1.0)
+                probs = torch.softmax(-scaled_energies / temperature, dim=0)
+                sampled_idx = torch.multinomial(probs, 1).item()
+
+                chosen_contexts_toks.append(candidate_tensors[sampled_idx])
+
+            # Step E) EBM step
+            if ebm_optimizer:
+                scaler.step(ebm_optimizer)
+                scaler.update()
+                ebm_optimizer.zero_grad()
+
+            # Step F) main model forward/back with chosen contexts
+            main_loss_accum = 0.0
+            for i in range(B):
+                if chosen_contexts_toks[i] is None:
+                    # no context => just main
+                    combined_tokens = main_ids[i].unsqueeze(0)
+                else:
+                    combined_tokens = torch.cat([
+                        main_ids[i].unsqueeze(0),
+                        chosen_contexts_toks[i].unsqueeze(0)
+                    ], dim=1)
+                if combined_tokens.size(1) > config.BLOCK_SIZE:
+                    combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
+
+                label_i = future_vals[i].unsqueeze(0)
+                with autocast(dtype=torch.float16):
+                    pred_val_i, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
+                    # add SI, EWC, L2
+                    if si:
+                        main_loss_i += si.penalty()
+                    if ewc:
+                        for ewc_inst in ewc:
+                            main_loss_i += args.lambda_ewc * ewc_inst.penalty(model)
+                    if getattr(args, 'use_l2', False):
+                        main_loss_i += args.lambda_l2 * compute_l2_loss(model)
+
+                scaler.scale(main_loss_i).backward()
+                main_loss_accum += main_loss_i.item()
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            total_loss += main_loss_accum
+            total_count += B
+
+            # replay buffer
+            if replay_buffer:
+                replay_samples = []
+                for i in range(B):
+                    replay_samples.append({
+                        'input_ids': main_ids[i].detach().cpu(),
+                        'labels': future_vals[i].detach().cpu(),
+                        'sector': sector_list[i] if sector_list else 'Unknown'
+                    })
+                replay_buffer.add_examples(replay_samples, [0]*B)
+
+        # end of epoch => average loss
+        avg_loss = total_loss / float(total_count) if total_count > 0 else 0.0
+        logging.info(f"Epoch {epoch+1} => train loss: {avg_loss:.4f}")
+
+        # Early stopping on this average loss
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                logging.info(f"Stopping early after {epoch+1} epochs (no improvement).")
+                break
+
+    logging.info("Training loop completed.")
