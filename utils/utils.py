@@ -672,43 +672,89 @@ def evaluate_model(model, dataloader, device):
     Returns:
         mse (float): Mean Squared Error on the validation set.
         r2 (float): R-squared score on the validation set.
-        sector_metrics (dict): MSE and R2 scores per sector.
+        sector_metrics (dict): MSE, R², and trend accuracy per sector.
+        overall_trend_acc (float): Overall trend accuracy across all samples.
     """
     model.eval()
     predictions = []
     actuals = []
-    sector_metrics = {}
+    oldprice_list = []  # To store current prices
+    sectors_list = []
+
+    sector_metrics = {}  # Structure: sector_metrics[sector] = {'predictions': [], 'actuals': [], 'oldprices': []}
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
+            print(batch, "batch")
             input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
+            labels = batch['labels'].to(device)          # Future price
+            old_prices = batch['old_price'].to(device)  # Current price
             sectors = batch['sector']
+
             with autocast():
                 outputs, _ = model(input_ids=input_ids)
+
             outputs = outputs.detach().cpu().numpy()
             labels = labels.cpu().numpy()
+            old_prices = old_prices.cpu().numpy()
+
+            # Accumulate overall metrics
             predictions.extend(outputs)
             actuals.extend(labels)
-            # Compute per-sector metrics
+            oldprice_list.extend(old_prices)
+            sectors_list.extend(sectors)
+
+            # Accumulate per-sector metrics
             for i, sector in enumerate(sectors):
                 if sector not in sector_metrics:
-                    sector_metrics[sector] = {'predictions': [], 'actuals': []}
+                    sector_metrics[sector] = {
+                        'predictions': [],
+                        'actuals': [],
+                        'oldprices': []
+                    }
                 sector_metrics[sector]['predictions'].append(outputs[i])
                 sector_metrics[sector]['actuals'].append(labels[i])
+                sector_metrics[sector]['oldprices'].append(old_prices[i])
 
+    # Compute Overall MSE & R2
     mse = mean_squared_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
 
-    # Calculate per-sector metrics
-    for sector in sector_metrics:
-        sector_predictions = sector_metrics[sector]['predictions']
-        sector_actuals = sector_metrics[sector]['actuals']
-        sector_mse = mean_squared_error(sector_actuals, sector_predictions)
-        sector_r2 = r2_score(sector_actuals, sector_predictions)
-        sector_metrics[sector] = {'mse': sector_mse, 'r2': sector_r2}
+    # Compute Overall Trend Accuracy
+    correct_trend = 0
+    total_samples = len(predictions)
+    for pred, act, oldp in zip(predictions, actuals, oldprice_list):
+        real_trend = np.sign(act - oldp)
+        pred_trend = np.sign(pred - oldp)
+        if real_trend == pred_trend:
+            correct_trend += 1
+    overall_trend_acc = correct_trend / total_samples if total_samples > 0 else 0.0
+
+    # Compute Per-Sector Metrics
+    for sector, values in sector_metrics.items():
+        sector_preds = values['predictions']
+        sector_acts  = values['actuals']
+        sector_oldp  = values['oldprices']
+
+        sector_mse = mean_squared_error(sector_acts, sector_preds)
+        sector_r2  = r2_score(sector_acts, sector_preds)
+
+        # Compute Trend Accuracy per Sector
+        sector_correct = 0
+        count = len(sector_preds)
+        for spred, sact, soldp in zip(sector_preds, sector_acts, sector_oldp):
+            if np.sign(sact - soldp) == np.sign(spred - soldp):
+                sector_correct += 1
+        trend_acc_sec = sector_correct / count if count > 0 else 0.0
+
+        sector_metrics[sector] = {
+            'mse': sector_mse,
+            'r2': sector_r2,
+            'trend_acc': trend_acc_sec
+        }
 
     model.train()
-    return mse, r2, sector_metrics
+    return mse, r2, sector_metrics, overall_trend_acc
 
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
     """
