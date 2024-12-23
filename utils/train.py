@@ -196,8 +196,8 @@ def train_model(
                 with torch.no_grad(), autocast(dtype=torch.float16):
                     for c_idx in range(num_candidates):
                         combined_tokens = torch.cat([
-                            main_article,
-                            candidate_tensors[c_idx].unsqueeze(0)
+                            candidate_tensors[c_idx].unsqueeze(0),
+                            main_article
                         ], dim=1)
                         if combined_tokens.size(1) > config.BLOCK_SIZE:
                             combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
