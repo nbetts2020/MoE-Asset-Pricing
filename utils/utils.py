@@ -103,7 +103,7 @@ def load_model_weights(model, weights_path, device):
 def download_models_from_s3(bucket):
     """
     Downloads the 'model' and 'models' directories from the specified S3 bucket.
-    
+
     Args:
         bucket (str): Name of the S3 bucket.
     """
@@ -138,7 +138,7 @@ def download_models_from_s3(bucket):
 def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_samples):
     """
     Generates and selects the best context based on EBM scoring.
-    
+
     Args:
         df (pd.DataFrame): The entire dataset to sample from.
         stock (str): Stock symbol to filter relevant articles.
@@ -147,16 +147,16 @@ def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_sample
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
         tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
-    
+
     Returns:
         str: The selected context string.
     """
     # Filter the dataframe based on stock and date
     filtered_df = df[df['Date'] <= pd.to_datetime(date)]
-    
+
     if filtered_df.empty:
         raise ValueError("No data available for the specified stock and date.")
-    
+
     candidates = []
     for _ in range(ebm_samples):
         # sample_articles(...) returns a list of sample_dicts; grab the first
@@ -172,7 +172,7 @@ def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_sample
     if not candidates:
         raise ValueError("No candidate contexts could be generated.")
 
-    # Score each candidate with EBM 
+    # Score each candidate with EBM
     scores = [] # embed each article and context together???
     device = next(model.parameters()).device  # or e.g. torch.device('cuda')
     for ctx in candidates:
@@ -512,7 +512,7 @@ def prepare_data(args, tokenizer):
     Prepares the data for training or updating.
     """
     percent_data = args.percent_data  # get percentage of data to use
-    
+
     random_seed = args.random_seed
 
     if args.mode == 'train':
@@ -531,7 +531,7 @@ def prepare_data(args, tokenizer):
             df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
         )
         logging.info(f"Prepared update DataLoader with {len(run_dataloader.dataset)} samples.")
-        
+
         return run_dataloader, df
     elif args.mode == 'update':
         # Load new data for updating
@@ -544,8 +544,8 @@ def prepare_data(args, tokenizer):
             df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
         )
         logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
-
-        return update_dataloader, df
+        train_df = get_data(percent_data=percent_data)
+        return update_dataloader, pd.concat([train_df, df])
     else:
         raise ValueError("Invalid mode specified in args.mode")
 
