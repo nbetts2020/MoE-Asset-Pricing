@@ -56,16 +56,19 @@ def train_model(model, optimizer, epochs, device, dataloader, args, si=None, ewc
         logging.info(f"Rank {rank}: Start of Epoch {epoch + 1}/{epochs}")
 
         # Update collate_fn with current_epoch and tokenizer
+        context_count = max(epochs - epoch, 5)
+
         dataloader.collate_fn = partial(
             custom_collate_fn,
             df=df,
             ebm=ebm,
             model=model,
-            tokenizer=tokenizer,  # Pass actual tokenizer here
+            tokenizer=tokenizer,
             device=device,
             use_ebm=use_ebm,
             total_epochs=epochs,
-            current_epoch=epoch
+            current_epoch=epoch,
+            context_count=context_count
         )
 
         total_loss = 0.0
