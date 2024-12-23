@@ -2,6 +2,7 @@
 
 import torch
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 import pandas as pd
 import logging
 import os
@@ -129,28 +130,26 @@ def format_concatenated_articles(sample: dict) -> str:
 
 def parallel_context_generation_worker(args):
     """
-    Worker function that generates context on CPU only.
-    No GPU operations or model calls here.
+    CPU-only worker. No EBM or GPU ops here.
+    Returns multiple raw context strings (or CPU tensors) for each sample.
     """
-    idx, df, tokenizer, total_epochs, current_epoch = args
-    # Generate sampled articles
-    print(idx, current_epoch, df, "ea")
-    sampled = sample_articles(df, [idx])
-    sampled_dict = sampled[0]
-    # Format concatenated articles as a CPU-only string
-    context_str = format_concatenated_articles(sampled_dict)
-    print(context_str, idx, "llk")
-    # Tokenize on CPU with half BLOCK_SIZE
-    encoding = tokenizer(
-        context_str,
-        truncation=True,
-        padding='max_length',
-        max_length= config.BLOCK_SIZE,
-        return_tensors='pt'
-    )
+    (idx, df, tokenizer, total_epochs, current_epoch, context_count) = args
+    # We'll store multiple raw context strings
+    candidate_contexts = []
 
-    # Return CPU tensors only (no GPU ops)
-    return encoding['input_ids'].squeeze(0)  # Still on CPU
+    for _ in range(context_count):
+        # 1) sample articles
+        sampled_list = sample_articles(df, index_list=[idx])
+        if not sampled_list:
+            continue
+        sample_dict = sampled_list[0]
+        # 2) format the concatenated context as a CPU-only string
+        context_str = format_concatenated_articles(sample_dict)
+        # store the raw string for now
+        candidate_contexts.append(context_str)
+    print(len(candidate_contexts), "llal")
+    # Just return all candidate strings
+    return candidate_contexts
 
 class ArticlePriceDataset(Dataset):
     def __init__(self,
@@ -207,82 +206,124 @@ class ArticlePriceDataset(Dataset):
 def worker_wrapper(args):
     return parallel_context_generation_worker(*args)
 
-def custom_collate_fn(batch, df, ebm, model, tokenizer, device, use_ebm, total_epochs, current_epoch):
+def custom_collate_fn(
+    batch,
+    df,
+    ebm,
+    model,
+    tokenizer,
+    device,
+    use_ebm,
+    total_epochs,
+    current_epoch,
+    context_count=5,
+    temperature=0.7  # for Boltzmann
+):
     """
-    Custom collate function.
-    CPU only in parallel processes.
-    GPU ops (model.get_embeddings(), ebm) in the main process.
+    CPU parallel for multiple contexts, then select one via Monte Carlo on GPU.
     """
     input_ids = []
     labels = []
-    # If use_ebm, we need to generate contexts using parallel workers
-    # but no GPU ops inside workers
-    context_input_ids = [] if use_ebm else None
 
-    # Collect indices for parallel processing if use_ebm
-    args_list = []
+    # We'll store final chosen contexts here, if use_ebm is True
+    chosen_context_ids = [] if use_ebm else None
+
+    # Step A: Gather CPU-worker args if EBM is used
     if use_ebm:
+        args_list = []
         for sample in batch:
             idx = sample['idx']
-            # Note: Passing only CPU related args, no GPU ops
-            args_list.append((idx, df, tokenizer, total_epochs, current_epoch))
-    print("aaaA")
-    # Run parallel context generation (CPU only)
-    if use_ebm:
+            args_list.append((idx, df, tokenizer, total_epochs, current_epoch, context_count))
+        # Launch CPU worker to get multiple context strings
         with ProcessPoolExecutor() as executor:
-            results = list(executor.map(parallel_context_generation_worker, args_list))
-        # results is a list of CPU tensors (context input_ids), one per sample
+            # results => list of [candidate_str1, candidate_str2, ...] per sample
+            all_candidates = list(executor.map(parallel_context_generation_worker, args_list))
     else:
-        results = None
-    print("bbbb")
-    # Now construct the main batch
+        all_candidates = None
+
+    print(all_candidates[0][0], len(all_candidates), len(all_candidates[0]), "ahhhh!")
+
+    # Step B: Convert main article input to Tensors
     for i, sample in enumerate(batch):
-        # input_ids and labels are presumably CPU tensors or arrays
         inp = sample['input_ids']
         lbl = sample['labels']
-        # Ensure they are tensors
         if not isinstance(inp, torch.Tensor):
             inp = torch.tensor(inp, dtype=torch.long)
         if not isinstance(lbl, torch.Tensor):
             lbl = torch.tensor(lbl, dtype=torch.float)
-
         input_ids.append(inp)
         labels.append(lbl)
 
-        if use_ebm:
-            # Append the CPU result for context_input_ids
-            context_input_ids.append(results[i])
+    # Step C: If EBM, handle multiple contexts per sample
+    if use_ebm:
+        # We'll do the entire selection on GPU
+        # Build final (per-sample) chosen context
+        for i, candidate_strings in enumerate(all_candidates):
+            if not candidate_strings:
+                # Fallback if no candidate contexts
+                chosen_context_ids.append(torch.zeros(1, dtype=torch.long))
+                continue
 
-    # Pad sequences on CPU
+            # 1) Tokenize each candidate -> shape [num_candidates, seq_len]
+            candidate_tensors = []
+            for ctx_str in candidate_strings:
+                enc = tokenizer(
+                    ctx_str,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=config.BLOCK_SIZE,
+                    return_tensors='pt'
+                )
+                candidate_tensors.append(enc['input_ids'].squeeze(0))
+
+            candidate_tensors = torch.stack(candidate_tensors, dim=0).to(device)
+              # shape: [num_candidates, seq_len]
+
+            # 2) Compute EBM energies
+            with torch.no_grad():
+                article_emb = model.get_embeddings(input_ids[i].unsqueeze(0).to(device))
+                  # shape [1, embed_dim], expand to match
+                # Compute embeddings for each candidate context
+                context_emb = model.get_embeddings(candidate_tensors) # [num_candidates, embed_dim]
+
+                # EBM => shape [num_candidates]
+                # Expand article_emb to match
+                expanded_article_emb = article_emb.expand(context_emb.size(0), -1)
+                energies = ebm(expanded_article_emb, context_emb) # [num_candidates]
+
+            # 3) Scale energies (min-max) then transform into probabilities
+            e_min = energies.min()
+            e_max = energies.max()
+            scaled = (energies - e_min) / ( (e_max - e_min) + 1e-8 )  # in [0..1]
+            # Boltzmann
+            probs = F.softmax(-scaled / temperature, dim=0)  # shape [num_candidates]
+
+            # 4) Sample exactly 1 context
+            sampled_idx = torch.multinomial(probs, 1).item()
+
+            # 5) Chosen context tokens -> store
+            chosen_context = candidate_tensors[sampled_idx]  # shape [seq_len]
+            chosen_context_ids.append(chosen_context)
+    # else no EBM => skip
+
+    # Step D: pad sequences on CPU
     input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
     labels_tensor = torch.stack(labels)
 
-    if use_ebm:
-        context_input_ids_padded = torch.nn.utils.rnn.pad_sequence(context_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-
-        # NOW move data to GPU and do GPU operations
-        input_ids_padded = input_ids_padded.to(device)
-        labels_tensor = labels_tensor.to(device)
-        context_input_ids_padded = context_input_ids_padded.to(device)
-
-        # Now run model.get_embeddings() here
-        with torch.no_grad():
-            article_embeddings = model.get_embeddings(input_ids_padded)        # GPU op
-            context_embeddings = model.get_embeddings(context_input_ids_padded) # GPU op
-
-        # Compute energies with EBM here if needed, store them in batch if you want.
-        # Or just return and handle EBM in train loop. Typically done in the train loop.
+    # Step E: If no EBM, just return
+    if not use_ebm:
         return {
-            'input_ids': input_ids_padded,
-            'labels': labels_tensor,
-            'context_input_ids': context_input_ids_padded,
-            'article_embeddings': article_embeddings,
-            'context_embeddings': context_embeddings
+            'input_ids': input_ids_padded.to(device),
+            'labels': labels_tensor.to(device)
         }
-    else:
-        # If no EBM, just return CPU (or move to GPU in train loop)
-        # Usually you'd want to move them to GPU in train loop anyway
-        return {
-            'input_ids': input_ids_padded,
-            'labels': labels_tensor
-        }
+
+    # If EBM => also pad the single chosen contexts
+    # shape => [batch_size, chosen_seq_len]
+    context_input_ids_padded = torch.nn.utils.rnn.pad_sequence(chosen_context_ids, batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
+
+    # Return final
+    return {
+        'input_ids': input_ids_padded.to(device),
+        'labels': labels_tensor.to(device),
+        'context_input_ids': context_input_ids_padded
+    }
