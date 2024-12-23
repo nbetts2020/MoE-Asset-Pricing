@@ -101,7 +101,7 @@ def main():
     parser.add_argument('--n_layer', type=int, help='Number of transformer blocks')
     parser.add_argument('--block_size', type=int, help='Maximum sequence length')
     parser.add_argument('--epochs', type=int, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
 
     args = parser.parse_args()
 
