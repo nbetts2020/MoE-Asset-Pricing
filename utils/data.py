@@ -205,7 +205,7 @@ class ArticlePriceDataset(Dataset):
         sample = {
             'input_ids': input_ids,
             'labels': torch.tensor(future_price, dtype=torch.float),
-            'sector': sector,
+            'sector': sector if sector is not None else "Unknown Sector",
             'idx': int(idx),
 
             # Provide the old/current price explicitly:
