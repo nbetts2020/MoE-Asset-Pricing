@@ -29,7 +29,8 @@ def train_model(
     df=None,              # entire DataFrame for sampling contexts
     ebm=None,             # EBM model
     ebm_optimizer=None,   # EBM optimizer
-    tokenizer=None
+    tokenizer=None,
+    top25_dict=None
 ):
     """
     Multi-context EBM approach in half precision for flash-attn.
@@ -148,10 +149,11 @@ def train_model(
                     tokenizer,
                     epochs,
                     epoch,
-                    context_count
+                    context_count,
+                    top25_dict
                 ))
             # parallel gather
-            with ProcessPoolExecutor() as executor:
+            with ProcessPoolExecutor(max_workers=4) as executor:
                 all_contexts_batch = list(executor.map(parallel_context_generation_worker, cpu_args_list))
                 # shape => list[B], each => list-of-strings
 
