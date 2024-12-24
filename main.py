@@ -185,6 +185,13 @@ def main():
         # Prepare data
         train_dataloader, df = prepare_data(args, tokenizer)
 
+        # Cache top-25 'percentage_change' for each symbol
+        df['abs_percentage_change'] = df['Percentage Change'].abs()
+        df = df.dropna(subset=['abs_percentage_change'])
+
+        top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(lambda x: x.nlargest(25, 'abs_percentage_change'))
+        top25_dict = {symbol: group.to_dict(orient='records') for symbol, group in top25_by_symbol.groupby('Symbol')}
+
         # Initialize EBM if using
         ebm = None
         ebm_optimizer = None
@@ -230,7 +237,8 @@ def main():
             df=df,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            top25_dict=top25_dict
         )
         logging.info("Training completed.")
 
