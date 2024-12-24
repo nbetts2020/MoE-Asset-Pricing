@@ -133,13 +133,13 @@ def parallel_context_generation_worker(args):
     CPU-only worker. No EBM or GPU ops here.
     Returns multiple raw context strings (or CPU tensors) for each sample.
     """
-    (idx, df, tokenizer, total_epochs, current_epoch, context_count) = args
+    (idx, df, tokenizer, total_epochs, current_epoch, context_count, top25_dict) = args
     # We'll store multiple raw context strings
     candidate_contexts = []
 
     for _ in range(context_count):
         # 1) sample articles
-        sampled_list = sample_articles(df, index_list=[idx])
+        sampled_list = sample_articles(df, index_list=[idx], top25_dict=top25_dict)
         if not sampled_list:
             continue
         sample_dict = sampled_list[0]
