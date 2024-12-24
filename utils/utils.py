@@ -70,8 +70,9 @@ def get_data(percent_data=100.0, run=False, update=False):
 
     df.reset_index(drop=True, inplace=True)
 
-    split1 = int(len(df) * 0.8)
-    split2 = int(len(df) * 0.9)
+    # 70/15/15 split
+    split1 = int(len(df) * 0.7)
+    split2 = int(len(df) * 0.85)
 
     if run:
         df = df[split1:split2]
