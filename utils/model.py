@@ -176,7 +176,7 @@ class SparseMoELanguageModel(nn.Module):
         # Apply gradient checkpointing only during training
         for block in self.blocks:
             if self.training:
-                x, entropy_loss = checkpoint(block, x)
+                x, entropy_loss = checkpoint(block, x, use_reentrant=False)
             else:
                 x, entropy_loss = block(x)
 
