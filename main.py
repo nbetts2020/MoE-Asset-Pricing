@@ -228,7 +228,7 @@ def main():
         # If using DDP, wrap AFTER param-grouping
         if use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                              output_device=local_rank)
+                                                              output_device=local_rank, find_unused_parameters=True)
             logging.info("Model wrapped with DistributedDataParallel.")
 
         # Prepare data
