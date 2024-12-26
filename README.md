@@ -86,7 +86,7 @@ Inspiration for the basic components of this architecture were taken from terrif
 
 ## Energy-Based Model and Monte Carlo Sampling for Optimal Context Selection [^6][^7][^8]
 
-*Work in Progress* The inspiration for a context optimal algorithm (**C***), comes from the belief that scalable transformer-based models are highly capable, yet substantially more capable when given tools such as prompt optimization and/or test-time compute, facilitating the model's ability to focus on the most pertinent information for improved predictions. In order to enhance the selection of optimal context for each article, this project incorporates an **Energy-Based Model (EBM)** coupled with **Monte Carlo Sampling**. The EBM is designed as a separate feedforward neural network that assigns a scalar energy value to each article-context pair. Specifically, for a given article $A$ and a generated context $C$, the EBM computes the energy $E(A, C)$ as follows:
+The inspiration for a context optimal algorithm (**C***), comes from the belief that scalable transformer-based models are highly capable, yet substantially more capable when given tools such as prompt optimization and/or test-time compute, facilitating the model's ability to focus on the most pertinent information for improved predictions. In order to enhance the selection of optimal context for each article, this project incorporates an **Energy-Based Model (EBM)** coupled with **Monte Carlo Sampling**. The EBM is designed as a separate feedforward neural network that assigns a scalar energy value to each article-context pair. Specifically, for a given article $A$ and a generated context $C$, the EBM computes the energy $E(A, C)$ as follows:
 
 $$
 E(A, C) = \text{EBM}(f(A), f(C))
