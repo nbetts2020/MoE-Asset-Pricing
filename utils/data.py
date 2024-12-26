@@ -197,7 +197,7 @@ class ArticlePriceDataset(Dataset):
             article,
             truncation=True,
             padding='max_length',
-            max_length= 1024, #config.BLOCK_SIZE,
+            max_length= config.BLOCK_SIZE,
             return_tensors='pt'
         )
         input_ids = input_encoding['input_ids'].squeeze(0)
