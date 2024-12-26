@@ -87,7 +87,7 @@ def train_model(
         total_count = 0
 
         # Example: dynamic # of contexts => pyramid: e.g. max(epochs - epoch, 5)
-        context_count = max(epochs - epoch, 5)
+        context_count = args.ebm_num_samples_train if args.ebm_num_samples_train else max(epochs - epoch, 5)
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
             # Zero out grads
