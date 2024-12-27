@@ -55,6 +55,8 @@ def main():
                         help="Name of the pretrained tokenizer to use")
     parser.add_argument('--model', type=str, default=None,
                         help="Hugging Face repository ID to load the model from.")
+    parser.add_argument('--save_model_name', type=str, default=None,
+                        help="Name of saved model.")
 
     # Secondary modes and catastrophic forgetting
     parser.add_argument('--test', action='store_true',
