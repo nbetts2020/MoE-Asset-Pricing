@@ -22,6 +22,7 @@ SC454k is a dataset of roughly 454k news articles and press releases related to 
 - **articleType**: value denoting the type of 'Article', either 'News' or 'Press Release'
 - **Publication**: source responsible for publishing the 'Article' (e.g., The Motley Fool)
 - **Author**: person or entity responsible for publishing the 'Article'. May appear as an entity similar to the 'Publication' (e.g., Publication: Zacks, Author: Zacks Equity Research) or as individual person (e.g., Publication: Validea, Author: John Reese)
+- **Risk_Free_Rate**: annualized 1-month U.S. Treasury bill yield at the time of the article's publication - rate is sourced from Federal Reserve Economic Data (FRED), where values are expressed as decimals
 - **weighted_avg_x_hours**: stock price 'x' hours away from 'Date' (calculated from a weighted average of the 8 closest stock prices to 'Date')
   
 **Scraping/Pairing Market Data**
