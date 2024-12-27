@@ -272,7 +272,14 @@ def get_model_from_hf(model_repo_id, device):
 
     return model
 
-def process_data(df, tokenizer):
+def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
+    """
+    Optionally format the data using a reduced EBM-like approach:
+      - 30-day window
+      - up to 3 articles for each category (markets, industry, sector)
+      - up to 5 articles for 'last_8'
+    If use_ebm_format=False, revert to the original approach.
+    """
     articles = []
     prices = []
     sectors = []
@@ -282,43 +289,144 @@ def process_data(df, tokenizer):
     symbols = []
     industries = []
 
-    grouped = df.groupby('Symbol', sort=False)
+    # Your original approach: No EBM-like sampling
+    if not use_ebm_format:
+        grouped = df.groupby('Symbol', sort=False)
 
-    for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
-        current_symbol = row.get('Symbol', 'Unknown Symbol')
-        current_date = row.get('Date', pd.Timestamp('1970-01-01'))
-        symbols.append(current_symbol)
-        industries.append(row.get('Industry', 'Unknown Industry'))
+        for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
+            current_symbol = row.get('Symbol', 'Unknown Symbol')
+            current_date = row.get('Date', pd.Timestamp('1970-01-01'))
 
-        # Build the concatenated text using .get() with default values
-        concatenated_text = (
-            "Symbol: " + str(row.get('Symbol', 'N/A')) +
-            "\nSecurity: " + str(row.get('Security', 'N/A')) +
-            "\nRelated Stocks/Topics: " + str(row.get('RelatedStocksList', 'N/A')) +
-            "\nArticle Content: " + str(row.get('Article', 'N/A')) +
-            "\nArticle Title: " + str(row.get('Title', 'N/A')) +
-            "\nArticle Type: " + str(row.get('articleType', 'N/A')) +
-            "\nArticle Publication: " + str(row.get('Publication', 'N/A')) +
-            "\nPublication Author: " + str(row.get('Author', 'N/A')) +
-            "\nStock Price 4 days before: " + str(row.get('weighted_avg_-96_hrs', 'N/A')) +
-            "\nStock Price 2 days before: " + str(row.get('weighted_avg_-48_hrs', 'N/A')) +
-            "\nStock Price 1 day before: " + str(row.get('weighted_avg_-24_hrs', 'N/A')) +
-            "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A'))
-        )
+            # Build your old-style concatenation
+            concatenated_text = (
+                "Symbol: " + str(row.get('Symbol', 'N/A')) +
+                "\nSecurity: " + str(row.get('Security', 'N/A')) +
+                "\nRelated Stocks/Topics: " + str(row.get('RelatedStocksList', 'N/A')) +
+                "\nArticle Content: " + str(row.get('Article', 'N/A')) +
+                "\nArticle Title: " + str(row.get('Title', 'N/A')) +
+                "\nArticle Type: " + str(row.get('articleType', 'N/A')) +
+                "\nArticle Publication: " + str(row.get('Publication', 'N/A')) +
+                "\nPublication Author: " + str(row.get('Author', 'N/A')) +
+                "\nStock Price 4 days before: " + str(row.get('weighted_avg_-96_hrs', 'N/A')) +
+                "\nStock Price 2 days before: " + str(row.get('weighted_avg_-48_hrs', 'N/A')) +
+                "\nStock Price 1 day before: " + str(row.get('weighted_avg_-24_hrs', 'N/A')) +
+                "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A'))
+            )
 
-        articles.append(concatenated_text)
-        prices.append(row.get('weighted_avg_720_hrs', 0.0))
-        sectors.append(row.get('Sector', 'Unknown Sector'))
-        dates.append(current_date)
-        related_stocks_list.append(row.get('RelatedStocksList', ''))
-        prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
+            articles.append(concatenated_text)
+            prices.append(row.get('weighted_avg_720_hrs', 0.0))
+            sectors.append(row.get('Sector', 'Unknown Sector'))
+            dates.append(current_date)
+            related_stocks_list.append(row.get('RelatedStocksList', ''))
+            prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
+            symbols.append(current_symbol)
+            industries.append(row.get('Industry', 'Unknown Industry'))
+
+    # EBM-like approach (reduced sampling)
+    else:
+        # We'll replicate a single-sample approach per row using a 30-day lookback
+        from datetime import timedelta
+
+        def safe_sample(data, n):
+            if len(data) == 0:
+                return pd.DataFrame()
+            import random
+            return data.sample(n=min(n, len(data)), random_state=random.randint(0, 10000))
+
+        for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
+            current_symbol = row.get('Symbol', 'Unknown Symbol')
+            current_date = row.get('Date', pd.Timestamp('1970-01-01'))
+
+            # Define 30-day lookback
+            start_date = current_date - pd.Timedelta(days=30)
+
+            # Filter articles within [start_date, current_date)
+            date_filtered = df[(df['Date'] >= start_date) & (df['Date'] < current_date)]
+
+            # Category sampling
+            # 1) markets
+            markets = date_filtered[
+                date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)
+                & (date_filtered['Symbol'] != current_symbol)
+            ]
+            markets_sample = safe_sample(markets, 3)
+
+            # 2) industry
+            target_industry = row.get('Industry', 'Unknown Industry')
+            industry_df = date_filtered[
+                (date_filtered['Industry'] == target_industry)
+                & (date_filtered['Symbol'] != current_symbol)
+            ]
+            industry_sample = safe_sample(industry_df, 3)
+
+            # 3) sector
+            target_sector = row.get('Sector', 'Unknown Sector')
+            sector_df = date_filtered[
+                (date_filtered['Sector'] == target_sector)
+                & (date_filtered['Symbol'] != current_symbol)
+            ]
+            sector_sample = safe_sample(sector_df, 3)
+
+            # 4) last_5 (instead of last_8)
+            #   Sort by date descending, take up to 5
+            symbol_df = df[(df['Symbol'] == current_symbol) & (df['Date'] < current_date)]
+            last_5 = symbol_df.sort_values(by='Date', ascending=False).head(5).sort_values(by='Date')
+
+            # Build a custom EBM-like concatenation
+            ebm_like_text = []
+            ebm_like_text.append("EBM-like Format:")
+            ebm_like_text.append("\nMarkets (up to 3):")
+            for _, mrow in markets_sample.iterrows():
+                ebm_like_text.append(
+                    f"Date: {mrow.get('Date', pd.Timestamp('1970-01-01'))}\n"
+                    f"Title: {mrow.get('Title', 'N/A')}\n"
+                    f"Article: {mrow.get('Article', 'N/A')}\n"
+                )
+
+            ebm_like_text.append("\nIndustry (up to 3):")
+            for _, irow in industry_sample.iterrows():
+                ebm_like_text.append(
+                    f"Date: {irow.get('Date', pd.Timestamp('1970-01-01'))}\n"
+                    f"Title: {irow.get('Title', 'N/A')}\n"
+                    f"Article: {irow.get('Article', 'N/A')}\n"
+                )
+
+            ebm_like_text.append("\nSector (up to 3):")
+            for _, srow in sector_sample.iterrows():
+                ebm_like_text.append(
+                    f"Date: {srow.get('Date', pd.Timestamp('1970-01-01'))}\n"
+                    f"Title: {srow.get('Title', 'N/A')}\n"
+                    f"Article: {srow.get('Article', 'N/A')}\n"
+                )
+
+            ebm_like_text.append("\nLast 5 Articles for Current Stock:")
+            for _, lrow in last_5.iterrows():
+                ebm_like_text.append(
+                    f"Symbol: {lrow.get('Symbol', 'Unknown Symbol')}\n"
+                    f"Title: {lrow.get('Title', 'N/A')}\n"
+                    f"Article: {lrow.get('Article', 'N/A')}\n"
+                )
+
+            # Convert list to a single string
+            concatenated_text = "\n".join(ebm_like_text)
+
+            # Append to final lists
+            articles.append(concatenated_text)
+            prices.append(row.get('weighted_avg_720_hrs', 0.0))
+            sectors.append(target_sector)
+            dates.append(current_date)
+            related_stocks_list.append(row.get('RelatedStocksList', ''))
+            prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
+            symbols.append(current_symbol)
+            industries.append(row.get('Industry', 'Unknown Industry'))
 
     return articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries
 
-def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None):
-    articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries = process_data(df, tokenizer)
+def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None):
+    articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates = process_data(df, tokenizer, use_ebm_format=args.use_ebm_format, top25_dict=top25_dict)
+    print(articles, "articles")
     dataset = ArticlePriceDataset(
-        articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, tokenizer, config.EPOCHS, use_ebm=args.use_ebm if args else False
+        articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates, tokenizer, config.EPOCHS, use_ebm=args.use_ebm if args else False
     )
 
     if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
@@ -519,18 +627,40 @@ def prepare_data(args, tokenizer):
 
     if args.mode == 'train':
         df = get_data(percent_data=percent_data)
+        top25_dict = None
+        if args.use_ebm_format:
+            df['abs_percentage_change'] = df['Percentage Change'].abs()
+            df = df.dropna(subset=['abs_percentage_change'])
+            top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
+                lambda x: x.nlargest(25, 'abs_percentage_change')
+            )
+            top25_dict = {
+                symbol: group.to_dict(orient='records')
+                for symbol, group in top25_by_symbol.groupby('Symbol')
+            }
 
         train_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args, top25_dict=top25_dict
         )
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
-        return train_dataloader, df
+        return train_dataloader, df, top25_dict
     elif args.mode == 'run':
         df = get_data(percent_data=percent_data, run=True)
+        top25_dict = None
+        if args.use_ebm_format:
+            df['abs_percentage_change'] = df['Percentage Change'].abs()
+            df = df.dropna(subset=['abs_percentage_change'])
+            top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
+                lambda x: x.nlargest(25, 'abs_percentage_change')
+            )
+            top25_dict = {
+                symbol: group.to_dict(orient='records')
+                for symbol, group in top25_by_symbol.groupby('Symbol')
+            }
 
         run_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args, top25_dict=top25_dict
         )
         logging.info(f"Prepared update DataLoader with {len(run_dataloader.dataset)} samples.")
 
@@ -541,13 +671,25 @@ def prepare_data(args, tokenizer):
             df = get_new_data(args.update_url)
         else:
             df = get_data(percent_data=percent_data, update=True)
+        top25_dict = None
+        if args.use_ebm_format:
+            df['abs_percentage_change'] = df['Percentage Change'].abs()
+            df = df.dropna(subset=['abs_percentage_change'])
+            top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
+                lambda x: x.nlargest(25, 'abs_percentage_change')
+            )
+            top25_dict = {
+                symbol: group.to_dict(orient='records')
+                for symbol, group in top25_by_symbol.groupby('Symbol')
+            }
 
         update_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args, top25_dict=top25_dict
         )
+
         logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
         train_df = get_data(percent_data=percent_data)
-        return update_dataloader, pd.concat([train_df, df])
+        return update_dataloader, pd.concat([train_df, df]), top25_dict
     else:
         raise ValueError("Invalid mode specified in args.mode")
 
@@ -665,65 +807,74 @@ def compute_l2_loss(model):
 
 def evaluate_model(model, dataloader, device):
     """
-    Evaluate the model on a validation set.
+    Evaluate the model on a validation/test set and compute metrics including Sharpe Ratio.
 
     Args:
         model (nn.Module): The trained model.
-        dataloader (DataLoader): DataLoader for the validation set.
+        dataloader (DataLoader): DataLoader for the validation/test set.
         device (torch.device): Device to perform computations on.
 
     Returns:
         mse (float): Mean Squared Error on the validation set.
         r2 (float): R-squared score on the validation set.
-        sector_metrics (dict): MSE, R², and trend accuracy per sector.
+        sector_metrics (dict): Dictionary of MSE, R², and trend accuracy per sector.
         overall_trend_acc (float): Overall trend accuracy across all samples.
+        sharpe_ratio (float): Sharpe Ratio computed on model's predicted returns.
     """
     model.eval()
     predictions = []
     actuals = []
-    oldprice_list = []  # To store current prices
+    oldprice_list = []     # Current (old) price
     sectors_list = []
+    riskfree_list = []     # Per-sample risk-free rate (monthly)
 
-    sector_metrics = {}  # Structure: sector_metrics[sector] = {'predictions': [], 'actuals': [], 'oldprices': []}
+    sector_metrics = {}    # sector -> { 'predictions': [], 'actuals': [], 'oldprices': [], 'riskfree': [] }
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            print(batch, "batch")
+            # Ensure your dataset includes 'risk_free_rate'
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)          # Future price
-            old_prices = batch['old_price'].to(device)  # Current price
+            old_prices = batch['old_price'].to(device)   # Current price
             sectors = batch['sector']
+            risk_free_rate = batch['risk_free_rate'].to(device)  # Monthly rate as decimal
 
-            with autocast():
+            # Forward pass
+            with torch.cuda.amp.autocast():
                 outputs, _ = model(input_ids=input_ids)
 
-            outputs = outputs.detach().cpu().numpy()
-            labels = labels.cpu().numpy()
-            old_prices = old_prices.cpu().numpy()
+            # Move predictions & labels to CPU for metric calculations
+            outputs_np = outputs.detach().cpu().numpy().flatten()  # Ensure it's a 1D array
+            labels_np = labels.detach().cpu().numpy()
+            old_prices_np = old_prices.detach().cpu().numpy()
+            rf_monthly_np = risk_free_rate.detach().cpu().numpy()
 
-            # Accumulate overall metrics
-            predictions.extend(outputs)
-            actuals.extend(labels)
-            oldprice_list.extend(old_prices)
+            # Collect overall stats
+            predictions.extend(outputs_np)
+            actuals.extend(labels_np)
+            oldprice_list.extend(old_prices_np)
+            riskfree_list.extend(rf_monthly_np)
             sectors_list.extend(sectors)
 
-            # Accumulate per-sector metrics
+            # Sector-wise accumulation
             for i, sector in enumerate(sectors):
                 if sector not in sector_metrics:
                     sector_metrics[sector] = {
                         'predictions': [],
-                        'actuals': [],
-                        'oldprices': []
+                        'actuals':     [],
+                        'oldprices':   [],
+                        'riskfree':    []
                     }
-                sector_metrics[sector]['predictions'].append(outputs[i])
-                sector_metrics[sector]['actuals'].append(labels[i])
-                sector_metrics[sector]['oldprices'].append(old_prices[i])
+                sector_metrics[sector]['predictions'].append(outputs_np[i])
+                sector_metrics[sector]['actuals'].append(labels_np[i])
+                sector_metrics[sector]['oldprices'].append(old_prices_np[i])
+                sector_metrics[sector]['riskfree'].append(rf_monthly_np[i])
 
-    # Compute Overall MSE & R2
+    # ---- Standard Overall MSE & R2 ----
     mse = mean_squared_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
 
-    # Compute Overall Trend Accuracy
+    # ---- Overall Trend Accuracy ----
     correct_trend = 0
     total_samples = len(predictions)
     for pred, act, oldp in zip(predictions, actuals, oldprice_list):
@@ -733,31 +884,43 @@ def evaluate_model(model, dataloader, device):
             correct_trend += 1
     overall_trend_acc = correct_trend / total_samples if total_samples > 0 else 0.0
 
-    # Compute Per-Sector Metrics
+    # ---- Compute Sharpe Ratio ----
+    # Since Risk_Free_Rate is already monthly, no division is needed
+    predicted_excess_returns = (np.array(predictions) - np.array(oldprice_list)) / (np.array(oldprice_list) + 1e-12) - np.array(riskfree_list)
+
+    # Compute mean and standard deviation of excess returns
+    mean_excess = np.mean(predicted_excess_returns)
+    std_excess = np.std(predicted_excess_returns, ddof=1)  # Sample standard deviation
+
+    # Compute Sharpe Ratio
+    sharpe_ratio = mean_excess / std_excess if std_excess > 1e-12 else 0.0
+
+    # ---- Compute Per-Sector Metrics (including trend accuracy) ----
     for sector, values in sector_metrics.items():
-        sector_preds = values['predictions']
-        sector_acts  = values['actuals']
-        sector_oldp  = values['oldprices']
+        spreds = values['predictions']
+        sacts = values['actuals']
+        soldp = values['oldprices']
+        sriskf = values['riskfree']
 
-        sector_mse = mean_squared_error(sector_acts, sector_preds)
-        sector_r2  = r2_score(sector_acts, sector_preds)
+        sector_mse = mean_squared_error(sacts, spreds)
+        sector_r2 = r2_score(sacts, spreds)
 
-        # Compute Trend Accuracy per Sector
-        sector_correct = 0
-        count = len(sector_preds)
-        for spred, sact, soldp in zip(sector_preds, sector_acts, sector_oldp):
-            if np.sign(sact - soldp) == np.sign(spred - soldp):
-                sector_correct += 1
-        trend_acc_sec = sector_correct / count if count > 0 else 0.0
+        # Trend Accuracy
+        sec_correct = 0
+        count = len(spreds)
+        for spred, sact, sold in zip(spreds, sacts, soldp):
+            if np.sign(sact - sold) == np.sign(spred - sold):
+                sec_correct += 1
+        sec_trend_acc = sec_correct / count if count > 0 else 0.0
 
         sector_metrics[sector] = {
             'mse': sector_mse,
             'r2': sector_r2,
-            'trend_acc': trend_acc_sec
+            'trend_acc': sec_trend_acc
         }
 
     model.train()
-    return mse, r2, sector_metrics, overall_trend_acc
+    return mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio
 
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
     """
