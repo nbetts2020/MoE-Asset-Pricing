@@ -319,7 +319,7 @@ def main():
         model.to(device)
 
         # Load main model weights
-        model_path = os.path.join("model", "model_weights.pth")
+        model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
         model.eval()
@@ -421,7 +421,7 @@ def main():
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.to(device)
         # Load main model weights
-        model_path = os.path.join("model", "model_weights.pth")
+        model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
         model.eval()
