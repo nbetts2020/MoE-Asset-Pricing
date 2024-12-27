@@ -619,8 +619,8 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
             state_dict = model.module.state_dict()
         else:
             state_dict = model.state_dict()
-        torch.save(state_dict, os.path.join(args.save_dir, 'model_weights.pth'))
-        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
+        torch.save(state_dict, os.path.join(args.save_dir, args.save_model_name if args.save_model_name else "model_weights.pth"))
+        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, args.save_model_name if args.save_model_name else "model_weights.pth")}'.")
 
         # Save EWC state
         if getattr(args, 'use_ewc', False) and ewc_list is not None:
@@ -812,8 +812,8 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
             state_dict = model.module.state_dict()
         else:
             state_dict = model.state_dict()
-        torch.save(state_dict, os.path.join(args.save_dir, 'model_weights.pth'))
-        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, 'model_weights.pth')}'.")
+        torch.save(state_dict, os.path.join(args.save_dir, args.save_model_name if args.save_model_name else "model_weights.pth"))
+        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, args.save_model_name if args.save_model_name else "model_weights.pth")}'.")
 
         # Save EWC state
         if getattr(args, 'use_ewc', False) and ewc_list is not None:
