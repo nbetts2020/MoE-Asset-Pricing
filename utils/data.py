@@ -161,6 +161,7 @@ class ArticlePriceDataset(Dataset):
                  prices_current: list,       # old/current price
                  symbols: list,
                  industries: list,
+                 risk_free_rates: list,
                  tokenizer,
                  total_epochs: int,
                  use_ebm: bool=False):
@@ -172,7 +173,8 @@ class ArticlePriceDataset(Dataset):
             'RelatedStocksList': related_stocks_list,
             'weighted_avg_0_hrs': prices_current,  # old/current price
             'Symbol': symbols,
-            'Industry': industries
+            'Industry': industries,
+            'Risk_Free_Rate': risk_free_rates
         })
         self.tokenizer = tokenizer
         self.total_epochs = total_epochs
@@ -209,7 +211,8 @@ class ArticlePriceDataset(Dataset):
             'idx': int(idx),
 
             # Provide the old/current price explicitly:
-            'old_price': torch.tensor(old_price, dtype=torch.float)
+            'old_price': torch.tensor(old_price, dtype=torch.float),
+            'risk_free_rate': torch.tensor(risk_free_rate, dtype=torch.float)
         }
         return sample
 
