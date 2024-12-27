@@ -105,6 +105,8 @@ def main():
                         help='Temperature parameter for Monte Carlo Sampling')
     parser.add_argument('--ebm_num_samples_train', type=int, default=1,
                         help="Number of samples the EBM generates when 'train' is active")
+    parser.add_argument('--use_ebm_format', action='store_true',
+                        help='Use simplified version of EBM formatting when using non-EBM model.')
 
     # Run params
     parser.add_argument('--ebm_num_samples', type=int, default=25,
@@ -236,18 +238,7 @@ def main():
             logging.info("Model wrapped with DistributedDataParallel.")
 
         # Prepare data
-        train_dataloader, df = prepare_data(args, tokenizer)
-
-        # Cache top-25 abs(%change) per symbol
-        df['abs_percentage_change'] = df['Percentage Change'].abs()
-        df = df.dropna(subset=['abs_percentage_change'])
-        top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
-            lambda x: x.nlargest(25, 'abs_percentage_change')
-        )
-        top25_dict = {
-            symbol: group.to_dict(orient='records')
-            for symbol, group in top25_by_symbol.groupby('Symbol')
-        }
+        train_dataloader, df, top25_dict = prepare_data(args, tokenizer)
 
         # Initialize EBM if requested
         ebm = None
@@ -415,7 +406,7 @@ def main():
         elif args.test and not args.bucket:
             raise ValueError("When evaluating on test set, provide --bucket.")
 
-        run_dataloader, df = prepare_data(args, tokenizer)
+        run_dataloader, df, top25_dict = prepare_data(args, tokenizer)
         download_models_from_s3(bucket=args.bucket)
 
         model, _ = initialize_model(args, device, init_from_scratch=True)
@@ -488,6 +479,7 @@ def main():
                 prices_current=df['weighted_avg_0_hrs'].tolist(),
                 symbols=df['Symbol'].tolist(),
                 industries=df['Industry'].tolist(),
+                risk_free_rates=df['Risk_Free_Rate'].tolist(),
                 tokenizer=tokenizer,
                 total_epochs=1,
                 use_ebm=args.use_ebm
