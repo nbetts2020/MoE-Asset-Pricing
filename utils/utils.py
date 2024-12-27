@@ -60,6 +60,7 @@ def get_data(percent_data=100.0, run=False, update=False):
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
     df.sort_values(by='Date', inplace=True)
+    df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
     df = df.head(num_samples)
 
     safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
