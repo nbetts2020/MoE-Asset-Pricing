@@ -288,6 +288,7 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
     prices_current = []
     symbols = []
     industries = []
+    risk_free_rates = []
 
     # Your original approach: No EBM-like sampling
     if not use_ebm_format:
@@ -321,6 +322,7 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
             symbols.append(current_symbol)
             industries.append(row.get('Industry', 'Unknown Industry'))
+            risk_free_rates.append(row.get('Risk_Free_Rate', 0.0))
 
     # EBM-like approach (reduced sampling)
     else:
@@ -419,8 +421,9 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
             symbols.append(current_symbol)
             industries.append(row.get('Industry', 'Unknown Industry'))
+            risk_free_rates.append(row.get('Risk_Free_Rate', 0.0))
 
-    return articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries
+    return articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None):
     articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates = process_data(df, tokenizer, use_ebm_format=args.use_ebm_format, top25_dict=top25_dict)
@@ -664,7 +667,7 @@ def prepare_data(args, tokenizer):
         )
         logging.info(f"Prepared update DataLoader with {len(run_dataloader.dataset)} samples.")
 
-        return run_dataloader, df
+        return run_dataloader, df, top25_dict
     elif args.mode == 'update':
         # Load new data for updating
         if args.update_url:
