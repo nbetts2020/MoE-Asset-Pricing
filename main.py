@@ -484,11 +484,13 @@ def main():
                 total_epochs=1,
                 use_ebm=args.use_ebm
             )
-            mse, r2, sector_metrics, overall_trend_acc = evaluate_model(model, run_dataloader, device)
+            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio = evaluate_model(model, run_dataloader, device)
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
+            print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+            logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
             print("Per-Sector Metrics:")
             for sector, metrics in sector_metrics.items():
                 print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}, "
