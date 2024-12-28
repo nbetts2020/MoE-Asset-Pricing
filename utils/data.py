@@ -195,6 +195,8 @@ class ArticlePriceDataset(Dataset):
 
         sector = row.get('Sector', 'Unknown Sector')
 
+        risk_free_rate = row.get('Risk_Free_Rate', 0.0)
+
         input_encoding = self.tokenizer(
             article,
             truncation=True,
