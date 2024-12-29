@@ -464,7 +464,7 @@ def prepare_tasks(tokenizer, args, k=3):
     # For each selected sector, create a DataLoader
     for sector in selected_sectors:
         df_task = df[df['Sector'] == sector]  # Filter data by the selected sector
-        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
+        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
         tasks.append(dataloader)
 
     return tasks
@@ -643,7 +643,7 @@ def prepare_data(args, tokenizer):
             }
 
         train_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args, top25_dict=top25_dict
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args, top25_dict=top25_dict
         )
         logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
 
@@ -663,7 +663,7 @@ def prepare_data(args, tokenizer):
             }
 
         run_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args, top25_dict=top25_dict
+            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args, top25_dict=top25_dict
         )
         logging.info(f"Prepared update DataLoader with {len(run_dataloader.dataset)} samples.")
 
