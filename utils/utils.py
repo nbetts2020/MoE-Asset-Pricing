@@ -810,56 +810,70 @@ def compute_l2_loss(model):
 
 def evaluate_model(model, dataloader, device):
     """
-    Evaluate the model on a validation/test set and compute metrics including Sharpe Ratio.
+    Evaluate the model on a validation/test set and compute metrics, including:
+      - MSE, R²
+      - Trend Accuracy
+      - Sharpe Ratio
+      - Sortino Ratio
+      - Maximum Drawdown
+      - Cumulative Returns
+
+    NOTE: For Maximum Drawdown, Cumulative Returns, and Sortino Ratio to make sense,
+          the dataset should be chronologically ordered. If samples are shuffled,
+          these measures will NOT reflect true sequential performance.
 
     Args:
         model (nn.Module): The trained model.
-        dataloader (DataLoader): DataLoader for the validation/test set.
+        dataloader (DataLoader): DataLoader for the validation/test set. It must:
+          - yield 'risk_free_rate' if computing Sharpe/Sortino Ratio
+          - yield samples in chronological order if computing MDD, Cumulative Returns
         device (torch.device): Device to perform computations on.
 
     Returns:
-        mse (float): Mean Squared Error on the validation set.
-        r2 (float): R-squared score on the validation set.
-        sector_metrics (dict): Dictionary of MSE, R², and trend accuracy per sector.
+        mse (float): Mean Squared Error.
+        r2 (float): R² Score.
+        sector_metrics (dict): MSE, R², trend_acc per sector.
         overall_trend_acc (float): Overall trend accuracy across all samples.
-        sharpe_ratio (float): Sharpe Ratio computed on model's predicted returns.
+        sharpe_ratio (float): Sharpe Ratio.
+        sortino_ratio (float): Sortino Ratio.
+        max_drawdown (float): Maximum Drawdown, in [0..1].
+        cumulative_return (float): Final (Equity - 1) after processing all returns.
     """
+
     model.eval()
     predictions = []
     actuals = []
-    oldprice_list = []     # Current (old) price
+    oldprice_list = []
     sectors_list = []
-    riskfree_list = []     # Per-sample risk-free rate (monthly)
+    riskfree_list = []  # monthly or per-period risk-free rate
 
-    sector_metrics = {}    # sector -> { 'predictions': [], 'actuals': [], 'oldprices': [], 'riskfree': [] }
+    sector_metrics = {}  # sector -> { 'predictions': [], 'actuals': [], 'oldprices': [], 'riskfree': [] }
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            # Ensure your dataset includes 'risk_free_rate'
             input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)          # Future price
-            old_prices = batch['old_price'].to(device)   # Current price
+            labels = batch['labels'].to(device)         # Future price
+            old_prices = batch['old_price'].to(device)  # Current price
             sectors = batch['sector']
-            risk_free_rate = batch['risk_free_rate'].to(device)  # Monthly rate as decimal
 
-            # Forward pass
+            # monthly risk-free rate if already in that form
+            risk_free_rate = batch['risk_free_rate'].to(device)
+
             with torch.cuda.amp.autocast():
                 outputs, _ = model(input_ids=input_ids)
 
-            # Move predictions & labels to CPU for metric calculations
-            outputs_np = outputs.detach().cpu().numpy().flatten()  # Ensure it's a 1D array
+            outputs_np = outputs.detach().cpu().numpy().flatten()  # shape [batch_size]
             labels_np = labels.detach().cpu().numpy()
             old_prices_np = old_prices.detach().cpu().numpy()
             rf_monthly_np = risk_free_rate.detach().cpu().numpy()
 
-            # Collect overall stats
             predictions.extend(outputs_np)
             actuals.extend(labels_np)
             oldprice_list.extend(old_prices_np)
             riskfree_list.extend(rf_monthly_np)
             sectors_list.extend(sectors)
 
-            # Sector-wise accumulation
+            # Sector accumulation
             for i, sector in enumerate(sectors):
                 if sector not in sector_metrics:
                     sector_metrics[sector] = {
@@ -873,42 +887,74 @@ def evaluate_model(model, dataloader, device):
                 sector_metrics[sector]['oldprices'].append(old_prices_np[i])
                 sector_metrics[sector]['riskfree'].append(rf_monthly_np[i])
 
-    # ---- Standard Overall MSE & R2 ----
+    # -- Standard MSE, R2
     mse = mean_squared_error(actuals, predictions)
-    r2 = r2_score(actuals, predictions)
+    r2  = r2_score(actuals, predictions)
 
-    # ---- Overall Trend Accuracy ----
+    # -- Trend Accuracy
     correct_trend = 0
     total_samples = len(predictions)
     for pred, act, oldp in zip(predictions, actuals, oldprice_list):
-        real_trend = np.sign(act - oldp)
+        true_trend = np.sign(act - oldp)
         pred_trend = np.sign(pred - oldp)
-        if real_trend == pred_trend:
+        if true_trend == pred_trend:
             correct_trend += 1
     overall_trend_acc = correct_trend / total_samples if total_samples > 0 else 0.0
 
-    # ---- Compute Sharpe Ratio ----
-    # Since Risk_Free_Rate is already monthly, no division is needed
-    predicted_excess_returns = (np.array(predictions) - np.array(oldprice_list)) / (np.array(oldprice_list) + 1e-12) - np.array(riskfree_list)
+    # =============================================================================
+    #  Compute time-series returns. The dataset must be chronologically sorted here.
+    # =============================================================================
+    # predicted_return[t] = (predictions[t] - oldprice_list[t]) / oldprice_list[t]
+    predicted_returns = (np.array(predictions) - np.array(oldprice_list)) / (np.array(oldprice_list) + 1e-12)
+    # If riskfree_list is already monthly, we subtract directly:
+    excess_returns = predicted_returns - np.array(riskfree_list)
 
-    # Compute mean and standard deviation of excess returns
-    mean_excess = np.mean(predicted_excess_returns)
-    std_excess = np.std(predicted_excess_returns, ddof=1)  # Sample standard deviation
+    # -- Sharpe Ratio
+    # mean / std of entire distribution of `excess_returns`
+    sharpe_numerator   = np.mean(excess_returns)
+    sharpe_denominator = np.std(excess_returns, ddof=1)  # sample std
+    sharpe_ratio = sharpe_numerator / sharpe_denominator if sharpe_denominator > 1e-12 else 0.0
 
-    # Compute Sharpe Ratio
-    sharpe_ratio = mean_excess / std_excess if std_excess > 1e-12 else 0.0
+    # -- Sortino Ratio
+    # Only consider negative returns in the denominator (downside deviation).
+    # If none are negative, we can set ratio = 0 or some large number.
+    negative_mask = (excess_returns < 0)
+    if np.any(negative_mask):
+        downside_std = np.std(excess_returns[negative_mask], ddof=1)
+        sortino_ratio = sharpe_numerator / downside_std if downside_std > 1e-12 else 0.0
+    else:
+        # e.g. no negative returns => infinite or large ratio
+        sortino_ratio = float('inf')  # or 0.0 if you prefer
 
-    # ---- Compute Per-Sector Metrics (including trend accuracy) ----
+    # -- Compute an Equity Curve for MDD & Cumulative Return
+    # Start with equity = 1.0 at time 0
+    # equity[t+1] = equity[t] * (1 + predicted_returns[t])
+    # We'll treat predicted_returns as if they are consecutive in time.
+    eq_curve = np.ones(len(predicted_returns) + 1, dtype=np.float64)
+    for i in range(len(predicted_returns)):
+        eq_curve[i+1] = eq_curve[i] * (1.0 + predicted_returns[i])
+
+    # Cumulative Return => eq_curve[-1] - 1
+    cumulative_return = eq_curve[-1] - 1.0
+
+    # Max Drawdown
+    #    drawdown[t] = (peak_so_far - eq_curve[t]) / peak_so_far
+    #    max_drawdown = np.max(drawdown[t] over t)
+    rolling_peak = np.maximum.accumulate(eq_curve)
+    drawdowns = (rolling_peak - eq_curve) / rolling_peak
+    max_drawdown = np.max(drawdowns)  # in [0..1]
+
+    # Sector-level metrics
     for sector, values in sector_metrics.items():
         spreds = values['predictions']
-        sacts = values['actuals']
-        soldp = values['oldprices']
+        sacts  = values['actuals']
+        soldp  = values['oldprices']
         sriskf = values['riskfree']
 
         sector_mse = mean_squared_error(sacts, spreds)
-        sector_r2 = r2_score(sacts, spreds)
+        sector_r2  = r2_score(sacts, spreds)
 
-        # Trend Accuracy
+        # Trend accuracy
         sec_correct = 0
         count = len(spreds)
         for spred, sact, sold in zip(spreds, sacts, soldp):
@@ -917,13 +963,22 @@ def evaluate_model(model, dataloader, device):
         sec_trend_acc = sec_correct / count if count > 0 else 0.0
 
         sector_metrics[sector] = {
-            'mse': sector_mse,
-            'r2': sector_r2,
+            'mse':       sector_mse,
+            'r2':        sector_r2,
             'trend_acc': sec_trend_acc
         }
 
     model.train()
-    return mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio
+    return (
+        mse,
+        r2,
+        sector_metrics,
+        overall_trend_acc,
+        sharpe_ratio,
+        sortino_ratio,
+        max_drawdown,
+        cumulative_return
+    )
 
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
     """
