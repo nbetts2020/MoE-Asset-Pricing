@@ -484,19 +484,64 @@ def main():
                 total_epochs=1,
                 use_ebm=args.use_ebm
             )
-            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio = evaluate_model(model, run_dataloader, device)
+            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, max_drawdown, cumulative_return = evaluate_model(model, run_dataloader, device)
+
+            # ---- Print and Log Overall Metrics ----
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
+
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
             logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+
+            print(f"Sortino Ratio: {sortino_ratio:.4f}")
+            logging.info(f"Sortino Ratio: {sortino_ratio:.4f}")
+
+            print(f"Maximum Drawdown: {max_drawdown:.4f}")
+            logging.info(f"Maximum Drawdown: {max_drawdown:.4f}")
+
+            print(f"Cumulative Return: {cumulative_return:.4f}")
+            logging.info(f"Cumulative Return: {cumulative_return:.4f}")
+
+            # ---- Print and Log Per-Sector Metrics ----
             print("Per-Sector Metrics:")
+            logging.info("Per-Sector Metrics:")
+
             for sector, metrics in sector_metrics.items():
-                print(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}, "
-                      f"Trend Accuracy: {metrics['trend_acc']:.4f}")
-                logging.info(f"Sector: {sector} - MSE: {metrics['mse']:.4f}, "
-                             f"R²: {metrics['r2']:.4f}, Trend Accuracy: {metrics['trend_acc']:.4f}")
+                # Extract sector-specific metrics
+                sector_mse = metrics.get('mse', 0.0)
+                sector_r2 = metrics.get('r2', 0.0)
+                sector_trend_acc = metrics.get('trend_acc', 0.0)
+                sector_sharpe = metrics.get('sharpe', 0.0)
+                sector_sortino = metrics.get('sortino', 0.0)
+                sector_mdd = metrics.get('max_drawdown', 0.0)
+                sector_c_return = metrics.get('cumulative_return', 0.0)
+
+                # Print sector metrics
+                print(
+                    f"Sector: {sector} - "
+                    f"MSE: {sector_mse:.4f}, "
+                    f"R²: {sector_r2:.4f}, "
+                    f"Trend Accuracy: {sector_trend_acc:.4f}, "
+                    f"Sharpe Ratio: {sector_sharpe:.4f}, "
+                    f"Sortino Ratio: {sector_sortino:.4f}, "
+                    f"Max Drawdown: {sector_mdd:.4f}, "
+                    f"Cumulative Return: {sector_c_return:.4f}"
+               )
+
+               # Log sector metrics
+               logging.info(
+                   f"Sector: {sector} - "
+                   f"MSE: {sector_mse:.4f}, "
+                   f"R²: {sector_r2:.4f}, "
+                   f"Trend Accuracy: {sector_trend_acc:.4f}, "
+                   f"Sharpe Ratio: {sector_sharpe:.4f}, "
+                   f"Sortino Ratio: {sector_sortino:.4f}, "
+                   f"Max Drawdown: {sector_mdd:.4f}, "
+                   f"Cumulative Return: {sector_c_return:.4f}"
+              )
 
     # -------------------------------------------
     # TEST_FORGETTING
