@@ -531,17 +531,17 @@ def main():
                     f"Cumulative Return: {sector_c_return:.4f}"
                )
 
-               # Log sector metrics
-               logging.info(
-                   f"Sector: {sector} - "
-                   f"MSE: {sector_mse:.4f}, "
-                   f"R²: {sector_r2:.4f}, "
-                   f"Trend Accuracy: {sector_trend_acc:.4f}, "
-                   f"Sharpe Ratio: {sector_sharpe:.4f}, "
-                   f"Sortino Ratio: {sector_sortino:.4f}, "
-                   f"Max Drawdown: {sector_mdd:.4f}, "
-                   f"Cumulative Return: {sector_c_return:.4f}"
-              )
+                # Log sector metrics
+                logging.info(
+                    f"Sector: {sector} - "
+                    f"MSE: {sector_mse:.4f}, "
+                    f"R²: {sector_r2:.4f}, "
+                    f"Trend Accuracy: {sector_trend_acc:.4f}, "
+                    f"Sharpe Ratio: {sector_sharpe:.4f}, "
+                    f"Sortino Ratio: {sector_sortino:.4f}, "
+                    f"Max Drawdown: {sector_mdd:.4f}, "
+                    f"Cumulative Return: {sector_c_return:.4f}"
+               )
 
     # -------------------------------------------
     # TEST_FORGETTING
