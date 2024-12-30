@@ -41,6 +41,9 @@ import subprocess
 import inspect
 import numpy as np
 
+from multiprocessing import Pool, cpu_count
+import random
+
 import torch.distributed as dist
 
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
@@ -272,13 +275,73 @@ def get_model_from_hf(model_repo_id, device):
 
     return model
 
-def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
+def safe_sample(data, n):
+    if len(data) == 0:
+        return pd.DataFrame()
+    return data.sample(n=min(n, len(data)), random_state=random.randint(0, 10000))
+
+def process_group(group_df, k=5):
     """
-    Optionally format the data using a reduced EBM-like approach:
-      - 30-day window
-      - up to 3 articles for each category (markets, industry, sector)
-      - up to 5 articles for 'last_8'
-    If use_ebm_format=False, revert to the original approach.
+    Process a single group of data corresponding to a single Symbol.
+
+    Args:
+        group_df (pd.DataFrame): DataFrame group for a single Symbol.
+        k (int): Number of preceding articles to include.
+
+    Returns:
+        List of tuples containing processed data.
+    """
+    processed = []
+    recent_articles = []  # To keep track of the last k articles
+
+    # Sort the group by Date ascending to ensure chronological order
+    group_df = group_df.sort_values(by='Date', ascending=True).reset_index(drop=True)
+
+    for idx, row in group_df.iterrows():
+        current_symbol = row.get('Symbol', 'Unknown Symbol')
+        current_date = row.get('Date', pd.Timestamp('1970-01-01'))
+
+        # Build concatenated text: current article + up to k previous articles
+        current_article = str(row.get('Article', 'N/A'))
+        all_articles = [current_article] + recent_articles.copy()
+        concatenated_text = "\n----\n".join(all_articles)
+
+        # Append to processed list
+        processed.append((
+            concatenated_text,
+            row.get('weighted_avg_720_hrs', 0.0),
+            row.get('Sector', 'Unknown Sector'),
+            current_date,
+            row.get('RelatedStocksList', ''),
+            row.get('weighted_avg_0_hrs', 0.0),
+            current_symbol,
+            row.get('Industry', 'Unknown Industry'),
+            row.get('Risk_Free_Rate', 0.0)
+        ))
+
+        # Update recent_articles
+        recent_articles.insert(0, current_article)  # Newest first
+        if len(recent_articles) > k:
+            recent_articles.pop()  # Remove the oldest
+
+    return processed
+
+def process_group_wrapper(args):
+    return process_group(*args)
+
+def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
+    """
+    Parallelized version of process_data for EBM-like processing.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        tokenizer: Tokenizer object (unused in this context).
+        use_ebm_format (bool): Flag to determine processing mode.
+        top25_dict (dict): Additional dictionary if needed (unused here).
+        k (int): Number of preceding articles to include.
+
+    Returns:
+        Tuple of lists containing processed data.
     """
     articles = []
     prices = []
@@ -290,17 +353,13 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
     industries = []
     risk_free_rates = []
 
-    # Your original approach: No EBM-like sampling
     if not use_ebm_format:
-        grouped = df.groupby('Symbol', sort=False)
-        print(grouped, "grouped")
-
-        # Add a tqdm progress bar here
-        for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Processing data"):
+        # Original processing with tqdm progress bar
+        for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Processing data (normal)"):
             current_symbol = row.get('Symbol', 'Unknown Symbol')
             current_date = row.get('Date', pd.Timestamp('1970-01-01'))
 
-            # Build your old-style concatenation
+            # Build concatenated text
             concatenated_text = (
                 "Symbol: " + str(row.get('Symbol', 'N/A')) +
                 "\nSecurity: " + str(row.get('Security', 'N/A')) +
@@ -315,6 +374,8 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
                 "\nStock Price 1 day before: " + str(row.get('weighted_avg_-24_hrs', 'N/A')) +
                 "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A'))
             )
+            # Optional: Print only a subset for debugging
+            # print(concatenated_text, "text!")
             articles.append(concatenated_text)
             prices.append(row.get('weighted_avg_720_hrs', 0.0))
             sectors.append(row.get('Sector', 'Unknown Sector'))
@@ -325,104 +386,35 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             industries.append(row.get('Industry', 'Unknown Industry'))
             risk_free_rates.append(row.get('Risk_Free_Rate', 0.0))
 
-    # EBM-like approach (reduced sampling)
     else:
-        from datetime import timedelta
+        # EBM-like processing with parallelization
+        # Group by 'Symbol' to allow parallel processing per group
+        grouped = df.groupby('Symbol', sort=False)
 
-        def safe_sample(data, n):
-            if len(data) == 0:
-                return pd.DataFrame()
-            import random
-            return data.sample(n=min(n, len(data)), random_state=random.randint(0, 10000))
+        # Prepare arguments for each group
+        group_args = [(group_df, k) for _, group_df in grouped]
 
-        # Add a tqdm progress bar here as well
-        for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Processing data (EBM-like)"):
-            current_symbol = row.get('Symbol', 'Unknown Symbol')
-            current_date = row.get('Date', pd.Timestamp('1970-01-01'))
+        # Determine number of workers
+        num_workers = max(1, cpu_count() - 1)  # Leave one CPU free
 
-            # Define 30-day lookback
-            start_date = current_date - pd.Timedelta(days=30)
+        with Pool(processes=num_workers) as pool:
+            # Use imap_unordered for better performance
+            results = list(tqdm(pool.imap(process_group_wrapper, group_args), 
+                                total=len(group_args), desc="Processing groups in parallel"))
 
-            # Filter articles within [start_date, current_date)
-            date_filtered = df[(df['Date'] >= start_date) & (df['Date'] < current_date)]
-
-            # Category sampling
-            # 1) markets
-            markets = date_filtered[
-                date_filtered['RelatedStocksList'].str.contains(r'\bMarkets\b', na=False)
-                & (date_filtered['Symbol'] != current_symbol)
-            ]
-            markets_sample = safe_sample(markets, 3)
-
-            # 2) industry
-            target_industry = row.get('Industry', 'Unknown Industry')
-            industry_df = date_filtered[
-                (date_filtered['Industry'] == target_industry)
-                & (date_filtered['Symbol'] != current_symbol)
-            ]
-            industry_sample = safe_sample(industry_df, 3)
-
-            # 3) sector
-            target_sector = row.get('Sector', 'Unknown Sector')
-            sector_df = date_filtered[
-                (date_filtered['Sector'] == target_sector)
-                & (date_filtered['Symbol'] != current_symbol)
-            ]
-            sector_sample = safe_sample(sector_df, 3)
-
-            # 4) last_5 (instead of last_8)
-            symbol_df = df[(df['Symbol'] == current_symbol) & (df['Date'] < current_date)]
-            last_5 = symbol_df.sort_values(by='Date', ascending=False).head(5).sort_values(by='Date')
-
-            # Build a custom EBM-like concatenation
-            ebm_like_text = []
-            ebm_like_text.append("EBM-like Format:")
-            ebm_like_text.append("\nMarkets (up to 3):")
-            for _, mrow in markets_sample.iterrows():
-                ebm_like_text.append(
-                    f"Date: {mrow.get('Date', pd.Timestamp('1970-01-01'))}\n"
-                    f"Title: {mrow.get('Title', 'N/A')}\n"
-                    f"Article: {mrow.get('Article', 'N/A')}\n"
-                )
-
-            ebm_like_text.append("\nIndustry (up to 3):")
-            for _, irow in industry_sample.iterrows():
-                ebm_like_text.append(
-                    f"Date: {irow.get('Date', pd.Timestamp('1970-01-01'))}\n"
-                    f"Title: {irow.get('Title', 'N/A')}\n"
-                    f"Article: {irow.get('Article', 'N/A')}\n"
-                )
-
-            ebm_like_text.append("\nSector (up to 3):")
-            for _, srow in sector_sample.iterrows():
-                ebm_like_text.append(
-                    f"Date: {srow.get('Date', pd.Timestamp('1970-01-01'))}\n"
-                    f"Title: {srow.get('Title', 'N/A')}\n"
-                    f"Article: {srow.get('Article', 'N/A')}\n"
-                )
-
-            ebm_like_text.append("\nLast 5 Articles for Current Stock:")
-            for _, lrow in last_5.iterrows():
-                ebm_like_text.append(
-                    f"Symbol: {lrow.get('Symbol', 'Unknown Symbol')}\n"
-                    f"Title: {lrow.get('Title', 'N/A')}\n"
-                    f"Article: {lrow.get('Article', 'N/A')}\n"
-                )
-
-            # Convert list to a single string
-            concatenated_text = "\n".join(ebm_like_text)
-
-            # Append to final lists
-            articles.append(concatenated_text)
-            prices.append(row.get('weighted_avg_720_hrs', 0.0))
-            # NOTE: we use 'target_sector' for the EBM approach
-            sectors.append(target_sector)
-            dates.append(current_date)
-            related_stocks_list.append(row.get('RelatedStocksList', ''))
-            prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
-            symbols.append(current_symbol)
-            industries.append(row.get('Industry', 'Unknown Industry'))
-            risk_free_rates.append(row.get('Risk_Free_Rate', 0.0))
+        # Flatten the list of lists
+        for group in results:
+            for item in group:
+                concatenated_text, price, sector, current_date, related_stocks, price_current, symbol, industry, risk_free_rate = item
+                articles.append(concatenated_text)
+                prices.append(price)
+                sectors.append(sector)
+                dates.append(current_date)
+                related_stocks_list.append(related_stocks)
+                prices_current.append(price_current)
+                symbols.append(symbol)
+                industries.append(industry)
+                risk_free_rates.append(risk_free_rate)
 
     return (articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates)
 
