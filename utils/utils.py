@@ -420,7 +420,6 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None):
     articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates = process_data(df, tokenizer, use_ebm_format=args.use_ebm_format, top25_dict=top25_dict)
-    print(articles, "articles")
     dataset = ArticlePriceDataset(
         articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates, tokenizer, config.EPOCHS, use_ebm=args.use_ebm if args else False
     )
@@ -903,9 +902,6 @@ def evaluate_model(model, dataloader, device):
 
     # Calculate strategy returns based on actual future prices
     strategy_returns = (actuals - old_prices) / (old_prices + 1e-12) * buy_signals
-
-    # Optional: Clip returns to avoid extreme values
-    strategy_returns = np.clip(strategy_returns, a_min=-0.99, a_max=10.0)  # Adjust a_max as needed
 
     # Excess returns over risk-free rate
     excess_returns = strategy_returns - riskfree
