@@ -293,8 +293,10 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
     # Your original approach: No EBM-like sampling
     if not use_ebm_format:
         grouped = df.groupby('Symbol', sort=False)
+        print(grouped, "grouped")
 
-        for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
+        # Add a tqdm progress bar here
+        for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Processing data"):
             current_symbol = row.get('Symbol', 'Unknown Symbol')
             current_date = row.get('Date', pd.Timestamp('1970-01-01'))
 
@@ -313,7 +315,6 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
                 "\nStock Price 1 day before: " + str(row.get('weighted_avg_-24_hrs', 'N/A')) +
                 "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A'))
             )
-
             articles.append(concatenated_text)
             prices.append(row.get('weighted_avg_720_hrs', 0.0))
             sectors.append(row.get('Sector', 'Unknown Sector'))
@@ -326,7 +327,6 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
 
     # EBM-like approach (reduced sampling)
     else:
-        # We'll replicate a single-sample approach per row using a 30-day lookback
         from datetime import timedelta
 
         def safe_sample(data, n):
@@ -335,7 +335,8 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             import random
             return data.sample(n=min(n, len(data)), random_state=random.randint(0, 10000))
 
-        for idx, row in tqdm(df.iterrows(), total=df.shape[0]):
+        # Add a tqdm progress bar here as well
+        for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Processing data (EBM-like)"):
             current_symbol = row.get('Symbol', 'Unknown Symbol')
             current_date = row.get('Date', pd.Timestamp('1970-01-01'))
 
@@ -370,7 +371,6 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             sector_sample = safe_sample(sector_df, 3)
 
             # 4) last_5 (instead of last_8)
-            #   Sort by date descending, take up to 5
             symbol_df = df[(df['Symbol'] == current_symbol) & (df['Date'] < current_date)]
             last_5 = symbol_df.sort_values(by='Date', ascending=False).head(5).sort_values(by='Date')
 
@@ -415,6 +415,7 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             # Append to final lists
             articles.append(concatenated_text)
             prices.append(row.get('weighted_avg_720_hrs', 0.0))
+            # NOTE: we use 'target_sector' for the EBM approach
             sectors.append(target_sector)
             dates.append(current_date)
             related_stocks_list.append(row.get('RelatedStocksList', ''))
@@ -423,7 +424,7 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None):
             industries.append(row.get('Industry', 'Unknown Industry'))
             risk_free_rates.append(row.get('Risk_Free_Rate', 0.0))
 
-    return articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates
+    return (articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates)
 
 def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None):
     articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates = process_data(df, tokenizer, use_ebm_format=args.use_ebm_format, top25_dict=top25_dict)
