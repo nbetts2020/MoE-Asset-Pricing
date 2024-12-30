@@ -801,11 +801,6 @@ def compute_l2_loss(model):
             l2_loss += torch.norm(param, 2) ** 2
     return l2_loss
 
-from sklearn.metrics import mean_squared_error, r2_score
-import numpy as np
-from tqdm import tqdm
-import torch
-
 def evaluate_model(model, dataloader, device):
     """
     Evaluate the model on a validation/test set and compute metrics, including:
