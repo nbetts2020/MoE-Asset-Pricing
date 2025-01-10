@@ -484,31 +484,36 @@ def main():
                 total_epochs=1,
                 use_ebm=args.use_ebm
             )
-            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, max_drawdown, cumulative_return = evaluate_model(model, run_dataloader, device)
-
+            # ---- Call evaluate_model and Unpack Metrics ----
+            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
+            
             # ---- Print and Log Overall Metrics ----
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-
+            
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
-
+            
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
             logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-
+            
             print(f"Sortino Ratio: {sortino_ratio:.4f}")
             logging.info(f"Sortino Ratio: {sortino_ratio:.4f}")
-
-            print(f"Maximum Drawdown: {max_drawdown:.4f}")
-            logging.info(f"Maximum Drawdown: {max_drawdown:.4f}")
-
-            print(f"Cumulative Return: {cumulative_return:.4f}")
-            logging.info(f"Cumulative Return: {cumulative_return:.4f}")
-
+            
+            # ---- Print and Log New Metrics ----
+            print(f"Average Return: {average_return:.4f}")
+            logging.info(f"Average Return: {average_return:.4f}")
+            
+            print(f"Win Rate: {win_rate:.2f}%")
+            logging.info(f"Win Rate: {win_rate:.2f}%")
+            
+            print(f"Profit Factor: {profit_factor:.4f}")
+            logging.info(f"Profit Factor: {profit_factor:.4f}")
+            
             # ---- Print and Log Per-Sector Metrics ----
             print("Per-Sector Metrics:")
             logging.info("Per-Sector Metrics:")
-
+            
             for sector, metrics in sector_metrics.items():
                 # Extract sector-specific metrics
                 sector_mse = metrics.get('mse', 0.0)
@@ -516,9 +521,10 @@ def main():
                 sector_trend_acc = metrics.get('trend_acc', 0.0)
                 sector_sharpe = metrics.get('sharpe', 0.0)
                 sector_sortino = metrics.get('sortino', 0.0)
-                sector_mdd = metrics.get('max_drawdown', 0.0)
-                sector_c_return = metrics.get('cumulative_return', 0.0)
-
+                sector_avg_return = metrics.get('average_return', 0.0)
+                sector_win_rate = metrics.get('win_rate', 0.0)
+                sector_profit_factor = metrics.get('profit_factor', 0.0)
+            
                 # Print sector metrics
                 print(
                     f"Sector: {sector} - "
@@ -527,10 +533,11 @@ def main():
                     f"Trend Accuracy: {sector_trend_acc:.4f}, "
                     f"Sharpe Ratio: {sector_sharpe:.4f}, "
                     f"Sortino Ratio: {sector_sortino:.4f}, "
-                    f"Max Drawdown: {sector_mdd:.4f}, "
-                    f"Cumulative Return: {sector_c_return:.4f}"
-               )
-
+                    f"Average Return: {sector_avg_return:.4f}, "
+                    f"Win Rate: {sector_win_rate:.2f}%, "
+                    f"Profit Factor: {sector_profit_factor:.4f}"
+                )
+            
                 # Log sector metrics
                 logging.info(
                     f"Sector: {sector} - "
@@ -539,10 +546,10 @@ def main():
                     f"Trend Accuracy: {sector_trend_acc:.4f}, "
                     f"Sharpe Ratio: {sector_sharpe:.4f}, "
                     f"Sortino Ratio: {sector_sortino:.4f}, "
-                    f"Max Drawdown: {sector_mdd:.4f}, "
-                    f"Cumulative Return: {sector_c_return:.4f}"
-               )
-
+                    f"Average Return: {sector_avg_return:.4f}, "
+                    f"Win Rate: {sector_win_rate:.2f}%, "
+                    f"Profit Factor: {sector_profit_factor:.4f}"
+                )
     # -------------------------------------------
     # TEST_FORGETTING
     # -------------------------------------------
