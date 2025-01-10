@@ -373,7 +373,7 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
                 "\nStock Price 2 days before: " + str(row.get('weighted_avg_-48_hrs', 'N/A')) +
                 "\nStock Price 1 day before: " + str(row.get('weighted_avg_-24_hrs', 'N/A')) +
                 "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A')) +
-                "\nRisk-Free Rate at release: " + str(row.get('Risk_Free_Rate', 'N/A'))"
+                "\nRisk-Free Rate at release: " + str(row.get('Risk_Free_Rate', 'N/A'))
             )
             # Optional: Print only a subset for debugging
             # print(concatenated_text, "text!")
