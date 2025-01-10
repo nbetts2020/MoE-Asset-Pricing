@@ -189,6 +189,8 @@ class ArticlePriceDataset(Dataset):
         # Original article text
         article = row.get('Article', 'N/A')
 
+        risk_free = row.get('Risk_Free_Rate', 0.0)
+
         # The label is the future price
         future_price = row.get('weighted_avg_720_hrs', 0.0)
 
