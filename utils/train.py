@@ -2,7 +2,8 @@
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp  # Updated import for autocast
+from torch.cuda.amp import GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
@@ -105,7 +106,7 @@ def train_model(
 
             # (a) If not using EBM => normal forward/back pass
             if not use_ebm:
-                with autocast(dtype=torch.float16):
+                with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
                     preds, main_loss = model(input_ids=main_ids, targets=future_vals)
 
                     # add SI, EWC, L2
@@ -196,7 +197,7 @@ def train_model(
                 # Step B) compute MSE for each candidate
                 # (no grad for main model here)
                 mse_vals = []
-                with torch.no_grad(), autocast(dtype=torch.float16):
+                with torch.no_grad(), amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
                     for c_idx in range(num_candidates):
                         combined_tokens = torch.cat([
                             candidate_tensors[c_idx].unsqueeze(0),
@@ -213,7 +214,7 @@ def train_model(
                 mse_vals_tensor = torch.stack(mse_vals, dim=0).float()  # shape => [num_candidates], as float
 
                 # Step C) EBM forward => predicted MSE => L2 to actual MSE
-                with autocast(dtype=torch.float16):
+                with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
                     # embed the main article once
                     main_emb = model.get_embeddings(main_article).half()  # [1, embed_dim]
                     context_embs = []
@@ -238,7 +239,14 @@ def train_model(
                 scaled_energies = (energies - e_min) / ((e_max - e_min) + 1e-8)
                 temperature = getattr(args, 'temperature', 1.0)
                 probs = torch.softmax(-scaled_energies / temperature, dim=0)
-                sampled_idx = torch.multinomial(probs, 1).item()
+                print(f"Shape of probs: {probs.shape}")  # Debugging
+                print(f"Probabilities: {probs}")  # Debugging
+
+                # Handle single context candidate
+                if probs.dim() == 0:
+                    sampled_idx = 0
+                else:
+                    sampled_idx = torch.multinomial(probs, 1).item()
 
                 chosen_contexts_toks.append(candidate_tensors[sampled_idx])
 
@@ -263,7 +271,7 @@ def train_model(
                     combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
 
                 label_i = future_vals[i].unsqueeze(0)
-                with autocast(dtype=torch.float16):
+                with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
                     pred_val_i, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
                     # add SI, EWC, L2
                     if si:
