@@ -123,6 +123,7 @@ def format_concatenated_articles(sample: dict) -> str:
             f"Stock Price 2 days before: {row.get('weighted_avg_-48_hrs', 'N/A')}\n"
             f"Stock Price 1 day before: {row.get('weighted_avg_-24_hrs', 'N/A')}\n"
             f"Stock Price at release: {row.get('weighted_avg_0_hrs', 'N/A')}\n"
+            f"Risk-Free Rate at release: {row.get('Risk_Free_Rate', 'N/A')}\n"
         )
 
     concatenated_articles = "\n".join(formatted_articles)
@@ -185,36 +186,38 @@ class ArticlePriceDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        # Original article text
         article = row.get('Article', 'N/A')
+        
+        # Append the risk-free rate to the end of the article prompt
+        risk_free = row.get('Risk_Free_Rate', 0.0)
+        article += f"\nRisk-Free Rate: {risk_free}"
 
-        # The label is the future price after 720 hours:
+        # The label is the future price
         future_price = row.get('weighted_avg_720_hrs', 0.0)
 
-        # The old/current price we also want for e.g. trend calc:
+        # The old/current price we also want for e.g. trend calc
         old_price = row.get('weighted_avg_0_hrs', 0.0)
 
         sector = row.get('Sector', 'Unknown Sector')
 
-        risk_free_rate = row.get('Risk_Free_Rate', 0.0)
-
+        # Tokenize this updated article text
         input_encoding = self.tokenizer(
             article,
             truncation=True,
             padding='max_length',
-            max_length= config.BLOCK_SIZE,
+            max_length=config.BLOCK_SIZE,
             return_tensors='pt'
         )
         input_ids = input_encoding['input_ids'].squeeze(0)
 
         sample = {
-            'input_ids': input_ids,
-            'labels': torch.tensor(future_price, dtype=torch.float),
-            'sector': sector if sector is not None else "Unknown Sector",
-            'idx': int(idx),
-
-            # Provide the old/current price explicitly:
-            'old_price': torch.tensor(old_price, dtype=torch.float),
-            'risk_free_rate': torch.tensor(risk_free_rate, dtype=torch.float)
+            'input_ids':     input_ids,
+            'labels':        torch.tensor(future_price, dtype=torch.float),
+            'sector':        sector if sector is not None else "Unknown Sector",
+            'idx':           int(idx),
+            'old_price':     torch.tensor(old_price, dtype=torch.float),
+            'risk_free_rate':torch.tensor(risk_free, dtype=torch.float)
         }
         return sample
 
