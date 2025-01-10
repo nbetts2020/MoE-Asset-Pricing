@@ -103,7 +103,7 @@ def main():
                         help='Learning rate for the EBM')
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='Temperature parameter for Monte Carlo Sampling')
-    parser.add_argument('--ebm_num_samples_train', type=int, default=1,
+    parser.add_argument('--ebm_num_samples_train', type=int,
                         help="Number of samples the EBM generates when 'train' is active")
     parser.add_argument('--use_ebm_format', action='store_true',
                         help='Use simplified version of EBM formatting when using non-EBM model.')
