@@ -188,10 +188,6 @@ class ArticlePriceDataset(Dataset):
         row = self.df.iloc[idx]
         # Original article text
         article = row.get('Article', 'N/A')
-        
-        # Append the risk-free rate to the end of the article prompt
-        risk_free = row.get('Risk_Free_Rate', 0.0)
-        article += f"\nRisk-Free Rate: {risk_free}"
 
         # The label is the future price
         future_price = row.get('weighted_avg_720_hrs', 0.0)
