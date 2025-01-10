@@ -807,212 +807,205 @@ def evaluate_model(model, dataloader, device):
       - Trend Accuracy
       - Sharpe Ratio
       - Sortino Ratio
-      - Maximum Drawdown
-      - Cumulative Returns
+      - Average Return
+      - Win Rate
+      - Profit Factor
 
-    NOTE: For Maximum Drawdown, Cumulative Returns, and Sortino Ratio to make sense,
-          the dataset should be chronologically ordered. If samples are shuffled,
-          these measures will NOT reflect true sequential performance. The same
-          caution applies at the sector level.
+    NOTE: For meaningful evaluation, ensure the dataset is chronologically sorted if
+          the strategy depends on order. The same caution applies at the sector level.
 
     Args:
         model (nn.Module): The trained model.
-        dataloader (DataLoader): DataLoader for the validation/test set. It must:
+        dataloader (DataLoader): DataLoader for the validation/test set. Must:
           - yield 'risk_free_rate' if computing Sharpe/Sortino Ratio
-          - yield samples in chronological order if computing MDD, Cumulative Returns
+          - be chronologically ordered if the strategy depends on time series order
         device (torch.device): Device to perform computations on.
 
     Returns:
         mse (float): Mean Squared Error (overall).
         r2 (float): R² Score (overall).
         sector_metrics (dict): sector -> {
-            'mse', 'r2', 'trend_acc', 'sharpe', 'sortino', 'max_drawdown', 'cumulative_return'
+            'mse', 'r2', 'trend_acc', 'sharpe', 'sortino',
+            'average_return', 'win_rate', 'profit_factor'
         }
         overall_trend_acc (float): Overall trend accuracy across all samples.
         sharpe_ratio (float): Overall Sharpe Ratio.
         sortino_ratio (float): Overall Sortino Ratio.
-        max_drawdown (float): Overall Maximum Drawdown, in [0..1].
-        cumulative_return (float): Overall (equity - 1) after processing all returns.
+        average_return (float): Average return per trade (overall).
+        win_rate (float): Percentage of profitable trades (overall).
+        profit_factor (float): Ratio of gross profits to gross losses (overall).
     """
 
     model.eval()
     predictions = []
     actuals = []
     oldprice_list = []
+    riskfree_list = []
     sectors_list = []
-    riskfree_list = []  # monthly or per-period risk-free rate
 
-    # sector -> dict of lists for computing sector-level time series
+    # sector -> dict for sector-level time series
     sector_data = {}
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            labels    = batch['labels'].to(device)      # Future price
-            old_prices= batch['old_price'].to(device)   # Current price
-            sectors   = batch['sector']
-            risk_free_rate = batch['risk_free_rate'].to(device)
+            input_ids       = batch['input_ids'].to(device)
+            labels          = batch['labels'].to(device)       # Future price
+            old_prices      = batch['old_price'].to(device)    # Current price
+            sectors         = batch['sector']
+            risk_free_rate  = batch['risk_free_rate'].to(device)
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda'):
                 outputs, _ = model(input_ids=input_ids)
 
+            # Move data to CPU/numpy
             outputs_np     = outputs.detach().cpu().numpy().flatten()
             labels_np      = labels.detach().cpu().numpy()
             old_prices_np  = old_prices.detach().cpu().numpy()
             rf_monthly_np  = risk_free_rate.detach().cpu().numpy()
 
-            # Append to overall
+            # Collect overall
             predictions.extend(outputs_np)
             actuals.extend(labels_np)
             oldprice_list.extend(old_prices_np)
             riskfree_list.extend(rf_monthly_np)
             sectors_list.extend(sectors)
 
-            # Accumulate in sector_data for sector-level time-series
+            # Accumulate sector-level data
             for i, sector in enumerate(sectors):
                 if sector not in sector_data:
                     sector_data[sector] = {
                         'predictions': [],
                         'actuals':     [],
                         'oldprices':   [],
-                        'riskfree':    [],
+                        'riskfree':    []
                     }
                 sector_data[sector]['predictions'].append(outputs_np[i])
                 sector_data[sector]['actuals'].append(labels_np[i])
                 sector_data[sector]['oldprices'].append(old_prices_np[i])
                 sector_data[sector]['riskfree'].append(rf_monthly_np[i])
 
-    # --------------------- Model Performance Metrics ---------------------
+    # --------------------- Model Performance (Overall) ---------------------
     mse = mean_squared_error(actuals, predictions)
-    r2 = r2_score(actuals, predictions)
+    r2  = r2_score(actuals, predictions)
 
     # Trend Accuracy (overall)
     true_trends = np.sign(np.array(actuals) - np.array(oldprice_list))
     pred_trends = np.sign(np.array(predictions) - np.array(oldprice_list))
-    overall_trend_acc = np.mean(true_trends == pred_trends)
+    overall_trend_acc = np.mean(true_trends == pred_trends) if len(predictions) > 0 else 0.0
 
-    # --------------------- Strategy Performance Metrics ---------------------
-    old_prices = np.array(oldprice_list)
-    predictions = np.array(predictions)
-    actuals = np.array(actuals)
-    riskfree = np.array(riskfree_list)
+    # Strategy returns (overall)
+    oldp_arr = np.array(oldprice_list)
+    pred_arr = np.array(predictions)
+    actl_arr = np.array(actuals)
+    rf_arr   = np.array(riskfree_list)
 
-    # Generate buy signals: 1 if predicted price > old price, else 0
-    buy_signals = (predictions > old_prices).astype(float)
+    # Buy signals if predicted price > current price
+    buy_signals = (pred_arr > oldp_arr).astype(float)
+    # Realized returns if we buy
+    strategy_returns = (actl_arr - oldp_arr) / (oldp_arr + 1e-12) * buy_signals
 
-    # Calculate strategy returns based on actual future prices
-    strategy_returns = (actuals - old_prices) / (old_prices + 1e-12) * buy_signals
+    # Excess returns (for Sharpe/Sortino)
+    excess_returns = strategy_returns - rf_arr
 
-    # Excess returns over risk-free rate
-    excess_returns = strategy_returns - riskfree
+    # --------------------- Sharpe Ratio (overall) ---------------------
+    sr_mean = np.mean(excess_returns)
+    sr_std  = np.std(excess_returns, ddof=1)
+    sharpe_ratio = sr_mean / sr_std if sr_std > 1e-12 else 0.0
 
-    # Sharpe Ratio (overall)
-    sharpe_numerator   = np.mean(excess_returns)
-    sharpe_denominator = np.std(excess_returns, ddof=1)
-    sharpe_ratio = sharpe_numerator / sharpe_denominator if sharpe_denominator > 1e-12 else 0.0
-
-    # Sortino Ratio (overall)
-    negative_mask = (excess_returns < 0)
-    if np.any(negative_mask):
-        downside_std = np.std(excess_returns[negative_mask], ddof=1)
-        sortino_ratio = sharpe_numerator / downside_std if downside_std > 1e-12 else float('inf')
+    # --------------------- Sortino Ratio (overall) ---------------------
+    neg_mask = (excess_returns < 0)
+    if np.any(neg_mask):
+        downside_std = np.std(excess_returns[neg_mask], ddof=1)
+        sortino_ratio = sr_mean / downside_std if downside_std > 1e-12 else float('inf')
     else:
-        sortino_ratio = float('inf')  # or 0.0, depending on preference
+        sortino_ratio = float('inf')
 
-    # Equity Curve => for MDD & Cumulative Return (overall)
-    eq_curve = np.ones(len(strategy_returns) + 1, dtype=np.float64)
-    for i in range(len(strategy_returns)):
-        eq_curve[i+1] = eq_curve[i] * (1.0 + strategy_returns[i])
-        if not np.isfinite(eq_curve[i+1]):
-            eq_curve[i+1] = eq_curve[i]
+    # --------------------- Average Return, Win Rate, Profit Factor (overall) ---------------------
+    # Average Return per trade
+    average_return = np.mean(strategy_returns) if len(strategy_returns) > 0 else 0.0
 
-    # Cumulative Return => eq_curve[-1] - 1
-    cumulative_return = eq_curve[-1] - 1.0
+    # Win Rate => ratio of trades with strategy_returns > 0
+    wins = strategy_returns > 0
+    win_rate = np.mean(wins) * 100 if len(wins) > 0 else 0.0
 
-    # Max Drawdown
-    rolling_peak = np.maximum.accumulate(eq_curve)
-    drawdowns = (rolling_peak - eq_curve) / rolling_peak
-    max_drawdown = np.max(drawdowns)
+    # Profit Factor => ratio of gross profits to gross losses
+    gross_profits = strategy_returns[strategy_returns > 0].sum()
+    gross_losses  = -strategy_returns[strategy_returns < 0].sum()  # negative of negative returns
+    profit_factor = (gross_profits / gross_losses) if gross_losses > 1e-12 else float('inf')
 
     # ------------------- Sector-level metrics -------------------
     sector_metrics = {}
-
-    for sector, data_dict in sector_data.items():
-        spreds = np.array(data_dict['predictions'], dtype=np.float64)
-        sacts  = np.array(data_dict['actuals'],     dtype=np.float64)
-        soldp  = np.array(data_dict['oldprices'],   dtype=np.float64)
-        sriskf = np.array(data_dict['riskfree'],    dtype=np.float64)
+    for sector, vals in sector_data.items():
+        spreds  = np.array(vals['predictions'], dtype=np.float64)
+        sacts   = np.array(vals['actuals'],     dtype=np.float64)
+        soldp   = np.array(vals['oldprices'],   dtype=np.float64)
+        sriskf  = np.array(vals['riskfree'],    dtype=np.float64)
 
         # MSE & R2
-        sector_mse = mean_squared_error(sacts, spreds)
-        sector_r2  = r2_score(sacts, spreds)
+        sec_mse = mean_squared_error(sacts, spreds)
+        sec_r2  = r2_score(sacts, spreds)
 
-        # Trend accuracy (sector)
-        sec_trends = np.sign(sacts - soldp)
+        # Trend accuracy
+        sec_true_trends = np.sign(sacts - soldp)
         sec_pred_trends = np.sign(spreds - soldp)
-        sec_trend_acc = np.mean(sec_trends == sec_pred_trends)
+        sec_trend_acc   = np.mean(sec_true_trends == sec_pred_trends) if len(spreds) > 0 else 0.0
 
-        # Generate buy signals for sector
-        sec_buy_signals = (spreds > soldp).astype(float)
+        # Buy signals if spreds > soldp
+        sec_signals = (spreds > soldp).astype(float)
+        # Strategy returns if we buy
+        sec_strategy_returns = (sacts - soldp) / (soldp + 1e-12) * sec_signals
 
-        # Calculate strategy returns based on actual future prices
-        sec_strategy_returns = (sacts - soldp) / (soldp + 1e-12) * sec_buy_signals
-
-        # Optional: Clip sector strategy returns
-        sec_strategy_returns = np.clip(sec_strategy_returns, a_min=-0.99, a_max=10.0)  # Adjust as needed
-
-        # Excess returns over risk-free rate
+        # Excess returns for sector
         sec_excess_returns = sec_strategy_returns - sriskf
 
         # Sharpe (sector)
-        sec_sharpe_num = np.mean(sec_excess_returns)
-        sec_sharpe_den = np.std(sec_excess_returns, ddof=1)
-        sec_sharpe = sec_sharpe_num / sec_sharpe_den if sec_sharpe_den > 1e-12 else 0.0
+        sec_ex_mean = np.mean(sec_excess_returns)
+        sec_ex_std  = np.std(sec_excess_returns, ddof=1)
+        sec_sharpe  = sec_ex_mean / sec_ex_std if sec_ex_std > 1e-12 else 0.0
 
         # Sortino (sector)
-        sec_neg_mask = (sec_excess_returns < 0)
-        if np.any(sec_neg_mask):
-            sec_downside_std = np.std(sec_excess_returns[sec_neg_mask], ddof=1)
-            sec_sortino = sec_sharpe_num / sec_downside_std if sec_downside_std > 1e-12 else float('inf')
+        neg_mask_s = (sec_excess_returns < 0)
+        if np.any(neg_mask_s):
+            sec_downside_std = np.std(sec_excess_returns[neg_mask_s], ddof=1)
+            sec_sortino = sec_ex_mean / sec_downside_std if sec_downside_std > 1e-12 else float('inf')
         else:
-            sec_sortino = float('inf')  # or 0.0
+            sec_sortino = float('inf')
 
-        # Equity Curve for sector
-        eq_s = np.ones(len(sec_strategy_returns) + 1, dtype=np.float64)
-        for i in range(len(sec_strategy_returns)):
-            eq_s[i+1] = eq_s[i] * (1.0 + sec_strategy_returns[i])
-            if not np.isfinite(eq_s[i+1]):
-                eq_s[i+1] = eq_s[i]
+        # Average Return (sector)
+        sec_avg_return = np.mean(sec_strategy_returns) if len(sec_strategy_returns) > 0 else 0.0
 
-        # Cumulative Return => eq_s[-1] - 1
-        sector_cReturn = eq_s[-1] - 1.0
+        # Win Rate (sector)
+        sec_wins = sec_strategy_returns > 0
+        sec_win_rate = np.mean(sec_wins) * 100 if len(sec_wins) > 0 else 0.0
 
-        # Max Drawdown
-        roll_peak_s = np.maximum.accumulate(eq_s)
-        drawdowns_s = (roll_peak_s - eq_s) / roll_peak_s
-        sector_mdd = np.max(drawdowns_s)
+        # Profit Factor (sector)
+        sec_gross_profits = sec_strategy_returns[sec_strategy_returns > 0].sum()
+        sec_gross_losses  = -sec_strategy_returns[sec_strategy_returns < 0].sum()
+        sec_profit_factor = (sec_gross_profits / sec_gross_losses) if sec_gross_losses > 1e-12 else float('inf')
 
-        # Store
+        # Store in sector_metrics
         sector_metrics[sector] = {
-            'mse':               sector_mse,
-            'r2':                sector_r2,
-            'trend_acc':         sec_trend_acc,
-            'sharpe':            sec_sharpe,
-            'sortino':           sec_sortino,
-            'max_drawdown':      sector_mdd,
-            'cumulative_return': sector_cReturn
+            'mse':           sec_mse,
+            'r2':            sec_r2,
+            'trend_acc':     sec_trend_acc,
+            'sharpe':        sec_sharpe,
+            'sortino':       sec_sortino,
+            'average_return':sec_avg_return,
+            'win_rate':      sec_win_rate,
+            'profit_factor': sec_profit_factor
         }
 
     model.train()
     return (
-        mse,
-        r2,
-        sector_metrics,
-        overall_trend_acc,
-        sharpe_ratio,
-        sortino_ratio,
-        max_drawdown,
-        cumulative_return
+        mse,             # 0
+        r2,              # 1
+        sector_metrics,  # 2
+        overall_trend_acc,  # 3
+        sharpe_ratio,    # 4
+        sortino_ratio,   # 5
+        average_return,  # 6
+        win_rate,        # 7
+        profit_factor    # 8
     )
     
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
