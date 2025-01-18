@@ -347,20 +347,18 @@ def process_group(group_df, k=5):
 def process_group_wrapper(args):
     return process_group(*args)
 
-def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
+def process_data(df,
+                 df_preprocessed,
+                 df_preprocessed_top25,
+                 tokenizer,
+                 use_ebm_format=False):
     """
-    Parallelized version of process_data for EBM-like processing.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame.
-        tokenizer: Tokenizer object (unused in this context).
-        use_ebm_format (bool): Flag to determine processing mode.
-        top25_dict (dict): Additional dictionary if needed (unused here).
-        k (int): Number of preceding articles to include.
-
-    Returns:
-        Tuple of lists containing processed data.
+    Builds final text for each row.
+    - If not use_ebm_format, just do your old single-article style.
+    - If use_ebm_format, gather references from df_preprocessed (economic etc.)
+      plus top25 from df_preprocessed_top25, then append the main article last.
     """
+
     articles = []
     prices = []
     sectors = []
@@ -371,14 +369,19 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
     industries = []
     risk_free_rates = []
 
-    if not use_ebm_format:
-        # Original processing with tqdm progress bar
-        for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Processing data (normal)"):
-            current_symbol = row.get('Symbol', 'Unknown Symbol')
-            current_date = row.get('Date', pd.Timestamp('1970-01-01'))
+    for i, row in df.iterrows():
+        future_price = row.get('weighted_avg_720_hrs', 0.0)
+        sector       = row.get('Sector', 'Unknown Sector')
+        date_val     = row.get('Date', pd.Timestamp('1970-01-01'))
+        old_price    = row.get('weighted_avg_0_hrs', 0.0)
+        symbol       = row.get('Symbol', 'Unknown Symbol')
+        industry     = row.get('Industry', 'Unknown Industry')
+        rfr          = row.get('Risk_Free_Rate', 0.0)
+        main_article = str(row.get('Article', 'N/A'))
 
-            # Build concatenated text
-            concatenated_text = (
+        if not use_ebm_format:
+            # --- OLD STYLE ---
+            final_text = (
                 "Symbol: " + str(row.get('Symbol', 'N/A')) +
                 "\nSecurity: " + str(row.get('Security', 'N/A')) +
                 "\nRelated Stocks/Topics: " + str(row.get('RelatedStocksList', 'N/A')) +
@@ -393,90 +396,138 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
                 "\nStock Price at release: " + str(row.get('weighted_avg_0_hrs', 'N/A')) +
                 "\nRisk-Free Rate at release: " + str(row.get('Risk_Free_Rate', 'N/A'))
             )
-            # Optional: Print only a subset for debugging
-            # print(concatenated_text, "text!")
-            articles.append(concatenated_text)
-            prices.append(row.get('weighted_avg_720_hrs', 0.0))
-            sectors.append(row.get('Sector', 'Unknown Sector'))
-            dates.append(current_date)
-            related_stocks_list.append(row.get('RelatedStocksList', ''))
-            prices_current.append(row.get('weighted_avg_0_hrs', 0.0))
-            symbols.append(current_symbol)
-            industries.append(row.get('Industry', 'Unknown Industry'))
-            risk_free_rates.append(row.get('Risk_Free_Rate', 0.0))
+        else:
+            # --- EBM STYLE: gather from df_preprocessed + top25 DataFrame ---
+            preproc_row     = df_preprocessed.iloc[i]
+            preproc_row_25  = df_preprocessed_top25.iloc[i] if df_preprocessed_top25 is not None else {}
 
-    else:
-        # EBM-like processing with parallelization
-        # Group by 'Symbol' to allow parallel processing per group
-        grouped = df.groupby('Symbol', sort=False)
+            # Each of these should be a list of indices if your parquet has them as lists
+            econ_idxs = preproc_row.get('use_ebm_economic', [])
+            ind_idxs  = preproc_row.get('use_ebm_industry', [])
+            sec_idxs  = preproc_row.get('use_ebm_sector', [])
+            hist_idxs = preproc_row.get('use_ebm_historical', [])
 
-        # Prepare arguments for each group
-        group_args = [(group_df, k) for _, group_df in grouped]
+            top25_idxs = preproc_row_25.get('use_ebm_top25', [])  # Example col name
 
-        # Determine number of workers
-        num_workers = max(1, cpu_count() - 1)  # Leave one CPU free
+            def gather_ref_text(idxs, label):
+                chunks = []
+                for idx_ref in idxs:
+                    if 0 <= idx_ref < len(df):
+                        refrow = df.iloc[idx_ref]
+                        chunks.append(f"[{label}] {refrow.get('Article','N/A')}")
+                return "\n".join(chunks)
 
-        with Pool(processes=num_workers) as pool:
-            # Use imap_unordered for better performance
-            results = list(tqdm(pool.imap(process_group_wrapper, group_args), 
-                                total=len(group_args), desc="Processing groups in parallel"))
+            economic_part   = gather_ref_text(econ_idxs, "Economic")
+            industry_part   = gather_ref_text(ind_idxs, "Industry")
+            sector_part     = gather_ref_text(sec_idxs, "Sector")
+            historical_part = gather_ref_text(hist_idxs, "Historical")
+            top25_part      = gather_ref_text(top25_idxs, "Top25Movers")
 
-        # Flatten the list of lists
-        for group in results:
-            for item in group:
-                concatenated_text, price, sector, current_date, related_stocks, price_current, symbol, industry, risk_free_rate = item
-                articles.append(concatenated_text)
-                prices.append(price)
-                sectors.append(sector)
-                dates.append(current_date)
-                related_stocks_list.append(related_stocks)
-                prices_current.append(price_current)
-                symbols.append(symbol)
-                industries.append(industry)
-                risk_free_rates.append(risk_free_rate)
+            # Main article LAST
+            final_text = (
+                f"{economic_part}\n\n"
+                f"{industry_part}\n\n"
+                f"{sector_part}\n\n"
+                f"{historical_part}\n\n"
+                f"{top25_part}\n\n"
+                f"MAIN ARTICLE:\n{main_article}"
+            )
 
-    return (articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates)
+        # Gather final
+        articles.append(final_text)
+        prices.append(future_price)
+        sectors.append(sector)
+        dates.append(date_val)
+        related_stocks_list.append(row.get('RelatedStocksList', ''))
+        prices_current.append(old_price)
+        symbols.append(symbol)
+        industries.append(industry)
+        risk_free_rates.append(rfr)
 
-def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None): # TODO
-    articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates = process_data(df, tokenizer, use_ebm_format=args.use_ebm_format, top25_dict=top25_dict)
-    dataset = ArticlePriceDataset(
-        articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates, tokenizer, config.EPOCHS, use_ebm=args.use_ebm if args else False
+    return (
+        articles, prices, sectors, dates,
+        related_stocks_list, prices_current,
+        symbols, industries, risk_free_rates
     )
 
-    if args and getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
+def prepare_dataloader(df,
+                       df_preprocessed,
+                       df_preprocessed_top25,
+                       tokenizer,
+                       batch_size,
+                       shuffle,
+                       args):
+    """
+    Pass df, df_preprocessed, and df_preprocessed_top25 to process_data.
+    Then wrap the resulting data in ArticlePriceDataset -> DataLoader.
+    """
+    (articles, prices, sectors, dates,
+     related_stocks, prices_current,
+     symbols, industries, rfr) = process_data(
+         df,
+         df_preprocessed,
+         df_preprocessed_top25,
+         tokenizer,
+         use_ebm_format=args.use_ebm_format
+     )
+
+    dataset = ArticlePriceDataset(
+        articles=articles,
+        prices=prices,
+        sectors=sectors,
+        dates=dates,
+        related_stocks_list=related_stocks,
+        prices_current=prices_current,
+        symbols=symbols,
+        industries=industries,
+        risk_free_rates=rfr,
+        tokenizer=tokenizer,
+        total_epochs=config.EPOCHS,
+        use_ebm=args.use_ebm
+    )
+
+    if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
+        from torch.utils.data.distributed import DistributedSampler
         sampler = DistributedSampler(dataset, shuffle=shuffle)
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     else:
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-    return dataloader
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
-def prepare_tasks(tokenizer, args, k=3): # TODO
+def prepare_tasks(tokenizer, args, k=3):
     """
-    Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
-
-    Args:
-        tokenizer (AutoTokenizer): The tokenizer to use.
-        args (argparse.Namespace): Command-line arguments.
-        k (int): Number of sectors to randomly select for the tasks.
-
-    Returns:
-        tasks (list): List of DataLoaders for the selected sectors.
+    For catastrophic-forgetting tests, pick k random sectors and build
+    separate DataLoaders for each sector.
     """
-    df = get_data(percent_data=args.percent_data)  # load your data
+    # Load everything
+    df, df_preprocessed, df_preprocessed_top25 = get_data(
+        percent_data=args.percent_data,
+        run=False,      # or however you want
+        update=False,   # or however you want
+        args=args
+    )
 
-    # Get unique sectors from the dataset
-    unique_sectors = df['Sector'].unique()
-
-    # Randomly sample k sectors from the unique sectors
+    # Grab unique sectors
+    unique_sectors = df['Sector'].dropna().unique()
     selected_sectors = np.random.choice(unique_sectors, size=k, replace=False)
 
     tasks = []
-
-    # For each selected sector, create a DataLoader
     for sector in selected_sectors:
-        df_task = df[df['Sector'] == sector]  # Filter data by the selected sector
-        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
-        tasks.append(dataloader)
+        df_task = df[df['Sector'] == sector].copy()
+        # For df_preprocessed (row-aligned), subset by the same index
+        dfp_task = df_preprocessed.loc[df_task.index].copy()
+        
+        task_top25 = df_preprocessed_top25  # Pass the full dictionary
+
+        loader = prepare_dataloader(
+            df_task,
+            dfp_task,
+            task_top25,        # pass the entire dictionary
+            tokenizer,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            args=args
+        )
+        tasks.append(loader)
 
     return tasks
 
@@ -631,81 +682,59 @@ def prepare_optimizer(model, args):
     logging.info("Initialized AdamW optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
 
-def prepare_data(args, tokenizer): # TODO
+def prepare_data(args, tokenizer):
     """
-    Prepares the data for training or updating.
+    Loads df, df_preprocessed, and df_preprocessed_top25 from get_data().
+    Returns DataLoader(s) depending on mode.
     """
-    percent_data = args.percent_data  # get percentage of data to use
-
-    random_seed = args.random_seed
+    # get_data() returns (df, df_preprocessed, df_preprocessed_top25)
+    df, df_preprocessed, df_preprocessed_top25 = get_data(
+        percent_data=args.percent_data,
+        run=(args.mode == 'run'),
+        update=(args.mode == 'update'),
+        args=args
+    )
 
     if args.mode == 'train':
-        df = get_data(percent_data=percent_data)
-        top25_dict = None
-        if args.use_ebm_format:
-            df['abs_percentage_change'] = df['Percentage Change'].abs()
-            df = df.dropna(subset=['abs_percentage_change'])
-            top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
-                lambda x: x.nlargest(25, 'abs_percentage_change')
-            )
-            top25_dict = {
-                symbol: group.to_dict(orient='records')
-                for symbol, group in top25_by_symbol.groupby('Symbol')
-            }
-
-        train_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args, top25_dict=top25_dict
+        train_loader = prepare_dataloader(
+            df,
+            df_preprocessed,
+            df_preprocessed_top25,  # <-- dictionary for top25
+            tokenizer,
+            batch_size=config.BATCH_SIZE,
+            shuffle=True,
+            args=args
         )
-        logging.info(f"Prepared DataLoader with {len(train_dataloader.dataset)} training samples.")
+        return train_loader, df
 
-        return train_dataloader, df, top25_dict
     elif args.mode == 'run':
-        df = get_data(percent_data=percent_data, run=True)
-        top25_dict = None
-        if args.use_ebm_format:
-            df['abs_percentage_change'] = df['Percentage Change'].abs()
-            df = df.dropna(subset=['abs_percentage_change'])
-            top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
-                lambda x: x.nlargest(25, 'abs_percentage_change')
-            )
-            top25_dict = {
-                symbol: group.to_dict(orient='records')
-                for symbol, group in top25_by_symbol.groupby('Symbol')
-            }
-
-        run_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args, top25_dict=top25_dict
+        run_loader = prepare_dataloader(
+            df,
+            df_preprocessed,
+            df_preprocessed_top25,
+            tokenizer,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            args=args
         )
-        logging.info(f"Prepared update DataLoader with {len(run_dataloader.dataset)} samples.")
+        return run_loader, df
 
-        return run_dataloader, df, top25_dict
     elif args.mode == 'update':
-        # Load new data for updating
-        if args.update_url:
-            df = get_new_data(args.update_url)
-        else:
-            df = get_data(percent_data=percent_data, update=True)
-        top25_dict = None
-        if args.use_ebm_format:
-            df['abs_percentage_change'] = df['Percentage Change'].abs()
-            df = df.dropna(subset=['abs_percentage_change'])
-            top25_by_symbol = df.groupby('Symbol', group_keys=False).apply(
-                lambda x: x.nlargest(25, 'abs_percentage_change')
-            )
-            top25_dict = {
-                symbol: group.to_dict(orient='records')
-                for symbol, group in top25_by_symbol.groupby('Symbol')
-            }
-
-        update_dataloader = prepare_dataloader(
-            df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args, top25_dict=top25_dict
+        update_loader = prepare_dataloader(
+            df,
+            df_preprocessed,
+            df_preprocessed_top25,
+            tokenizer,
+            batch_size=config.BATCH_SIZE,
+            shuffle=True,
+            args=args
         )
+        # Possibly combine with old training data if desired
+        old_train_df, _, _ = get_data(percent_data=args.percent_data, args=args)
+        return update_loader, pd.concat([old_train_df, df])
 
-        logging.info(f"Prepared update DataLoader with {len(update_dataloader.dataset)} samples.")
-        train_df = get_data(percent_data=percent_data)
-        return update_dataloader, pd.concat([train_df, df]), top25_dict
     else:
-        raise ValueError("Invalid mode specified in args.mode")
+        raise ValueError(f"Invalid mode: {args.mode}")
 
 def initialize_si(model, args):
     """
