@@ -52,7 +52,7 @@ def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
 
-def get_data(percent_data=100.0, run=False, update=False):
+def get_data(percent_data=100.0, run=False, update=False, args):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
 
@@ -78,13 +78,31 @@ def get_data(percent_data=100.0, run=False, update=False):
     split1 = int(len(df) * 0.7)
     split2 = int(len(df) * 0.85)
 
+    df_preprocessed = None
+    df_preprocessed_top25 = None
+
+    if args.use_ebm:
+        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
+        df_preprocessed = dataset_preprocessed['train'].to_pandas()
+        df_preprocessed = df_preprocessed.head(num_samples)
+
+        dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
+        df_preprocessed_top25 = dataset_preprocessed_top25['train'].to_dict()
+        df_preprocessed_top25 = df_preprocessed_top25.head(num_samples)
+
     if run:
         df = df[split1:split2]
+        df_preprocessed = df_preprocessed[split1:split2]
+        df_preprocessed_top25 = df_preprocessed_top25[split1:split2]
     elif update:
         df = df[split2:]
+        df_preprocessed = df_preprocessed[split2:]
+        df_preprocessed_top25 = df_preprocessed_top25[split2:]
     else:
         df = df[:split1]
-    return df
+        df_preprocessed = df_preprocessed[:split1]
+        df_preprocessed_top25 = df_preprocessed_top25[:split1]
+    return df, df_preprocessed, df_preprocessed_top25
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
@@ -419,7 +437,7 @@ def process_data(df, tokenizer, use_ebm_format=False, top25_dict=None, k=5):
 
     return (articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates)
 
-def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None):
+def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=None, top25_dict=None): # TODO
     articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates = process_data(df, tokenizer, use_ebm_format=args.use_ebm_format, top25_dict=top25_dict)
     dataset = ArticlePriceDataset(
         articles, prices, sectors, dates, related_stocks_list, prices_current, symbols, industries, risk_free_rates, tokenizer, config.EPOCHS, use_ebm=args.use_ebm if args else False
@@ -432,7 +450,7 @@ def prepare_dataloader(df, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     return dataloader
 
-def prepare_tasks(tokenizer, args, k=3):
+def prepare_tasks(tokenizer, args, k=3): # TODO
     """
     Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
 
@@ -613,7 +631,7 @@ def prepare_optimizer(model, args):
     logging.info("Initialized AdamW optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
 
-def prepare_data(args, tokenizer):
+def prepare_data(args, tokenizer): # TODO
     """
     Prepares the data for training or updating.
     """
@@ -1048,36 +1066,6 @@ def save_model_weights(model, filepath, device):
     model = model.to(device)
     print(f"Model loaded from {filepath}.")
     return model
-
-def prepare_tasks(tokenizer, args, k=3):
-    """
-    Prepare multiple tasks (DataLoaders) for testing catastrophic forgetting based on sectors.
-
-    Args:
-        tokenizer (AutoTokenizer): The tokenizer to use.
-        args (argparse.Namespace): Command-line arguments.
-        k (int): Number of sectors to randomly select for the tasks.
-
-    Returns:
-        tasks (list): List of DataLoaders for the selected sectors.
-    """
-    df = get_data(percent_data=args.percent_data)  # Load your data
-
-    # Get unique sectors from the dataset
-    unique_sectors = df['Sector'].unique()
-
-    # Randomly sample k sectors from the unique sectors
-    selected_sectors = np.random.choice(unique_sectors, size=k, replace=False)
-
-    tasks = []
-
-    # For each selected sector, create a DataLoader
-    for sector in selected_sectors:
-        df_task = df[df['Sector'] == sector]  # Filter data by the selected sector
-        dataloader = prepare_dataloader(df_task, tokenizer, batch_size=config.BATCH_SIZE, shuffle=True, args=args)
-        tasks.append(dataloader)
-
-    return tasks
 
 def initialize_si(model, args):
     """
