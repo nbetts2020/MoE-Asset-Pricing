@@ -131,27 +131,110 @@ def format_concatenated_articles(sample: dict) -> str:
 
 def parallel_context_generation_worker(args):
     """
-    CPU-only worker. No EBM or GPU ops here.
-    Returns multiple raw context strings (or CPU tensors) for each sample.
+    CPU-only worker that generates multiple prompt contexts (strings) for one batch sample
+    in the EBM approach. No GPU logic here.
+
+    Args:
+        args (tuple): A tuple of:
+          - idx (int): index in df (the main DataFrame)
+          - df (pd.DataFrame): the "master" DataFrame (with 'Article', 'Date', 'Percentage Change', etc.)
+          - df_preprocessed (pd.DataFrame): row-aligned with df, containing columns like
+                'use_ebm_economic', 'use_ebm_industry', 'use_ebm_sector', 'use_ebm_historical'
+                (each a list of row indices referencing df).
+          - df_preprocessed_top25 (dict): keys are symbols, values are lists of row indices in df
+          - total_epochs (int): total training epochs
+          - current_epoch (int): current epoch
+          - context_count (int): e.g., max(epochs - epoch, 5)
+            ( how many distinct prompt contexts to generate for this single sample )
+
+    Returns:
+        List[str]: A list of prompt strings (one for each context_count) using format_concatenated_articles.
     """
-    (idx, df, tokenizer, total_epochs, current_epoch, context_count, top25_dict) = args
-    # We'll store multiple raw context strings
+
+    (
+        idx,
+        df,
+        df_preprocessed,
+        df_preprocessed_top25,
+        total_epochs,
+        current_epoch,
+        context_count
+    ) = args
+
     candidate_contexts = []
 
-    for _ in range(context_count):
-        # 1) sample articles
-        sampled_list = sample_articles(df, index_list=[idx], top25_dict=top25_dict)
-        if not sampled_list:
-            continue
-        sample_dict = sampled_list[0]
-        # 2) format the concatenated context as a CPU-only string
-        context_str = format_concatenated_articles(sample_dict)
-        # store the raw string for now
-        candidate_contexts.append(context_str)
-    print(len(candidate_contexts), "llal")
-    # Just return all candidate strings
-    return candidate_contexts
+    # Step 1: Validate idx and gather main row
+    if idx < 0 or idx >= len(df):
+        return candidate_contexts  # out-of-bounds => empty
 
+    main_row = df.iloc[idx]
+    preproc_row = df_preprocessed.iloc[idx]  # row-aligned with df
+    symbol = main_row.get('Symbol', 'Unknown Symbol')
+
+    # We'll randomly sample up to 5 items from these columns
+    # but NOT from use_ebm_historical (where we take all).
+    sample_map = {
+        'use_ebm_economic':  5,
+        'use_ebm_industry':  5,
+        'use_ebm_sector':    5,
+        # We do NOT sample from 'use_ebm_historical'; we take the full list.
+    }
+
+    # Step 2: Build multiple contexts, each one is used by the EBM
+    for _ in range(context_count):
+        # A) ECONOMIC -> "markets" in your final dict
+        econ_list = preproc_row.get('use_ebm_economic', [])
+        econ_needed = min(len(econ_list), sample_map['use_ebm_economic'])
+        econ_indices = random.sample(econ_list, econ_needed) if econ_needed > 0 else []
+        markets_df = df.loc[econ_indices].copy() if econ_indices else pd.DataFrame()
+
+        # B) INDUSTRY -> "industry"
+        ind_list = preproc_row.get('use_ebm_industry', [])
+        ind_needed = min(len(ind_list), sample_map['use_ebm_industry'])
+        ind_indices = random.sample(ind_list, ind_needed) if ind_needed > 0 else []
+        industry_df = df.loc[ind_indices].copy() if ind_indices else pd.DataFrame()
+
+        # C) SECTOR -> "sector"
+        sec_list = preproc_row.get('use_ebm_sector', [])
+        sec_needed = min(len(sec_list), sample_map['use_ebm_sector'])
+        sec_indices = random.sample(sec_list, sec_needed) if sec_needed > 0 else []
+        sector_df = df.loc[sec_indices].copy() if sec_indices else pd.DataFrame()
+
+        # D) HISTORICAL -> "last_8"
+        # We take **all** references (no sampling), partial if <8 is handled by .head(8) in your formatting
+        hist_list = preproc_row.get('use_ebm_historical', [])
+        last_8_df = df.loc[hist_list].copy() if hist_list else pd.DataFrame()
+
+        # E) TOP25 -> "stock"
+        # up to 5 references from df_preprocessed_top25[symbol] if present
+        if df_preprocessed_top25 and symbol in df_preprocessed_top25:
+            top25_list = df_preprocessed_top25[symbol]
+        else:
+            top25_list = []
+        top25_needed = min(len(top25_list), 5)
+        top25_indices = random.sample(top25_list, top25_needed) if top25_needed > 0 else []
+        stock_df = df.loc[top25_indices].copy() if top25_indices else pd.DataFrame()
+
+        # F) CURRENT -> main article
+        current_df = pd.DataFrame([main_row])
+
+        # Step 3: Build dict for format_concatenated_articles
+        sample_dict = {
+            'markets': markets_df,
+            'industry': industry_df,
+            'sector': sector_df,
+            'stock': stock_df,
+            'last_8': last_8_df,
+            'current': current_df
+        }
+
+        # Step 4: Convert to final string
+        prompt_str = format_concatenated_articles(sample_dict)
+
+        # Step 5: Add to our list of contexts
+        candidate_contexts.append(prompt_str)
+
+    return candidate_contexts
 class ArticlePriceDataset(Dataset):
     def __init__(self,
                  articles: list,
