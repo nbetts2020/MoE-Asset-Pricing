@@ -83,7 +83,7 @@ def get_data(percent_data=100.0, run=False, update=False, args):
 
     if args.use_ebm:
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
-        df_preprocessed = dataset_preprocessed['train'].to_pandas()
+        df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
         df_preprocessed = df_preprocessed.head(num_samples)
 
         dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
