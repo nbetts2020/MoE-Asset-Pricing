@@ -52,7 +52,7 @@ def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
 
-def get_data(percent_data=100.0, run=False, update=False, args):
+def get_data(percent_data=100.0, run=False, update=False, args=None):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
 
