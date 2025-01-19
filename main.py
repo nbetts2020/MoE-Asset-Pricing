@@ -219,56 +219,56 @@ def main():
     # TRAIN MODE
     # -------------------------------------------
     if args.mode == 'train':
-
         # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
-
-        # Prepare optimizer BEFORE wrapping with DDP
-        # so we can reference model.token_embedding_table, etc.
+    
+        # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
-
-        # If using DDP, wrap AFTER param-grouping
+    
+        # Possibly wrap DDP
         if use_ddp:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                              output_device=local_rank, find_unused_parameters=True)
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, 
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True
+            )
             logging.info("Model wrapped with DistributedDataParallel.")
-
-        # Prepare data
-        train_dataloader, df, top25_dict = prepare_data(args, tokenizer)
-
-        # Initialize EBM if requested
+    
+        # Load data
+        train_dataloader, data_bundle = prepare_data(args, tokenizer)
+        df = data_bundle['df']
+        df_preprocessed = data_bundle['df_preprocessed']
+        df_preprocessed_top25 = data_bundle['df_preprocessed_top25']
+    
+        # Initialize EBM if using
         ebm = None
         ebm_optimizer = None
         if args.use_ebm:
-            from utils.ebm import EnergyBasedModel
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(),
-                                              lr=args.ebm_learning_rate*0.1)
-
-            # Re-create train_dataloader with custom collate_fn if needed
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
+    
             from utils.data import custom_collate_fn
             train_dataset = train_dataloader.dataset
             train_dataloader = DataLoader(
                 train_dataset, batch_size=args.batch_size, shuffle=True,
                 collate_fn=custom_collate_fn
             )
-
-        # SI
+    
+        # Initialize Synaptic Intelligence (SI), Elastic Weight Consolidation (EWC), Replay Buffer
         si = initialize_si(model, args) if args.use_si else None
-        # EWC
         if args.use_ewc:
             ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
             ewc_list = [ewc_instance]
         else:
             ewc_list = None
-        # Replay Buffer
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
-
-        # Train
+    
+        # Train the model
         train_model(
             model=model,
             optimizer=optimizer,
@@ -279,66 +279,69 @@ def main():
             si=si,
             ewc=ewc_list,
             replay_buffer=replay_buffer,
-            df=df,
+            df=df,  # Main DataFrame
+            df_preprocessed=df_preprocessed,
+            df_preprocessed_top25=df_preprocessed_top25,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
-            tokenizer=tokenizer,
-            top25_dict=top25_dict
+            tokenizer=tokenizer
         )
         logging.info("Training completed.")
-
+    
+        # Save EBM if applicable
         if ebm and (rank == 0):
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
-
-        # Save final model/states
+    
+        # Save final model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
-
     # -------------------------------------------
     # UPDATE MODE
     # -------------------------------------------
     elif args.mode == 'update':
-        update_dataloader, df = prepare_data(args, tokenizer)
-
+        update_dataloader, data_bundle = prepare_data(args, tokenizer)
+        df = data_bundle['df']
+        df_preprocessed = data_bundle['df_preprocessed']
+        df_preprocessed_top25 = data_bundle['df_preprocessed_top25']
+    
         if not all([args.bucket]):
             raise ValueError("When using EBM sampling in 'update', --bucket is required.")
-
+    
         download_models_from_s3(bucket=args.bucket)
-
-        # Initialize from scratch, then load
+    
+        # Initialize model and load weights
         model, _ = initialize_model(args, device, init_from_scratch=True)
-        model.to(device)
-
-        # Load main model weights
         model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from S3.")
-
-        # Possibly load EBM
+    
+        # Load EBM if using
         ebm = None
+        ebm_optimizer = None
         if args.use_ebm:
-            from utils.ebm import EnergyBasedModel
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-
-        # Prepare optimizer (model module) BEFORE DDP
+    
+        # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
-
+    
+        # Wrap DDP if needed
         if use_ddp:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                              output_device=local_rank)
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank
+            )
             logging.info("Model wrapped with DistributedDataParallel.")
-
-        # Possibly re-create update dataloader if using EBM
-        ebm_optimizer = None
-        if args.use_ebm:
-            from utils.ebm import EnergyBasedModel
+    
+        # Re-create DataLoader with custom collate_fn if using EBM
+        if args.use_ebm and ebm is not None:
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
             from utils.data import custom_collate_fn
             update_dataset = update_dataloader.dataset
@@ -346,18 +349,16 @@ def main():
                 update_dataset, batch_size=args.batch_size, shuffle=True,
                 collate_fn=custom_collate_fn
             )
-
+    
+        # Initialize SI, EWC, Replay Buffer
         si = initialize_si(model, args) if args.use_si else None
-
-        # Possibly load EWC
         if args.use_ewc:
             ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
             if os.path.exists(ewc_state_path):
                 ewc_states = torch.load(ewc_state_path, map_location=device)
                 ewc_list = []
                 for state in ewc_states:
-                    ewc_instance = ElasticWeightConsolidation(model, dataloader=None,
-                                                              device=device, args=args)
+                    ewc_instance = ElasticWeightConsolidation(model, dataloader=None, device=device, args=args)
                     ewc_instance.params = {n: p.to(device) for n, p in state['params'].items()}
                     ewc_instance.fisher = {n: f.to(device) for n, f in state['fisher'].items()}
                     ewc_list.append(ewc_instance)
@@ -368,11 +369,11 @@ def main():
                 ewc_list = [ewc_instance]
         else:
             ewc_list = None
-
+    
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
-
-        # Do the update
-        logging.info("Starting updating...")
+    
+        # Perform the update
+        logging.info("Starting update...")
         train_model(
             model=model,
             optimizer=optimizer,
@@ -384,62 +385,70 @@ def main():
             ewc=ewc_list,
             replay_buffer=replay_buffer,
             df=df,
+            df_preprocessed=df_preprocessed,
+            df_preprocessed_top25=df_preprocessed_top25,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer
         )
-        logging.info("Updating completed.")
-
+        logging.info("Update completed.")
+    
+        # Save EBM if applicable
         if ebm and (rank == 0):
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
-
+    
+        # Save final model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
-
     # -------------------------------------------
     # RUN MODE
     # -------------------------------------------
     elif args.mode == 'run':
-        # If not just testing, ensure we have stock/date/text/bucket
+        # Validate input arguments
         if (not args.test) and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("In 'run' mode with EBM (no --test), must provide --stock, --date, --text, --bucket.")
         elif args.test and not args.bucket:
             raise ValueError("When evaluating on test set, provide --bucket.")
-
-        run_dataloader, df, top25_dict = prepare_data(args, tokenizer)
+    
+        # Prepare data
+        run_dataloader, data_bundle = prepare_data(args, tokenizer)
+        df = data_bundle['df']
+        df_preprocessed = data_bundle['df_preprocessed']
+        df_preprocessed_top25 = data_bundle['df_preprocessed_top25']
+    
+        # Download models
         download_models_from_s3(bucket=args.bucket)
-
+    
+        # Initialize and load the main model
         model, _ = initialize_model(args, device, init_from_scratch=True)
-        model.to(device)
-        # Load main model weights
         model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from S3.")
-
+    
+        # Load EBM if using and not in test mode
         if args.use_ebm and (not args.test):
-            from utils.ebm import EnergyBasedModel
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-
-            # Possibly override sample_count
-            num_samples = args.test if args.test else 25
+    
+            # Select context using EBM
             selected_context = ebm_select_contexts(
                 df=df,
                 stock=args.stock,
                 date=args.date,
-                sample_count=num_samples,
+                text=args.text,  # Pass the input text
                 model=model,
                 ebm=ebm,
-                tokenizer=tokenizer
+                tokenizer=tokenizer,
+                ebm_samples=args.ebm_num_samples
             )
             final_input = f"{selected_context}\n{args.text}"
-
+    
             encoding = tokenizer(
                 final_input,
                 truncation=True,
@@ -448,11 +457,11 @@ def main():
                 return_tensors='pt'
             ).to(device)
             input_ids = encoding["input_ids"]
-
+    
             with torch.no_grad():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
-
+    
         elif not args.test:
             # Simple run without EBM
             encoding = tokenizer(
@@ -466,10 +475,9 @@ def main():
             with torch.no_grad():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
-
+    
         else:
             # Evaluate on test set
-            from utils.data import ArticlePriceDataset
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
                 prices=df['weighted_avg_720_hrs'].tolist(),
@@ -484,6 +492,7 @@ def main():
                 total_epochs=1,
                 use_ebm=args.use_ebm
             )
+
             # ---- Call evaluate_model and Unpack Metrics ----
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
             
