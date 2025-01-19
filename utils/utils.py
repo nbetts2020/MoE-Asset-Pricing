@@ -685,9 +685,12 @@ def prepare_optimizer(model, args):
 def prepare_data(args, tokenizer):
     """
     Loads df, df_preprocessed, and df_preprocessed_top25 from get_data().
-    Returns DataLoader(s) depending on mode.
+    Returns:
+        (DataLoader, dict):
+          - The DataLoader for the current mode (train/run/update).
+          - A dictionary containing 'df', 'df_preprocessed', 'df_preprocessed_top25'.
     """
-    # get_data() returns (df, df_preprocessed, df_preprocessed_top25)
+    # Load data
     df, df_preprocessed, df_preprocessed_top25 = get_data(
         percent_data=args.percent_data,
         run=(args.mode == 'run'),
@@ -695,17 +698,23 @@ def prepare_data(args, tokenizer):
         args=args
     )
 
+    data_bundle = {
+        'df': df,
+        'df_preprocessed': df_preprocessed,
+        'df_preprocessed_top25': df_preprocessed_top25
+    }
+
     if args.mode == 'train':
         train_loader = prepare_dataloader(
             df,
             df_preprocessed,
-            df_preprocessed_top25,  # <-- dictionary for top25
+            df_preprocessed_top25,
             tokenizer,
             batch_size=config.BATCH_SIZE,
             shuffle=True,
             args=args
         )
-        return train_loader, df
+        return train_loader, data_bundle
 
     elif args.mode == 'run':
         run_loader = prepare_dataloader(
@@ -717,7 +726,7 @@ def prepare_data(args, tokenizer):
             shuffle=False,
             args=args
         )
-        return run_loader, df
+        return run_loader, data_bundle
 
     elif args.mode == 'update':
         update_loader = prepare_dataloader(
@@ -729,9 +738,11 @@ def prepare_data(args, tokenizer):
             shuffle=True,
             args=args
         )
-        # Possibly combine with old training data if desired
-        old_train_df, _, _ = get_data(percent_data=args.percent_data, args=args)
-        return update_loader, pd.concat([old_train_df, df])
+        # Optionally combine with old training data
+        old_train_df, _, _ = get_data(percent_data=args.percent_data, run=False, update=False, args=args)
+        combined_df = pd.concat([old_train_df, df])
+        data_bundle['df'] = combined_df  # Update 'df' in the bundle
+        return update_loader, data_bundle
 
     else:
         raise ValueError(f"Invalid mode: {args.mode}")
