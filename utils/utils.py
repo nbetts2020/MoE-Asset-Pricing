@@ -92,16 +92,17 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
     if run:
         df = df[split1:split2]
-        df_preprocessed = df_preprocessed[split1:split2]
-        df_preprocessed_top25 = df_preprocessed_top25[split1:split2]
+        df_preprocessed = df_preprocessed[:split2]
+        df_preprocessed_top25 = {key: [value for value in values if value >= split2] for key, values in df_preprocessed_top25.items()}
+
     elif update:
         df = df[split2:]
-        df_preprocessed = df_preprocessed[split2:]
-        df_preprocessed_top25 = df_preprocessed_top25[split2:]
+        
     else:
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
         df_preprocessed_top25 = df_preprocessed_top25[:split1]
+
     return df, df_preprocessed, df_preprocessed_top25
 
 def get_new_data(new_data_url):
