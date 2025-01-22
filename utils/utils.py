@@ -81,27 +81,28 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     df_preprocessed = None
     df_preprocessed_top25 = None
 
-    if args.use_ebm:
+    if train:
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
         df_preprocessed = df_preprocessed.head(num_samples)
 
+        df = df[:split1]
+        df_preprocessed = df_preprocessed[:split1]
+
         dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
         df_preprocessed_top25 = dataset_preprocessed_top25['train'].to_dict()
-        df_preprocessed_top25 = {key: [value for value in values if value >= num_samples] for key, values in df_preprocessed_top25.items()}
+        df_preprocessed_top25 = {
+            key: [item for sublist in values for item in sublist if item >= split1]
+            for key, values in df_preprocessed_top25.items()
+        }
 
-    if run:
+    elif run:
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
         df_preprocessed_top25 = {key: [value for value in values if value >= split2] for key, values in df_preprocessed_top25.items()}
 
     elif update:
         df = df[split2:]
-        
-    else:
-        df = df[:split1]
-        df_preprocessed = df_preprocessed[:split1]
-        df_preprocessed_top25 = df_preprocessed_top25[:split1]
 
     return df, df_preprocessed, df_preprocessed_top25
 
