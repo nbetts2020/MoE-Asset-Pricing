@@ -81,7 +81,7 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     df_preprocessed = None
     df_preprocessed_top25 = None
 
-    if train:
+    if args.mode == "train":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
         df_preprocessed = df_preprocessed.head(num_samples)
@@ -96,12 +96,12 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
             for key, values in df_preprocessed_top25.items()
         }
 
-    elif run:
+    elif args.mode == "run":
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
         df_preprocessed_top25 = {key: [value for value in values if value >= split2] for key, values in df_preprocessed_top25.items()}
 
-    elif update:
+    elif args.mode == "update":
         df = df[split2:]
 
     return df, df_preprocessed, df_preprocessed_top25
