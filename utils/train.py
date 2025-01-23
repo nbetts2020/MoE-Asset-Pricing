@@ -28,6 +28,7 @@ def train_model(
     ewc=None,             # optional EWC list
     replay_buffer=None,   # optional replay buffer
     df=None,              # entire DataFrame for sampling contexts
+    df_preprocessed=None,
     ebm=None,             # EBM model
     ebm_optimizer=None,   # EBM optimizer
     tokenizer=None,
@@ -147,7 +148,7 @@ def train_model(
                 cpu_args_list.append((
                     idx_list[i],
                     df,
-                    df_preprocessed,
+                    ,
                     df_preprocessed_top25,
                     tokenizer,
                     epochs,
