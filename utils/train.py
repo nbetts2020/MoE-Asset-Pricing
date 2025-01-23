@@ -150,7 +150,6 @@ def train_model(
                     df,
                     df_preprocessed,
                     top25_dict,
-                    tokenizer,
                     epochs,
                     epoch,
                     context_count
