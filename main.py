@@ -281,7 +281,7 @@ def main():
             replay_buffer=replay_buffer,
             df=df,  # Main DataFrame
             df_preprocessed=df_preprocessed,
-            top25_dict=df_preprocessed_top25,
+            top25_dict=top25_dict,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer
@@ -386,7 +386,7 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             df_preprocessed=df_preprocessed,
-            top25_dict=df_preprocessed_top25,
+            top25_dict=top25_dict,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer
