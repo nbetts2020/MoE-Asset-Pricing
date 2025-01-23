@@ -153,8 +153,7 @@ def train_model(
                     tokenizer,
                     epochs,
                     epoch,
-                    context_count,
-                    top25_dict
+                    context_count
                 ))
             # parallel gather
             max_workers = max(os.cpu_count() - 1, 1)
