@@ -9,6 +9,8 @@ import os
 import concurrent.futures
 import numpy as np
 
+import random
+
 from utils.sampling import sample_articles
 from utils.config import config
 
