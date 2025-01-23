@@ -148,8 +148,8 @@ def train_model(
                 cpu_args_list.append((
                     idx_list[i],
                     df,
-                    ,
-                    df_preprocessed_top25,
+                    df_preprocessed,
+                    top25_dict,
                     tokenizer,
                     epochs,
                     epoch,
