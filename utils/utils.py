@@ -92,7 +92,7 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
         df_preprocessed_top25 = dataset_preprocessed_top25['train'].to_dict()
         df_preprocessed_top25 = {
-            key: [item for sublist in values for item in sublist if item >= split1]
+            key: [item for sublist in values for item in sublist if item < split1]
             for key, values in df_preprocessed_top25.items()
         }
 
