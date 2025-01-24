@@ -487,10 +487,10 @@ def prepare_dataloader(df,
 
     if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(dataset, shuffle=shuffle)
+        sampler = DistributedSampler(dataset, shuffle=False)
         return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     else:
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 def prepare_tasks(tokenizer, args, k=3):
     """
@@ -710,7 +710,7 @@ def prepare_data(args, tokenizer):
             df_preprocessed_top25,
             tokenizer,
             batch_size=config.BATCH_SIZE,
-            shuffle=True,
+            shuffle=False,
             args=args
         )
         return train_loader, data_bundle
@@ -734,7 +734,7 @@ def prepare_data(args, tokenizer):
             df_preprocessed_top25,
             tokenizer,
             batch_size=config.BATCH_SIZE,
-            shuffle=True,
+            shuffle=False,
             args=args
         )
         # Optionally combine with old training data
