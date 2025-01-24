@@ -81,7 +81,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     split2 = int(len(df) * 0.85)
 
     df_preprocessed = None
-    df_preprocessed_top25 = None
 
     excluded_df_indices_list = excluded_df.index.tolist()
     excluded_df_indices_list_split1 = [i for i in excluded_df_indices_list if i < split1]
@@ -115,15 +114,11 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_historical Filtering Complete!")
 
-        dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
-        dataset_preprocessed_top25 = dataset_preprocessed_top25['train'].to_pandas()
-
-        dataset_preprocessed_top25['use_ebm_top25'] = dataset_preprocessed_top25['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
 
         logging.info("use_ebm_top25 Filtering Complete!")
-
-        df_preprocessed = merged_df = pd.concat([df_preprocessed, dataset_preprocessed_top25], axis=1)
-
+        
     elif args.mode == "run":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
@@ -152,14 +147,10 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_historical Filtering Complete!")
 
-        dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
-        dataset_preprocessed_top25 = dataset_preprocessed_top25['train'].to_pandas()
-
-        dataset_preprocessed_top25['use_ebm_top25'] = dataset_preprocessed_top25['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
+        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
         logging.info("use_ebm_top25 Filtering Complete!")
-
-        df_preprocessed = merged_df = pd.concat([df_preprocessed, dataset_preprocessed_top25], axis=1)
 
     elif args.mode == "update":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
@@ -188,16 +179,12 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_historical Filtering Complete!")
 
-        dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
-        dataset_preprocessed_top25 = dataset_preprocessed_top25['train'].to_pandas()
-
-        dataset_preprocessed_top25['use_ebm_top25'] = dataset_preprocessed_top25['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
+        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
         logging.info("use_ebm_top25 Filtering Complete!")
 
-        df_preprocessed = merged_df = pd.concat([df_preprocessed, dataset_preprocessed_top25], axis=1)
-
-    return df, df_preprocessed, None
+    return df, df_preprocessed
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
@@ -444,14 +431,12 @@ def process_group_wrapper(args):
 
 def process_data(df,
                  df_preprocessed,
-                 df_preprocessed_top25,
                  tokenizer,
                  use_ebm_format=False):
     """
     Builds final text for each row.
     - If not use_ebm_format, just do your old single-article style.
     - If use_ebm_format, gather references from df_preprocessed (economic etc.)
-      plus top25 from df_preprocessed_top25, then append the main article last.
     """
 
     articles = []
@@ -494,7 +479,6 @@ def process_data(df,
         else:
             # --- EBM STYLE: gather from df_preprocessed + top25 DataFrame ---
             preproc_row     = df_preprocessed.iloc[i]
-            preproc_row_25  = df_preprocessed_top25.iloc[i] if df_preprocessed_top25 is not None else {}
 
             # Each of these should be a list of indices if your parquet has them as lists
             econ_idxs = preproc_row.get('use_ebm_economic', [])
@@ -502,7 +486,7 @@ def process_data(df,
             sec_idxs  = preproc_row.get('use_ebm_sector', [])
             hist_idxs = preproc_row.get('use_ebm_historical', [])
 
-            top25_idxs = preproc_row_25.get('use_ebm_top25', [])  # Example col name
+            top25_idxs = preproc_row.get('use_ebm_top25', [])  # Example col name
 
             def gather_ref_text(idxs, label):
                 chunks = []
@@ -547,13 +531,12 @@ def process_data(df,
 
 def prepare_dataloader(df,
                        df_preprocessed,
-                       df_preprocessed_top25,
                        tokenizer,
                        batch_size,
                        shuffle,
                        args):
     """
-    Pass df, df_preprocessed, and df_preprocessed_top25 to process_data.
+    Pass df and df_preprocessed to process_data.
     Then wrap the resulting data in ArticlePriceDataset -> DataLoader.
     """
     (articles, prices, sectors, dates,
@@ -561,7 +544,6 @@ def prepare_dataloader(df,
      symbols, industries, rfr) = process_data(
          df,
          df_preprocessed,
-         df_preprocessed_top25,
          tokenizer,
          use_ebm_format=args.use_ebm_format
      )
@@ -594,10 +576,10 @@ def prepare_tasks(tokenizer, args, k=3):
     separate DataLoaders for each sector.
     """
     # Load everything
-    df, df_preprocessed, df_preprocessed_top25 = get_data(
+    df, df_preprocessed = get_data(
         percent_data=args.percent_data,
-        run=False,      # or however you want
-        update=False,   # or however you want
+        run=False,
+        update=False,
         args=args
     )
 
@@ -611,8 +593,6 @@ def prepare_tasks(tokenizer, args, k=3):
         # For df_preprocessed (row-aligned), subset by the same index
         dfp_task = df_preprocessed.loc[df_task.index].copy()
         
-        task_top25 = df_preprocessed_top25  # Pass the full dictionary
-
         loader = prepare_dataloader(
             df_task,
             dfp_task,
@@ -779,14 +759,14 @@ def prepare_optimizer(model, args):
 
 def prepare_data(args, tokenizer):
     """
-    Loads df, df_preprocessed, and df_preprocessed_top25 from get_data().
+    Loads df and df_preprocessed from get_data().
     Returns:
         (DataLoader, dict):
           - The DataLoader for the current mode (train/run/update).
-          - A dictionary containing 'df', 'df_preprocessed', 'df_preprocessed_top25'.
+          - A dictionary containing 'df', 'df_preprocessed'.
     """
     # Load data
-    df, df_preprocessed, df_preprocessed_top25 = get_data(
+    df, df_preprocessed = get_data(
         percent_data=args.percent_data,
         run=(args.mode == 'run'),
         update=(args.mode == 'update'),
@@ -795,15 +775,13 @@ def prepare_data(args, tokenizer):
 
     data_bundle = {
         'df': df,
-        'df_preprocessed': df_preprocessed,
-        'df_preprocessed_top25': df_preprocessed_top25
+        'df_preprocessed': df_preprocessed
     }
 
     if args.mode == 'train':
         train_loader = prepare_dataloader(
             df,
             df_preprocessed,
-            df_preprocessed_top25,
             tokenizer,
             batch_size=config.BATCH_SIZE,
             shuffle=False,
@@ -815,7 +793,6 @@ def prepare_data(args, tokenizer):
         run_loader = prepare_dataloader(
             df,
             df_preprocessed,
-            df_preprocessed_top25,
             tokenizer,
             batch_size=config.BATCH_SIZE,
             shuffle=False,
@@ -827,7 +804,6 @@ def prepare_data(args, tokenizer):
         update_loader = prepare_dataloader(
             df,
             df_preprocessed,
-            df_preprocessed_top25,
             tokenizer,
             batch_size=config.BATCH_SIZE,
             shuffle=False,
