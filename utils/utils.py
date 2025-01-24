@@ -63,6 +63,8 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
+
+    excluded_df = df[(df['weighted_avg_0_hrs'] <= 0) & (df['weighted_avg_720_hrs'] <= 0)]
     df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
 
     df = df.head(num_samples)
@@ -81,11 +83,10 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     df_preprocessed = None
     df_preprocessed_top25 = None
 
-    df_indices_list = df.index.tolist()
-    df_indices_list_split1 = [i for i in df_indices_list if i < split1]
-    df_indices_list_split2 = [i for i in df_indices_list if i < split2]
+    excluded_df_indices_list = excluded_df.index.tolist()
+    excluded_df_indices_list_split1 = [i for i in excluded_df_indices_list if i < split1]
+    excluded_df_indices_list_split2 = [i for i in excluded_df_indices_list if i < split2]
 
-    print(split1, "split1")
     if args.mode == "train":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
@@ -95,48 +96,108 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df_preprocessed = df_preprocessed[:split1]
 
         df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+
+        logging.info("use_ebm_economic Filtering Complete!")
 
         df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+
+        logging.info("use_ebm_industry Filtering Complete!")
 
         df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+
+        logging.info("use_ebm_sector Filtering Complete!")
 
         df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+
+        logging.info("use_ebm_historical Filtering Complete!")
 
         dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
-        df_preprocessed_top25 = dataset_preprocessed_top25['train'].to_dict()
-        df_preprocessed_top25 = {
-            key: [item for sublist in values for item in sublist if item in df_indices_list_split1]
-            for key, values in df_preprocessed_top25.items()
-        }
+        dataset_preprocessed_top25 = dataset_preprocessed_top25['train'].to_pandas()
+
+        dataset_preprocessed_top25['use_ebm_top25'] = dataset_preprocessed_top25['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+
+        logging.info("use_ebm_top25 Filtering Complete!")
+
+        df_preprocessed = merged_df = pd.concat([df_preprocessed, dataset_preprocessed_top25], axis=1)
 
     elif args.mode == "run":
+        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
+        df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
+        df_preprocessed = df_preprocessed.head(num_samples)
+
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
 
         df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
+
+        logging.info("use_ebm_economic Filtering Complete!")
 
         df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
+
+        logging.info("use_ebm_industry Filtering Complete!")
 
         df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
+
+        logging.info("use_ebm_sector Filtering Complete!")
 
         df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
+        logging.info("use_ebm_historical Filtering Complete!")
 
-        df_preprocessed_top25 = {key: [value for value in values if value in df_indices_list_split2] for key, values in df_preprocessed_top25.items()}
+        dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
+        dataset_preprocessed_top25 = dataset_preprocessed_top25['train'].to_pandas()
+
+        dataset_preprocessed_top25['use_ebm_top25'] = dataset_preprocessed_top25['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
+
+        logging.info("use_ebm_top25 Filtering Complete!")
+
+        df_preprocessed = merged_df = pd.concat([df_preprocessed, dataset_preprocessed_top25], axis=1)
 
     elif args.mode == "update":
+        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
+        df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
+        df_preprocessed = df_preprocessed.head(num_samples)
+
         df = df[split2:]
 
-    return df, df_preprocessed, df_preprocessed_top25
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
+        logging.info("use_ebm_economic Filtering Complete!")
+
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
+
+        logging.info("use_ebm_industry Filtering Complete!")
+
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
+
+        logging.info("use_ebm_sector Filtering Complete!")
+
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
+
+        logging.info("use_ebm_historical Filtering Complete!")
+
+        dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
+        dataset_preprocessed_top25 = dataset_preprocessed_top25['train'].to_pandas()
+
+        dataset_preprocessed_top25['use_ebm_top25'] = dataset_preprocessed_top25['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
+
+        logging.info("use_ebm_top25 Filtering Complete!")
+
+        df_preprocessed = merged_df = pd.concat([df_preprocessed, dataset_preprocessed_top25], axis=1)
+
+    return df, df_preprocessed, None
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
