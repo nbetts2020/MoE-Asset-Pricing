@@ -31,8 +31,7 @@ def train_model(
     df_preprocessed=None,
     ebm=None,             # EBM model
     ebm_optimizer=None,   # EBM optimizer
-    tokenizer=None,
-    top25_dict=None
+    tokenizer=None
 ):
     """
     Multi-context EBM approach in half precision for flash-attn.
@@ -149,7 +148,6 @@ def train_model(
                     idx_list[i],
                     df,
                     df_preprocessed,
-                    top25_dict,
                     epochs,
                     epoch,
                     context_count
