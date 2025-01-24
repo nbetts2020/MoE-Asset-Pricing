@@ -186,7 +186,6 @@ def parallel_context_generation_worker(args):
         idx,
         df,
         df_preprocessed,
-        df_preprocessed_top25,
         total_epochs,
         current_epoch,
         context_count
@@ -236,7 +235,6 @@ def parallel_context_generation_worker(args):
         last_8_df = df.loc[hist_list].copy() if hist_list else pd.DataFrame()
 
         # E) TOP25 -> "stock"
-        # up to 5 references from df_preprocessed_top25[symbol] if present
         top25_list = preproc_row.get('use_ebm_top25', [])
         top25_needed = min(len(top25_list), sample_map['use_ebm_top25'])
         top25_indices = random.sample(top25_list, top25_needed) if top25_needed > 0 else []
