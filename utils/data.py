@@ -82,10 +82,16 @@ def format_concatenated_articles(sample: dict) -> str:
             f"Title: {row.get('Title', 'N/A')}\n"
             f"Article: {row.get('Article', 'N/A')}\n"
         )
-
+    print(sample.get('stock', pd.DataFrame()), "LALA", sample.get('stock').columns)
     # Information Indicating Significant Market Movement Related to Current Stock
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
-    stock = sample.get('stock', pd.DataFrame()).nlargest(5, 'Percentage Change')
+    #stock = sample.get('stock', pd.DataFrame()).nlargest(5, 'Percentage Change')
+    stock_df = sample.get('stock', pd.DataFrame())
+    if not stock_df.empty:
+        stock = stock_df.nlargest(5, 'Percentage Change')
+    else:
+        stock = pd.DataFrame()  # Or handle the empty case as needed
+
     for _, row in stock.iterrows():
         date = row.get('Date', pd.Timestamp('1970-01-01'))
         if not isinstance(date, pd.Timestamp):
@@ -165,7 +171,7 @@ def parallel_context_generation_worker(args):
     ) = args
 
     candidate_contexts = []
-
+    print(len(df), "len_df")
     # Step 1: Validate idx and gather main row
     if idx < 0 or idx >= len(df):
         return candidate_contexts  # out-of-bounds => empty
@@ -173,7 +179,6 @@ def parallel_context_generation_worker(args):
     main_row = df.iloc[idx]
     preproc_row = df_preprocessed.iloc[idx]  # row-aligned with df
     symbol = main_row.get('Symbol', 'Unknown Symbol')
-
     # We'll randomly sample up to 5 items from these columns
     # but NOT from use_ebm_historical (where we take all).
     sample_map = {
@@ -187,21 +192,19 @@ def parallel_context_generation_worker(args):
     for _ in range(context_count):
         # A) ECONOMIC -> "markets" in your final dict
         econ_list = preproc_row.get('use_ebm_economic', [])
-        econ_list = ast.literal_eval(econ_list)
         econ_needed = min(len(econ_list), sample_map['use_ebm_economic'])
         econ_indices = random.sample(econ_list, econ_needed) if econ_needed > 0 else []
+        print(type(econ_indices), "EI", len(df), df.head(), econ_indices, idx)
         markets_df = df.loc[econ_indices].copy() if econ_indices else pd.DataFrame()
 
         # B) INDUSTRY -> "industry"
         ind_list = preproc_row.get('use_ebm_industry', [])
-        ind_list = ast.literal_eval(ind_list)
         ind_needed = min(len(ind_list), sample_map['use_ebm_industry'])
         ind_indices = random.sample(ind_list, ind_needed) if ind_needed > 0 else []
         industry_df = df.loc[ind_indices].copy() if ind_indices else pd.DataFrame()
 
         # C) SECTOR -> "sector"
         sec_list = preproc_row.get('use_ebm_sector', [])
-        sec_list = ast.literal_eval(sec_list)
         sec_needed = min(len(sec_list), sample_map['use_ebm_sector'])
         sec_indices = random.sample(sec_list, sec_needed) if sec_needed > 0 else []
         sector_df = df.loc[sec_indices].copy() if sec_indices else pd.DataFrame()
@@ -209,7 +212,6 @@ def parallel_context_generation_worker(args):
         # D) HISTORICAL -> "last_8"
         # We take **all** references (no sampling), partial if <8 is handled by .head(8) in your formatting
         hist_list = preproc_row.get('use_ebm_historical', [])
-        hist_list = ast.literal_eval(hist_list)
         last_8_df = df.loc[hist_list].copy() if hist_list else pd.DataFrame()
 
         # E) TOP25 -> "stock"
@@ -221,7 +223,6 @@ def parallel_context_generation_worker(args):
         top25_needed = min(len(top25_list), 5)
         top25_indices = random.sample(top25_list, top25_needed) if top25_needed > 0 else []
         stock_df = df.loc[top25_indices].copy() if top25_indices else pd.DataFrame()
-
         # F) CURRENT -> main article
         current_df = pd.DataFrame([main_row])
 
