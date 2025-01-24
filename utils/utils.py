@@ -62,7 +62,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
-    df.sort_values(by='Date', inplace=True)
     df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
     df = df.head(num_samples)
 
@@ -71,8 +70,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-
-    df.reset_index(drop=True, inplace=True)
 
     # 70/15/15 split
     split1 = int(len(df) * 0.7)
