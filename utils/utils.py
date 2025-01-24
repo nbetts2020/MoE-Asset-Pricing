@@ -43,6 +43,7 @@ import numpy as np
 
 from multiprocessing import Pool, cpu_count
 import random
+import ast
 
 import torch.distributed as dist
 
@@ -63,10 +64,12 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
     df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
+
     df = df.head(num_samples)
 
     safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
-    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div) * 100
+    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div)
+
 
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
@@ -78,6 +81,11 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     df_preprocessed = None
     df_preprocessed_top25 = None
 
+    df_indices_list = df.index.tolist()
+    df_indices_list_split1 = [i for i in df_indices_list if i < split1]
+    df_indices_list_split2 = [i for i in df_indices_list if i < split2]
+
+    print(split1, "split1")
     if args.mode == "train":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
@@ -86,22 +94,49 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
 
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i in df_indices_list_split1])
+
         dataset_preprocessed_top25 = load_dataset("nbettencourt/SC454k-preprocessed-top25")
         df_preprocessed_top25 = dataset_preprocessed_top25['train'].to_dict()
         df_preprocessed_top25 = {
-            key: [item for sublist in values for item in sublist if item < split1]
+            key: [item for sublist in values for item in sublist if item in df_indices_list_split1]
             for key, values in df_preprocessed_top25.items()
         }
 
     elif args.mode == "run":
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
-        df_preprocessed_top25 = {key: [value for value in values if value >= split2] for key, values in df_preprocessed_top25.items()}
+
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
+        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i in df_indices_list_split2])
+
+
+        df_preprocessed_top25 = {key: [value for value in values if value in df_indices_list_split2] for key, values in df_preprocessed_top25.items()}
 
     elif args.mode == "update":
         df = df[split2:]
 
     return df, df_preprocessed, df_preprocessed_top25
+
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
