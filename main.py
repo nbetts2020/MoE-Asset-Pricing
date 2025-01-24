@@ -243,7 +243,6 @@ def main():
         train_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
-        top25_dict = data_bundle['df_preprocessed_top25']
     
         # Initialize EBM if using
         ebm = None
@@ -281,7 +280,6 @@ def main():
             replay_buffer=replay_buffer,
             df=df,  # Main DataFrame
             df_preprocessed=df_preprocessed,
-            top25_dict=top25_dict,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer
@@ -302,7 +300,6 @@ def main():
         update_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
-        top25_dict = data_bundle['df_preprocessed_top25']
     
         if not all([args.bucket]):
             raise ValueError("When using EBM sampling in 'update', --bucket is required.")
@@ -386,7 +383,6 @@ def main():
             replay_buffer=replay_buffer,
             df=df,
             df_preprocessed=df_preprocessed,
-            top25_dict=top25_dict,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer
@@ -414,7 +410,6 @@ def main():
         run_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
-        top25_dict = data_bundle['df_preprocessed_top25']
     
         # Download models
         download_models_from_s3(bucket=args.bucket)
@@ -598,7 +593,6 @@ def main():
     # Clean up DDP
     if use_ddp:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
