@@ -255,7 +255,7 @@ def main():
             from utils.data import custom_collate_fn
             train_dataset = train_dataloader.dataset
             train_dataloader = DataLoader(
-                train_dataset, batch_size=args.batch_size, shuffle=True,
+                train_dataset, batch_size=args.batch_size, shuffle=False,
                 collate_fn=custom_collate_fn
             )
     
@@ -346,7 +346,7 @@ def main():
             from utils.data import custom_collate_fn
             update_dataset = update_dataloader.dataset
             update_dataloader = DataLoader(
-                update_dataset, batch_size=args.batch_size, shuffle=True,
+                update_dataset, batch_size=args.batch_size, shuffle=False,
                 collate_fn=custom_collate_fn
             )
     
