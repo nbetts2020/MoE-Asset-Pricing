@@ -10,6 +10,7 @@ import concurrent.futures
 import numpy as np
 
 import random
+import ast
 
 from utils.sampling import sample_articles
 from utils.config import config
@@ -186,18 +187,21 @@ def parallel_context_generation_worker(args):
     for _ in range(context_count):
         # A) ECONOMIC -> "markets" in your final dict
         econ_list = preproc_row.get('use_ebm_economic', [])
+        econ_list = ast.literal_eval(econ_list)
         econ_needed = min(len(econ_list), sample_map['use_ebm_economic'])
         econ_indices = random.sample(econ_list, econ_needed) if econ_needed > 0 else []
         markets_df = df.loc[econ_indices].copy() if econ_indices else pd.DataFrame()
 
         # B) INDUSTRY -> "industry"
         ind_list = preproc_row.get('use_ebm_industry', [])
+        ind_list = ast.literal_eval(ind_list)
         ind_needed = min(len(ind_list), sample_map['use_ebm_industry'])
         ind_indices = random.sample(ind_list, ind_needed) if ind_needed > 0 else []
         industry_df = df.loc[ind_indices].copy() if ind_indices else pd.DataFrame()
 
         # C) SECTOR -> "sector"
         sec_list = preproc_row.get('use_ebm_sector', [])
+        sec_list = ast.literal_eval(sec_list)
         sec_needed = min(len(sec_list), sample_map['use_ebm_sector'])
         sec_indices = random.sample(sec_list, sec_needed) if sec_needed > 0 else []
         sector_df = df.loc[sec_indices].copy() if sec_indices else pd.DataFrame()
@@ -205,6 +209,7 @@ def parallel_context_generation_worker(args):
         # D) HISTORICAL -> "last_8"
         # We take **all** references (no sampling), partial if <8 is handled by .head(8) in your formatting
         hist_list = preproc_row.get('use_ebm_historical', [])
+        hist_list = ast.literal_eval(hist_list)
         last_8_df = df.loc[hist_list].copy() if hist_list else pd.DataFrame()
 
         # E) TOP25 -> "stock"
