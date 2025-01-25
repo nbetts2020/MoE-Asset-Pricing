@@ -50,8 +50,6 @@ import torch.distributed as dist
 
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
 
-pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
-
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
@@ -60,7 +58,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
 
-    # Assuming 'login' is a defined function
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k")
     df = dataset['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
@@ -68,13 +65,19 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
 
-    excluded_df = df[(df['weighted_avg_0_hrs'] <= 0) & (df['weighted_avg_720_hrs'] <= 0)]
-    df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
+    excluded_df = df[
+        (df['weighted_avg_0_hrs'] <= 0) &
+        (df['weighted_avg_720_hrs'] <= 0)
+    ]
+    df = df[
+        (df['weighted_avg_0_hrs'] > 0) &
+        (df['weighted_avg_720_hrs'] > 0)
+    ]
 
     df = df.head(num_samples)
 
     safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
-    df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div)
+    df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
 
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
@@ -89,7 +92,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     excluded_df_indices_list_split1 = [i for i in excluded_df_indices_list if i < split1]
     excluded_df_indices_list_split2 = [i for i in excluded_df_indices_list if i < split2]
 
-    # Define the columns to filter
     filter_columns = [
         'use_ebm_economic',
         'use_ebm_industry',
@@ -99,7 +101,7 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     ]
 
     def filter_function(x, excluded_indices):
-        return [i for i in x if i not in excluded_indices]
+        return [item for item in x if item not in excluded_indices]
 
     if args.mode == "train":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
@@ -109,7 +111,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
 
-        # Apply filtering in parallel with progress bar
         for col in filter_columns:
             df_preprocessed[col] = df_preprocessed[col].parallel_apply(
                 lambda x: filter_function(x, excluded_df_indices_list_split1)
@@ -124,7 +125,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
 
-        # Apply filtering in parallel with progress bar
         for col in filter_columns:
             df_preprocessed[col] = df_preprocessed[col].parallel_apply(
                 lambda x: filter_function(x, excluded_df_indices_list_split2)
@@ -138,7 +138,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         df = df[split2:]
 
-        # Apply filtering in parallel with progress bar
         for col in filter_columns:
             df_preprocessed[col] = df_preprocessed[col].parallel_apply(
                 lambda x: filter_function(x, excluded_df_indices_list)
