@@ -185,17 +185,15 @@ def parallel_context_generation_worker(args):
           - df (pd.DataFrame): the "master" DataFrame (with 'Article', 'Date', 'Percentage Change', etc.)
           - df_preprocessed (pd.DataFrame): row-aligned with df, containing columns like
                 'use_ebm_economic', 'use_ebm_industry', 'use_ebm_sector', 'use_ebm_historical'
-                (each a list of row indices referencing df).
-          - df_preprocessed_top25 (dict): keys are symbols, values are lists of row indices in df
+                (each a NumPy array of row indices referencing df).
           - total_epochs (int): total training epochs
           - current_epoch (int): current epoch
           - context_count (int): e.g., max(epochs - epoch, 5)
-            ( how many distinct prompt contexts to generate for this single sample )
+            (how many distinct prompt contexts to generate for this single sample)
 
     Returns:
         List[str]: A list of prompt strings (one for each context_count) using format_concatenated_articles.
     """
-
     (
         idx,
         df,
@@ -204,55 +202,84 @@ def parallel_context_generation_worker(args):
         current_epoch,
         context_count
     ) = args
-
     candidate_contexts = []
+
     # Step 1: Validate idx and gather main row
     if idx < 0 or idx >= len(df):
+        logging.error(f"Index {idx} is out-of-bounds for the main DataFrame.")
         return candidate_contexts  # out-of-bounds => empty
 
     main_row = df.iloc[idx]
     preproc_row = df_preprocessed.iloc[idx]  # row-aligned with df
     symbol = main_row.get('Symbol', 'Unknown Symbol')
-    # We'll randomly sample up to 5 items from these columns
-    # but NOT from use_ebm_historical (where we take all).
+
+    # Define how many samples to take from each category
     sample_map = {
-        'use_ebm_economic':  5,
-        'use_ebm_industry':  5,
-        'use_ebm_sector':    5,
-        'use_ebm_top25':     5,
+        'use_ebm_economic': 5,
+        'use_ebm_industry': 5,
+        'use_ebm_sector': 5,
+        'use_ebm_top25': 5,
         # We do NOT sample from 'use_ebm_historical'; we take the full list.
     }
 
     # Step 2: Build multiple contexts, each one is used by the EBM
     for _ in range(context_count):
         # A) ECONOMIC -> "markets" in your final dict
-        econ_list = preproc_row.get('use_ebm_economic', [])
-        econ_needed = min(len(econ_list), sample_map['use_ebm_economic'])
-        econ_indices = random.sample(econ_list, econ_needed) if econ_needed > 0 else []
-        markets_df = df.loc[econ_indices].copy() if econ_indices else pd.DataFrame()
+        econ_array = preproc_row.get('use_ebm_economic', np.array([]))
+        econ_needed = min(len(econ_array), sample_map['use_ebm_economic'])
+        if econ_needed > 0:
+            if econ_needed > len(econ_array):
+                logging.warning(f"Requested {econ_needed} econ samples, but only {len(econ_array)} available.")
+                econ_indices = econ_array  # Take all available
+            else:
+                econ_indices = np.random.choice(econ_array, size=econ_needed, replace=False)
+        else:
+            econ_indices = np.array([], dtype=int)
+        markets_df = df.loc[econ_indices].copy() if econ_indices.size > 0 else pd.DataFrame()
 
         # B) INDUSTRY -> "industry"
-        ind_list = preproc_row.get('use_ebm_industry', [])
-        ind_needed = min(len(ind_list), sample_map['use_ebm_industry'])
-        ind_indices = random.sample(ind_list, ind_needed) if ind_needed > 0 else []
-        industry_df = df.loc[ind_indices].copy() if ind_indices else pd.DataFrame()
+        ind_array = preproc_row.get('use_ebm_industry', np.array([]))
+        ind_needed = min(len(ind_array), sample_map['use_ebm_industry'])
+        if ind_needed > 0:
+            if ind_needed > len(ind_array):
+                logging.warning(f"Requested {ind_needed} industry samples, but only {len(ind_array)} available.")
+                ind_indices = ind_array
+            else:
+                ind_indices = np.random.choice(ind_array, size=ind_needed, replace=False)
+        else:
+            ind_indices = np.array([], dtype=int)
+        industry_df = df.loc[ind_indices].copy() if ind_indices.size > 0 else pd.DataFrame()
 
         # C) SECTOR -> "sector"
-        sec_list = preproc_row.get('use_ebm_sector', [])
-        sec_needed = min(len(sec_list), sample_map['use_ebm_sector'])
-        sec_indices = random.sample(sec_list, sec_needed) if sec_needed > 0 else []
-        sector_df = df.loc[sec_indices].copy() if sec_indices else pd.DataFrame()
+        sec_array = preproc_row.get('use_ebm_sector', np.array([]))
+        sec_needed = min(len(sec_array), sample_map['use_ebm_sector'])
+        if sec_needed > 0:
+            if sec_needed > len(sec_array):
+                logging.warning(f"Requested {sec_needed} sector samples, but only {len(sec_array)} available.")
+                sec_indices = sec_array
+            else:
+                sec_indices = np.random.choice(sec_array, size=sec_needed, replace=False)
+        else:
+            sec_indices = np.array([], dtype=int)
+        sector_df = df.loc[sec_indices].copy() if sec_indices.size > 0 else pd.DataFrame()
 
         # D) HISTORICAL -> "last_8"
         # We take **all** references (no sampling), partial if <8 is handled by .head(8) in your formatting
-        hist_list = preproc_row.get('use_ebm_historical', [])
-        last_8_df = df.loc[hist_list].copy() if hist_list else pd.DataFrame()
+        hist_array = preproc_row.get('use_ebm_historical', np.array([]))
+        last_8_df = df.loc[hist_array].copy() if len(hist_array) > 0 else pd.DataFrame()
 
         # E) TOP25 -> "stock"
-        top25_list = preproc_row.get('use_ebm_top25', [])
-        top25_needed = min(len(top25_list), sample_map['use_ebm_top25'])
-        top25_indices = random.sample(top25_list, top25_needed) if top25_needed > 0 else []
-        stock_df = df.loc[top25_indices].copy() if top25_indices else pd.DataFrame()
+        top25_array = preproc_row.get('use_ebm_top25', np.array([]))
+        top25_needed = min(len(top25_array), sample_map['use_ebm_top25'])
+        if top25_needed > 0:
+            if top25_needed > len(top25_array):
+                logging.warning(f"Requested {top25_needed} top25 samples, but only {len(top25_array)} available.")
+                top25_indices = top25_array
+            else:
+                top25_indices = np.random.choice(top25_array, size=top25_needed, replace=False)
+        else:
+            top25_indices = np.array([], dtype=int)
+        stock_df = df.loc[top25_indices].copy() if top25_indices.size > 0 else pd.DataFrame()
 
         # F) CURRENT -> main article
         current_df = pd.DataFrame([main_row])
@@ -274,6 +301,7 @@ def parallel_context_generation_worker(args):
         candidate_contexts.append(prompt_str)
 
     return candidate_contexts
+
 class ArticlePriceDataset(Dataset):
     def __init__(self,
                  articles: list,
