@@ -82,23 +82,37 @@ def format_concatenated_articles(sample: dict) -> str:
             f"Title: {row.get('Title', 'N/A')}\n"
             f"Article: {row.get('Article', 'N/A')}\n"
         )
+
     # Information Indicating Significant Market Movement Related to Current Stock
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
-    stock = sample.get('stock', pd.DataFrame()).nlargest(5, 'Percentage Change')
-    for _, row in stock.iterrows():
-        date = row.get('Date', pd.Timestamp('1970-01-01'))
-        if not isinstance(date, pd.Timestamp):
-            date = pd.to_datetime(date, errors='coerce')
-            if pd.isna(date):
-                date = pd.Timestamp('1970-01-01')
-        date_str = date.strftime('%Y-%m-%d')
-        percentage_change = row.get('Percentage Change', 0.0)
-        formatted_articles.append(
-            f"Date: {date_str}\n"
-            f"Title: {row.get('Title', 'N/A')}\n"
-            f"Article: {row.get('Article', 'N/A')}\n"
-            f"Percentage Change: {percentage_change:.2f}%\n"
-        )
+    stock_df = sample.get('stock', pd.DataFrame())
+
+    # **Check if 'Percentage Change' exists**
+    if 'Percentage Change' not in stock_df.columns:
+        logger.error(f"'Percentage Change' missing in stock_df. Columns: {stock_df.columns}")
+        stock = stock_df.head(5)  # Fallback to top 5 without sorting
+    else:
+        stock = stock_df.nlargest(5, 'Percentage Change')
+    print("LALALAL")
+    if not stock.empty:
+        for _, row in stock.iterrows():
+            date = row.get('Date', pd.Timestamp('1970-01-01'))
+            if not isinstance(date, pd.Timestamp):
+                date = pd.to_datetime(date, errors='coerce')
+                if pd.isna(date):
+                    date = pd.Timestamp('1970-01-01')
+            date_str = date.strftime('%Y-%m-%d')
+            print("OOFA")
+            percentage_change = row.get('Percentage Change', 0.0)
+            print("OOLA")
+            formatted_articles.append(
+                f"Date: {date_str}\n"
+                f"Title: {row.get('Title', 'N/A')}\n"
+                f"Article: {row.get('Article', 'N/A')}\n"
+                f"Percentage Change: {percentage_change:.2f}%\n"
+            )
+    else:
+        logger.warning("No stock data available to format.")
 
     # Last 8 Articles for Current Stock
     formatted_articles.append("\nLast 8 Articles for Current Stock:")
