@@ -65,10 +65,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     total_samples = len(df)
     num_samples = int((percent_data / 100.0) * total_samples)
 
-    excluded_df = df[
-        (df['weighted_avg_0_hrs'] <= 0) &
-        (df['weighted_avg_720_hrs'] <= 0)
-    ]
     df = df[
         (df['weighted_avg_0_hrs'] > 0) &
         (df['weighted_avg_720_hrs'] > 0)
@@ -88,21 +84,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
     df_preprocessed = None
 
-    excluded_df_indices_list = excluded_df.index.tolist()
-    excluded_df_indices_list_split1 = [i for i in excluded_df_indices_list if i < split1]
-    excluded_df_indices_list_split2 = [i for i in excluded_df_indices_list if i < split2]
-
-    filter_columns = [
-        'use_ebm_economic',
-        'use_ebm_industry',
-        'use_ebm_sector',
-        'use_ebm_historical',
-        'use_ebm_top25'
-    ]
-
-    def filter_function(x, excluded_indices):
-        return [item for item in x if item not in excluded_indices]
-
     if args.mode == "train":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
@@ -110,12 +91,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
-
-        for col in filter_columns:
-            df_preprocessed[col] = df_preprocessed[col].parallel_apply(
-                lambda x: filter_function(x, excluded_df_indices_list_split1)
-            )
-            logging.info(f"{col} Filtering Complete!")
 
     elif args.mode == "run":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
@@ -125,24 +100,12 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
 
-        for col in filter_columns:
-            df_preprocessed[col] = df_preprocessed[col].parallel_apply(
-                lambda x: filter_function(x, excluded_df_indices_list_split2)
-            )
-            logging.info(f"{col} Filtering Complete!")
-
     elif args.mode == "update":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
         df_preprocessed = df_preprocessed.head(num_samples)
 
         df = df[split2:]
-
-        for col in filter_columns:
-            df_preprocessed[col] = df_preprocessed[col].parallel_apply(
-                lambda x: filter_function(x, excluded_df_indices_list)
-            )
-            logging.info(f"{col} Filtering Complete!")
 
     return df, df_preprocessed
 
