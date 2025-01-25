@@ -44,10 +44,13 @@ import numpy as np
 from multiprocessing import Pool, cpu_count
 import random
 import ast
+from pandarallel import pandarallel
 
 import torch.distributed as dist
 
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
+
+pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
 
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
@@ -57,6 +60,7 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
 
+    # Assuming 'login' is a defined function
     login(hf_token)
     dataset = load_dataset("nbettencourt/SC454k")
     df = dataset['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
@@ -72,7 +76,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
     df['Percentage Change'] = ((df['weighted_avg_0_hrs'] - safe_div) / safe_div)
 
-
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
 
@@ -86,6 +89,18 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     excluded_df_indices_list_split1 = [i for i in excluded_df_indices_list if i < split1]
     excluded_df_indices_list_split2 = [i for i in excluded_df_indices_list if i < split2]
 
+    # Define the columns to filter
+    filter_columns = [
+        'use_ebm_economic',
+        'use_ebm_industry',
+        'use_ebm_sector',
+        'use_ebm_historical',
+        'use_ebm_top25'
+    ]
+
+    def filter_function(x, excluded_indices):
+        return [i for i in x if i not in excluded_indices]
+
     if args.mode == "train":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
@@ -94,26 +109,13 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
 
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
+        # Apply filtering in parallel with progress bar
+        for col in filter_columns:
+            df_preprocessed[col] = df_preprocessed[col].parallel_apply(
+                lambda x: filter_function(x, excluded_df_indices_list_split1)
+            )
+            logging.info(f"{col} Filtering Complete!")
 
-        logging.info("use_ebm_economic Filtering Complete!")
-
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
-
-        logging.info("use_ebm_industry Filtering Complete!")
-
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
-
-        logging.info("use_ebm_sector Filtering Complete!")
-
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
-
-        logging.info("use_ebm_historical Filtering Complete!")
-
-        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
-
-        logging.info("use_ebm_top25 Filtering Complete!")
-        
     elif args.mode == "run":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
         df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
@@ -122,25 +124,12 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
 
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
-
-        logging.info("use_ebm_economic Filtering Complete!")
-
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
-
-        logging.info("use_ebm_industry Filtering Complete!")
-
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
-
-        logging.info("use_ebm_sector Filtering Complete!")
-
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
-
-        logging.info("use_ebm_historical Filtering Complete!")
-
-        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
-
-        logging.info("use_ebm_top25 Filtering Complete!")
+        # Apply filtering in parallel with progress bar
+        for col in filter_columns:
+            df_preprocessed[col] = df_preprocessed[col].parallel_apply(
+                lambda x: filter_function(x, excluded_df_indices_list_split2)
+            )
+            logging.info(f"{col} Filtering Complete!")
 
     elif args.mode == "update":
         dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
@@ -149,25 +138,12 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         df = df[split2:]
 
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
-
-        logging.info("use_ebm_economic Filtering Complete!")
-
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
-
-        logging.info("use_ebm_industry Filtering Complete!")
-
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
-
-        logging.info("use_ebm_sector Filtering Complete!")
-
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
-
-        logging.info("use_ebm_historical Filtering Complete!")
-
-        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
-
-        logging.info("use_ebm_top25 Filtering Complete!")
+        # Apply filtering in parallel with progress bar
+        for col in filter_columns:
+            df_preprocessed[col] = df_preprocessed[col].parallel_apply(
+                lambda x: filter_function(x, excluded_df_indices_list)
+            )
+            logging.info(f"{col} Filtering Complete!")
 
     return df, df_preprocessed
 
