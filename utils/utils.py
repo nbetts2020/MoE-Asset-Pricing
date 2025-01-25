@@ -114,7 +114,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_historical Filtering Complete!")
 
-        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
 
         logging.info("use_ebm_top25 Filtering Complete!")
@@ -142,7 +141,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_sector Filtering Complete!")
 
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
         logging.info("use_ebm_historical Filtering Complete!")
@@ -179,7 +177,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_historical Filtering Complete!")
 
-        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
         logging.info("use_ebm_top25 Filtering Complete!")
