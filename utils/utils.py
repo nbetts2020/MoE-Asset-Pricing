@@ -94,22 +94,18 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
 
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
 
         logging.info("use_ebm_economic Filtering Complete!")
 
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
 
         logging.info("use_ebm_industry Filtering Complete!")
 
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
 
         logging.info("use_ebm_sector Filtering Complete!")
 
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split1])
 
         logging.info("use_ebm_historical Filtering Complete!")
@@ -126,17 +122,14 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
 
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
         logging.info("use_ebm_economic Filtering Complete!")
 
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
         logging.info("use_ebm_industry Filtering Complete!")
 
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
         logging.info("use_ebm_sector Filtering Complete!")
@@ -145,7 +138,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         logging.info("use_ebm_historical Filtering Complete!")
 
-        df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_top25'] = df_preprocessed['use_ebm_top25'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list_split2])
 
         logging.info("use_ebm_top25 Filtering Complete!")
@@ -157,22 +149,18 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
         df = df[split2:]
 
-        df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_economic'] = df_preprocessed['use_ebm_economic'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
         logging.info("use_ebm_economic Filtering Complete!")
 
-        df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_industry'] = df_preprocessed['use_ebm_industry'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
         logging.info("use_ebm_industry Filtering Complete!")
 
-        df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_sector'] = df_preprocessed['use_ebm_sector'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
         logging.info("use_ebm_sector Filtering Complete!")
 
-        df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(ast.literal_eval)
         df_preprocessed['use_ebm_historical'] = df_preprocessed['use_ebm_historical'].apply(lambda x: [i for i in x if i not in excluded_df_indices_list])
 
         logging.info("use_ebm_historical Filtering Complete!")
