@@ -355,7 +355,8 @@ def process_group_wrapper(args):
 def process_data(df,
                  df_preprocessed,
                  tokenizer,
-                 use_ebm_format=False):
+                 use_ebm_format=False
+                 numeric_only=False):
     """
     Builds final text for each row.
     - If not use_ebm_format, just do your old single-article style.
@@ -479,7 +480,8 @@ def prepare_dataloader(df,
          df,
          df_preprocessed,
          tokenizer,
-         use_ebm_format=args.use_ebm_format
+         use_ebm_format=args.use_ebm_format,
+         numeric_only=args.numeric_only
      )
 
     dataset = ArticlePriceDataset(
