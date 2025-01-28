@@ -282,7 +282,7 @@ def train_model(
                     # Pass all contexts for this sample
                     # context_tensors: [num_candidates, seq_len]
                     with amp.autocast('cuda', dtype=torch.float16):
-                        combined_tokens = torch.cat([context_tensors, main_ids[i].unsqueeze(1).repeat(1, context_tensors.size(0))], dim=1)
+                        combined_tokens = torch.cat([context_tensors, main_ids[i].repeat(context_tensors.size(0), 1)], dim=1)
                         # combined_tokens: [num_candidates, seq_len_main + seq_len_context]
                         # Truncate if necessary
                         if combined_tokens.size(1) > config.BLOCK_SIZE:
