@@ -82,6 +82,8 @@ def main():
                         help="Random seed for reproducibility.")
     parser.add_argument('--num_tasks', type=int, default=3,
                         help="Number of tasks (sectors) for catastrophic forgetting testing.")
+    parser.add_argument('--numeric_only', action='store_true',
+                        help="Ablation test for extracting value of text in prediction.")
 
     # Catastrophic forgetting methods
     parser.add_argument('--use_si', action='store_true',
