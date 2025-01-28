@@ -355,7 +355,7 @@ def process_group_wrapper(args):
 def process_data(df,
                  df_preprocessed,
                  tokenizer,
-                 use_ebm_format=False
+                 use_ebm_format=False,
                  numeric_only=False):
     """
     Builds final text for each row.
