@@ -175,7 +175,7 @@ def main():
         config.BLOCK_SIZE = 1024
     if args.numeric_only:
         logging.info("Switching to numeric_only hyperparameters for faster execution.")
-        config.BLOCK_SIZE = 64
+        config.BLOCK_SIZE = 128
 
     # Additional overrides
     if args.n_embed is not None:
