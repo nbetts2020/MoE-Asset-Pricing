@@ -42,7 +42,7 @@ def train_model(
       3) If use_ebm:
          (A) For each sample, gather multiple contexts (CPU parallel).
          (B) For each candidate context => compute MSE => EBM regresses MSE => backward EBM loss => step.
-         (C) Monte Carlo sample exactly 1 context => feed to main model => backward main model loss.
+         (C) **Pass all contexts** to the main model and accumulate losses.
       4) Replay buffer is updated after main forward pass.
       5) EWC / SI / L2 are optionally applied.
 
@@ -232,22 +232,25 @@ def train_model(
                 ebm_batch_loss_accum += ebm_loss_i.item() * num_candidates
                 ebm_count += num_candidates
 
-                # Step D) sample exactly 1 context => use predicted MSE => energies
-                energies = pred_mse.detach()  # shape => [num_candidates]
-                e_min, e_max = energies.min(), energies.max()
-                scaled_energies = (energies - e_min) / ((e_max - e_min) + 1e-8)
-                temperature = getattr(args, 'temperature', 1.0)
-                probs = torch.softmax(-scaled_energies / temperature, dim=0)
-                print(f"Shape of probs: {probs.shape}")  # Debugging
-                print(f"Probabilities: {probs}")  # Debugging
+                # # Step D) sample exactly 1 context => use predicted MSE => energies
+                # energies = pred_mse.detach()  # shape => [num_candidates]
+                # e_min, e_max = energies.min(), energies.max()
+                # scaled_energies = (energies - e_min) / ((e_max - e_min) + 1e-8)
+                # temperature = getattr(args, 'temperature', 1.0)
+                # probs = torch.softmax(-scaled_energies / temperature, dim=0)
+                # print(f"Shape of probs: {probs.shape}")  # Debugging
+                # print(f"Probabilities: {probs}")  # Debugging
 
-                # Handle single context candidate
-                if probs.dim() == 0:
-                    sampled_idx = 0
-                else:
-                    sampled_idx = torch.multinomial(probs, 1).item()
+                # # Handle single context candidate
+                # if probs.dim() == 0:
+                #     sampled_idx = 0
+                # else:
+                #     sampled_idx = torch.multinomial(probs, 1).item()
 
-                chosen_contexts_toks.append(candidate_tensors[sampled_idx])
+                # chosen_contexts_toks.append(candidate_tensors[sampled_idx])
+
+                # **Pass all contexts instead of sampling one**
+                chosen_contexts_toks.append(candidate_tensors)  # [num_candidates, seq_len]
 
             # Step E) EBM step
             if ebm_optimizer:
@@ -255,34 +258,49 @@ def train_model(
                 scaler.update()
                 ebm_optimizer.zero_grad()
 
-            # Step F) main model forward/back with chosen contexts
+            # Step F) main model forward/back with all chosen contexts
             main_loss_accum = 0.0
             for i in range(B):
-                if chosen_contexts_toks[i] is None:
-                    # no context => just main
-                    combined_tokens = main_ids[i].unsqueeze(0)
-                else:
-                    combined_tokens = torch.cat([
-                        main_ids[i].unsqueeze(0),
-                        chosen_contexts_toks[i].unsqueeze(0)
-                    ], dim=1)
-                if combined_tokens.size(1) > config.BLOCK_SIZE:
-                    combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
-
+                context_tensors = chosen_contexts_toks[i]
                 label_i = future_vals[i].unsqueeze(0)
-                with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
-                    pred_val_i, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
-                    # add SI, EWC, L2
-                    if si:
-                        main_loss_i += si.penalty()
-                    if ewc:
-                        for ewc_inst in ewc:
-                            main_loss_i += args.lambda_ewc * ewc_inst.penalty(model)
-                    if getattr(args, 'use_l2', False):
-                        main_loss_i += args.lambda_l2 * compute_l2_loss(model)
+                if context_tensors is None:
+                    # no context => just main
+                    combined_tokens = main_ids[i].unsqueeze(0)  # [1, seq_len]
+                    with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
+                        pred_val_i, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
+                        # add SI, EWC, L2
+                        if si:
+                            main_loss_i += si.penalty()
+                        if ewc:
+                            for ewc_inst in ewc:
+                                main_loss_i += args.lambda_ewc * ewc_inst.penalty(model)
+                        if getattr(args, 'use_l2', False):
+                            main_loss_i += args.lambda_l2 * compute_l2_loss(model)
+                    scaler.scale(main_loss_i).backward()
+                    main_loss_accum += main_loss_i.item()
+                else:
+                    # Pass all contexts for this sample
+                    # context_tensors: [num_candidates, seq_len]
+                    with amp.autocast('cuda', dtype=torch.float16):
+                        combined_tokens = torch.cat([context_tensors, main_ids[i].unsqueeze(1).repeat(1, context_tensors.size(0))], dim=1)
+                        # combined_tokens: [num_candidates, seq_len_main + seq_len_context]
+                        # Truncate if necessary
+                        if combined_tokens.size(1) > config.BLOCK_SIZE:
+                            combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
+                        preds, main_loss_i = model(input_ids=combined_tokens, targets=label_i.unsqueeze(1).repeat(1, context_tensors.size(0)))
+                        
+                        # Add SI, EWC, L2
+                        if si:
+                            main_loss_i += si.penalty()
+                        if ewc:
+                            for ewc_inst in ewc:
+                                main_loss_i += args.lambda_ewc * ewc_inst.penalty(model)
+                        if getattr(args, 'use_l2', False):
+                            main_loss_i += args.lambda_l2 * compute_l2_loss(model)
 
-                scaler.scale(main_loss_i).backward()
-                main_loss_accum += main_loss_i.item()
+                    # Assuming main_loss_i is averaged over the contexts
+                    scaler.scale(main_loss_i).backward()
+                    main_loss_accum += main_loss_i.item()
 
             scaler.step(optimizer)
             scaler.update()
@@ -291,7 +309,7 @@ def train_model(
             total_loss += main_loss_accum
             total_count += B
 
-            # replay buffer
+            # Replay buffer
             if replay_buffer:
                 replay_samples = []
                 for i in range(B):
