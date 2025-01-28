@@ -72,6 +72,10 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
 
     df = df.head(num_samples)
 
+    dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
+    df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
+    df_preprocessed = df_preprocessed.head(num_samples)
+
     safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
     df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
 
@@ -85,26 +89,14 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     df_preprocessed = None
 
     if args.mode == "train":
-        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
-        df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
-        df_preprocessed = df_preprocessed.head(num_samples)
-
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
 
     elif args.mode == "run":
-        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
-        df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
-        df_preprocessed = df_preprocessed.head(num_samples)
-
         df = df[split1:split2]
         df_preprocessed = df_preprocessed[:split2]
 
     elif args.mode == "update":
-        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
-        df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
-        df_preprocessed = df_preprocessed.head(num_samples)
-
         df = df[split2:]
 
     return df, df_preprocessed
