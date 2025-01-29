@@ -2,14 +2,13 @@
 
 import torch
 import torch.nn.functional as F
-from torch import amp  # Updated import for autocast
+from torch import amp
 from torch.cuda.amp import GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
 import logging
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count  # Changed to multiprocessing.Pool
 
 from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
@@ -32,27 +31,14 @@ def train_model(
     df_preprocessed=None,
     ebm=None,             # EBM model
     ebm_optimizer=None,   # EBM optimizer
-    tokenizer=None
+    tokenizer=None,
+    numeric_only=False    # New parameter for numeric-only mode
 ):
     """
-    Multi-context EBM approach in half precision for flash-attn.
+    Optimized Multi-context EBM approach in half precision for flash-attn.
 
-    Workflow:
-      1) Possibly load from checkpoint.
-      2) If not use_ebm: standard forward/back pass for each batch.
-      3) If use_ebm:
-         (A) For each sample, gather multiple contexts (CPU parallel).
-         (B) For each candidate context => compute MSE => EBM regresses MSE => backward EBM loss => step.
-         (C) **Pass all contexts** to the main model and accumulate losses.
-      4) Replay buffer is updated after main forward pass.
-      5) EWC / SI / L2 are optionally applied.
-
-    This code expects:
-      - 'labels' field in batch => future price
-      - 'input_ids' => main article tokens as long dtype
-      - 'idx' => row index in df
-      - 'sector' => optional string
-      - If old price is used => 'old_price' in batch
+    Additional parameter:
+      - numeric_only (bool): If True, performs numeric-only training without EBM.
     """
 
     # -------------------------------------------------------------------------
@@ -63,12 +49,12 @@ def train_model(
         start_epoch = load_checkpoint(
             model,
             optimizer,
-            ebm if (ebm and args.use_ebm) else None,
-            ebm_optimizer if (ebm and args.use_ebm) else None,
+            ebm if (ebm and args.use_ebm and not numeric_only) else None,
+            ebm_optimizer if (ebm and args.use_ebm and not numeric_only) else None,
             args.checkpoint_path
         )
 
-    use_ebm = (ebm is not None) and getattr(args, 'use_ebm', False)
+    use_ebm = (ebm is not None) and getattr(args, 'use_ebm', False) and not numeric_only
     if use_ebm:
         ebm.train()  # EBM in train mode
 
@@ -105,9 +91,47 @@ def train_model(
             idx_list     = batch.get('idx', None)
             B = main_ids.size(0)
 
-            # (a) If not using EBM => normal forward/back pass
+            if numeric_only:
+                # -------------------------------------------
+                # Numeric-Only Forward/Backward Pass
+                # -------------------------------------------
+                with amp.autocast('cuda', dtype=torch.float16):
+                    preds, main_loss = model(input_ids=main_ids, targets=future_vals)
+
+                    # add SI, EWC, L2
+                    if si:
+                        main_loss += si.penalty()
+                    if ewc:
+                        for ewc_inst in ewc:
+                            main_loss += args.lambda_ewc * ewc_inst.penalty(model)
+                    if getattr(args, 'use_l2', False):
+                        main_loss += args.lambda_l2 * compute_l2_loss(model)
+
+                scaler.scale(main_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                total_loss += main_loss.item() * B
+                total_count += B
+
+                # Replay buffer
+                if replay_buffer:
+                    replay_samples = []
+                    for i in range(B):
+                        replay_samples.append({
+                            'input_ids': main_ids[i].detach().cpu(),
+                            'labels': future_vals[i].detach().cpu(),
+                            'sector': sector_list[i] if sector_list else 'Unknown'
+                        })
+                    replay_buffer.add_examples(replay_samples, [0]*B)
+
+                continue  # next batch
+
             if not use_ebm:
-                with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
+                # -------------------------------------------
+                # Standard Forward/Backward Pass without EBM
+                # -------------------------------------------
+                with amp.autocast('cuda', dtype=torch.float16):
                     preds, main_loss = model(input_ids=main_ids, targets=future_vals)
 
                     # add SI, EWC, L2
@@ -142,24 +166,7 @@ def train_model(
             # -----------------------------------------------------------------
             # (b) If use EBM => multi-context approach
             # -----------------------------------------------------------------
-            # CPU gather contexts
-            # cpu_args_list = []
-            # for i in range(B):
-            #     cpu_args_list.append((
-            #         idx_list[i],
-            #         df,
-            #         df_preprocessed,
-            #         epochs,
-            #         epoch,
-            #         context_count
-            #     ))
-            # # parallel gather
-            max_workers = max(os.cpu_count() - 1, 1)
-            # with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            #     all_contexts_batch = list(executor.map(parallel_context_generation_worker, cpu_args_list))
-            #     # shape => list[B], each => list-of-strings
-
-            # Prepare all indices in the batch
+            # Batch gather contexts using multiprocessing Pool
             cpu_args_list = [
                 (
                     idx,
@@ -171,26 +178,24 @@ def train_model(
                 )
                 for idx in idx_list
             ]
-            
-            # Utilize multiprocessing Pool for better performance
+
+            max_workers = max(cpu_count() - 1, 1)
             with Pool(processes=max_workers) as pool:
                 all_contexts_batch = pool.map(parallel_context_generation_worker, cpu_args_list)
-                
+                # shape => list[B], each => list-of-strings
+
             chosen_contexts_toks = []
             ebm_count = 0
             ebm_batch_loss_accum = 0.0
 
-            # Step A) For each sample in the batch
             for i in range(B):
-                main_article = main_ids[i].unsqueeze(0)    # [1, seq_len_main]
-                label_future = future_vals[i].unsqueeze(0) # [1,]
                 context_str_list = all_contexts_batch[i]
                 if not context_str_list:
                     # fallback => no contexts
                     chosen_contexts_toks.append(None)
                     continue
 
-                # build candidate_tensors
+                # Tokenize all candidate contexts in batch
                 candidate_tensors = []
                 for c_str in context_str_list:
                     c_str = c_str.strip()
@@ -211,71 +216,30 @@ def train_model(
                 candidate_tensors = torch.stack(candidate_tensors, dim=0).to(device, dtype=torch.long)
                 num_candidates = candidate_tensors.size(0)
 
-                # Step B) compute MSE for each candidate
-                # (no grad for main model here)
-                mse_vals = []
-                with torch.no_grad(), amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
-                    # for c_idx in range(num_candidates):
-                    #     combined_tokens = torch.cat([
-                    #         candidate_tensors[c_idx].unsqueeze(0),
-                    #         main_article
-                    #     ], dim=1)
-                    #     if combined_tokens.size(1) > config.BLOCK_SIZE:
-                    #         combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
+                # Step B) compute MSE for each candidate in a single forward pass
+                combined_tokens = torch.cat([candidate_tensors, main_ids[i].repeat(num_candidates, 1)], dim=1)
+                # Truncate if necessary
+                if combined_tokens.size(1) > config.BLOCK_SIZE:
+                    combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
 
-                    #     pred_val_i, _ = model(input_ids=combined_tokens)
-                    #     # MSE => (pred_val - label)**2
-                    #     mse_i = (pred_val_i - label_future)**2
-                    #     mse_vals.append(mse_i.squeeze())
-                    # Step B) compute MSE for each candidate in a single forward pass
-                    combined_tokens = torch.cat([candidate_tensors, main_ids[i].repeat(num_candidates, 1)], dim=1)
-                    # Truncate if necessary
-                    if combined_tokens.size(1) > config.BLOCK_SIZE:
-                        combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
-                    
-                    with torch.no_grad(), amp.autocast('cuda', dtype=torch.float16):
-                        preds_batch, _ = model(input_ids=combined_tokens)
-                        mse_vals = (preds_batch - label_future)**2  # Shape: [num_candidates, 1]
-                        mse_vals = mse_vals.squeeze()  # Shape: [num_candidates]
-
-                mse_vals_tensor = torch.stack(mse_vals, dim=0).float()  # shape => [num_candidates], as float
+                with torch.no_grad(), amp.autocast('cuda', dtype=torch.float16):
+                    preds_batch, _ = model(input_ids=combined_tokens)
+                    mse_vals = (preds_batch - future_vals[i].unsqueeze(1))**2  # Shape: [num_candidates, 1]
+                    mse_vals = mse_vals.squeeze()  # Shape: [num_candidates]
 
                 # Step C) EBM forward => predicted MSE => L2 to actual MSE
-                with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
-                    # embed the main article once
-                    main_emb = model.get_embeddings(main_article).half()  # [1, embed_dim]
-                    context_embs = []
-                    for c_idx in range(num_candidates):
-                        ctx_ids = candidate_tensors[c_idx].unsqueeze(0)
-                        ctx_emb = model.get_embeddings(ctx_ids).half()  # [1, embed_dim]
-                        context_embs.append(ctx_emb.squeeze(0))
-                    context_embs = torch.stack(context_embs, dim=0)  # [num_candidates, embed_dim]
+                with amp.autocast('cuda', dtype=torch.float16):
+                    # Embed all contexts and main articles in batch
+                    context_embs = model.get_embeddings(candidate_tensors).half()  # [num_candidates, embed_dim]
+                    main_emb = model.get_embeddings(main_ids[i].unsqueeze(0).repeat(num_candidates, 1)).half()  # [num_candidates, embed_dim]
 
-                    main_emb_exp = main_emb.expand(num_candidates, -1)       # [num_candidates, embed_dim]
-                    pred_mse = ebm(main_emb_exp, context_embs).float().squeeze()
+                    pred_mse = ebm(main_emb, context_embs).float().squeeze()  # [num_candidates]
                     # L2 difference with actual MSE
-                    ebm_loss_i = torch.mean((pred_mse - mse_vals_tensor)**2)
+                    ebm_loss_i = torch.mean((pred_mse - mse_vals)**2)
 
                 scaler.scale(ebm_loss_i).backward(retain_graph=True)
                 ebm_batch_loss_accum += ebm_loss_i.item() * num_candidates
                 ebm_count += num_candidates
-
-                # # Step D) sample exactly 1 context => use predicted MSE => energies
-                # energies = pred_mse.detach()  # shape => [num_candidates]
-                # e_min, e_max = energies.min(), energies.max()
-                # scaled_energies = (energies - e_min) / ((e_max - e_min) + 1e-8)
-                # temperature = getattr(args, 'temperature', 1.0)
-                # probs = torch.softmax(-scaled_energies / temperature, dim=0)
-                # print(f"Shape of probs: {probs.shape}")  # Debugging
-                # print(f"Probabilities: {probs}")  # Debugging
-
-                # # Handle single context candidate
-                # if probs.dim() == 0:
-                #     sampled_idx = 0
-                # else:
-                #     sampled_idx = torch.multinomial(probs, 1).item()
-
-                # chosen_contexts_toks.append(candidate_tensors[sampled_idx])
 
                 # **Pass all contexts instead of sampling one**
                 chosen_contexts_toks.append(candidate_tensors)  # [num_candidates, seq_len]
@@ -294,7 +258,7 @@ def train_model(
                 if context_tensors is None:
                     # no context => just main
                     combined_tokens = main_ids[i].unsqueeze(0)  # [1, seq_len]
-                    with amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
+                    with amp.autocast('cuda', dtype=torch.float16):
                         pred_val_i, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
                         # add SI, EWC, L2
                         if si:
@@ -307,17 +271,19 @@ def train_model(
                     scaler.scale(main_loss_i).backward()
                     main_loss_accum += main_loss_i.item()
                 else:
-                    # Pass all contexts for this sample
-                    # context_tensors: [num_candidates, seq_len]
+                    # Pass all contexts for this sample in a single batch
                     with amp.autocast('cuda', dtype=torch.float16):
                         combined_tokens = torch.cat([context_tensors, main_ids[i].repeat(context_tensors.size(0), 1)], dim=1)
                         # combined_tokens: [num_candidates, seq_len_main + seq_len_context]
                         # Truncate if necessary
                         if combined_tokens.size(1) > config.BLOCK_SIZE:
                             combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
-                        preds, main_loss_i = model(input_ids=combined_tokens, targets=label_i.unsqueeze(1).repeat(1, context_tensors.size(0)))
-                        
-                        # Add SI, EWC, L2
+                        # Prepare targets by repeating label_i for each context
+                        expanded_labels = label_i.repeat(context_tensors.size(0), 1)  # [num_candidates, 1]
+
+                        preds, main_loss_i = model(input_ids=combined_tokens, targets=expanded_labels)
+
+                        # add SI, EWC, L2
                         if si:
                             main_loss_i += si.penalty()
                         if ewc:
