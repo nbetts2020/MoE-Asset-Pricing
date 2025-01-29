@@ -190,6 +190,9 @@ class SparseMoELanguageModel(nn.Module):
 
         loss = None
         if targets is not None:
+            # Ensure targets are 1D to match output shape
+            if targets.dim() == 2 and targets.size(1) == 1:
+                targets = targets.squeeze(1)
             task_loss = F.mse_loss(output, targets)
             loss = task_loss
             if use_entropy_reg:
