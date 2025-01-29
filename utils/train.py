@@ -142,22 +142,39 @@ def train_model(
             # (b) If use EBM => multi-context approach
             # -----------------------------------------------------------------
             # CPU gather contexts
-            cpu_args_list = []
-            for i in range(B):
-                cpu_args_list.append((
-                    idx_list[i],
+            # cpu_args_list = []
+            # for i in range(B):
+            #     cpu_args_list.append((
+            #         idx_list[i],
+            #         df,
+            #         df_preprocessed,
+            #         epochs,
+            #         epoch,
+            #         context_count
+            #     ))
+            # # parallel gather
+            # max_workers = max(os.cpu_count() - 1, 1)
+            # with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            #     all_contexts_batch = list(executor.map(parallel_context_generation_worker, cpu_args_list))
+            #     # shape => list[B], each => list-of-strings
+
+            # Prepare all indices in the batch
+            cpu_args_list = [
+                (
+                    idx,
                     df,
                     df_preprocessed,
                     epochs,
                     epoch,
                     context_count
-                ))
-            # parallel gather
-            max_workers = max(os.cpu_count() - 1, 1)
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                all_contexts_batch = list(executor.map(parallel_context_generation_worker, cpu_args_list))
-                # shape => list[B], each => list-of-strings
-
+                )
+                for idx in idx_list
+            ]
+            
+            # Utilize multiprocessing Pool for better performance
+            with Pool(processes=max_workers) as pool:
+                all_contexts_batch = pool.map(parallel_context_generation_worker, cpu_args_list)
+                
             chosen_contexts_toks = []
             ebm_count = 0
             ebm_batch_loss_accum = 0.0
