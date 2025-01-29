@@ -2,8 +2,8 @@
 
 import torch
 import torch.nn.functional as F
-from torch import amp  # Updated import for autocast
-from torch.amp import GradScaler  # Updated GradScaler import
+from torch import amp
+from torch.amp import GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
@@ -43,23 +43,7 @@ def train_model(
 ):
     """
     Multi-context EBM approach in half precision for flash-attn.
-
-    Workflow:
-      1) Possibly load from checkpoint.
-      2) If not use_ebm: standard forward/back pass for each batch.
-      3) If use_ebm:
-         (A) For each sample, gather multiple contexts (CPU parallel).
-         (B) For each candidate context => compute MSE => EBM regresses MSE => backward EBM loss => step.
-         (C) **Pass all contexts** to the main model and accumulate losses.
-      4) Replay buffer is updated after main forward pass.
-      5) EWC / SI / L2 are optionally applied.
-
-    This code expects:
-      - 'labels' field in batch => future price
-      - 'input_ids' => main article tokens as long dtype
-      - 'idx' => row index in df
-      - 'sector' => optional string
-      - If old price is used => 'old_price' in batch
+    [Docstring trimmed for brevity]
     """
 
     # -------------------------------------------------------------------------
@@ -118,6 +102,13 @@ def train_model(
     epochs_no_improve = 0
     patience = getattr(args, 'early_stopping_patience', 5)
     logging.info(f"Early stopping patience set to {patience} epochs with no improvement.")
+
+    # -------------------------------------------------------------------------
+    # Initialize Persistent Multiprocessing Pool
+    # -------------------------------------------------------------------------
+    max_workers = max(cpu_count() - 1, 1)
+    pool = Pool(processes=max_workers)
+    logging.debug(f"Created a persistent multiprocessing Pool with {max_workers} workers.")
 
     # -------------------------------------------------------------------------
     # 2) Training Loop
@@ -259,13 +250,10 @@ def train_model(
                     context_count
                 ))
 
-            # Utilize multiprocessing Pool for better performance
-            max_workers = max(cpu_count() - 1, 1)
-            logging.debug(f"  Creating multiprocessing Pool with {max_workers} workers for context generation.")
+            # Utilize persistent multiprocessing Pool
             try:
-                with Pool(processes=max_workers) as pool:
-                    all_contexts_batch = pool.map(parallel_context_generation_worker, cpu_args_list)
-                    logging.debug(f"  Context generation complete for batch {batch_idx+1}.")
+                all_contexts_batch = pool.map(parallel_context_generation_worker, cpu_args_list)
+                logging.debug(f"  Context generation complete for batch {batch_idx+1}.")
             except Exception as e:
                 logging.error(f"  Error during context generation: {e}")
                 raise e
@@ -543,5 +531,12 @@ def train_model(
             if epochs_no_improve >= patience:
                 logging.info(f"Stopping early after {epoch+1} epochs (no improvement).")
                 break
+
+    # -------------------------------------------------------------------------
+    # Close Persistent Pool
+    # -------------------------------------------------------------------------
+    pool.close()
+    pool.join()
+    logging.debug("Closed the multiprocessing Pool.")
 
     logging.info("Training loop completed.")
