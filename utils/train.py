@@ -9,6 +9,7 @@ import os
 from tqdm import tqdm
 import logging
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Pool, cpu_count
 
 from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
