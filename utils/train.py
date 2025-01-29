@@ -154,7 +154,7 @@ def train_model(
             #         context_count
             #     ))
             # # parallel gather
-            # max_workers = max(os.cpu_count() - 1, 1)
+            max_workers = max(os.cpu_count() - 1, 1)
             # with ProcessPoolExecutor(max_workers=max_workers) as executor:
             #     all_contexts_batch = list(executor.map(parallel_context_generation_worker, cpu_args_list))
             #     # shape => list[B], each => list-of-strings
