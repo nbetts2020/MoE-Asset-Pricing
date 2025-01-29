@@ -215,18 +215,28 @@ def train_model(
                 # (no grad for main model here)
                 mse_vals = []
                 with torch.no_grad(), amp.autocast('cuda', dtype=torch.float16):  # Updated autocast usage
-                    for c_idx in range(num_candidates):
-                        combined_tokens = torch.cat([
-                            candidate_tensors[c_idx].unsqueeze(0),
-                            main_article
-                        ], dim=1)
-                        if combined_tokens.size(1) > config.BLOCK_SIZE:
-                            combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
+                    # for c_idx in range(num_candidates):
+                    #     combined_tokens = torch.cat([
+                    #         candidate_tensors[c_idx].unsqueeze(0),
+                    #         main_article
+                    #     ], dim=1)
+                    #     if combined_tokens.size(1) > config.BLOCK_SIZE:
+                    #         combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
 
-                        pred_val_i, _ = model(input_ids=combined_tokens)
-                        # MSE => (pred_val - label)**2
-                        mse_i = (pred_val_i - label_future)**2
-                        mse_vals.append(mse_i.squeeze())
+                    #     pred_val_i, _ = model(input_ids=combined_tokens)
+                    #     # MSE => (pred_val - label)**2
+                    #     mse_i = (pred_val_i - label_future)**2
+                    #     mse_vals.append(mse_i.squeeze())
+                    # Step B) compute MSE for each candidate in a single forward pass
+                    combined_tokens = torch.cat([candidate_tensors, main_ids[i].repeat(num_candidates, 1)], dim=1)
+                    # Truncate if necessary
+                    if combined_tokens.size(1) > config.BLOCK_SIZE:
+                        combined_tokens = combined_tokens[:, :config.BLOCK_SIZE]
+                    
+                    with torch.no_grad(), amp.autocast('cuda', dtype=torch.float16):
+                        preds_batch, _ = model(input_ids=combined_tokens)
+                        mse_vals = (preds_batch - label_future)**2  # Shape: [num_candidates, 1]
+                        mse_vals = mse_vals.squeeze()  # Shape: [num_candidates]
 
                 mse_vals_tensor = torch.stack(mse_vals, dim=0).float()  # shape => [num_candidates], as float
 
