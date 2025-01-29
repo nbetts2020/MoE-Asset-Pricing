@@ -86,8 +86,6 @@ def get_data(percent_data=100.0, run=False, update=False, args=None):
     split1 = int(len(df) * 0.7)
     split2 = int(len(df) * 0.85)
 
-    df_preprocessed = None
-
     if args.mode == "train":
         df = df[:split1]
         df_preprocessed = df_preprocessed[:split1]
