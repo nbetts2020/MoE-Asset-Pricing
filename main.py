@@ -39,13 +39,13 @@ from utils.ewc import ElasticWeightConsolidation
 from utils.test import test_forgetting
 
 from utils.ebm import EnergyBasedModel
+from torch.utils.data.distributed import DistributedSampler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
 
 def main():
-
     pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
     logging.info("pandarallel initialized with parallel_apply.")
 
@@ -265,18 +265,29 @@ def main():
 
             from utils.data import custom_collate_fn
             train_dataset = train_dataloader.dataset
+
+            # If you're using DDP, also shard this second data loader
+            # so that each rank only sees its subset for EBM:
+            sampler = None
+            if use_ddp:
+                sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=False)
+
             train_dataloader = DataLoader(
-                train_dataset, batch_size=args.batch_size, shuffle=False,
-                collate_fn=custom_collate_fn
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=custom_collate_fn,
+                sampler=sampler
             )
 
-        # Initialize Synaptic Intelligence (SI), Elastic Weight Consolidation (EWC), Replay Buffer
+        # Initialize SI, EWC, Replay Buffer
         si = initialize_si(model, args) if args.use_si else None
         if args.use_ewc:
             ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
             ewc_list = [ewc_instance]
         else:
             ewc_list = None
+
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
 
         # Train the model
@@ -305,6 +316,7 @@ def main():
         # Save final model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
+
     # -------------------------------------------
     # UPDATE MODE
     # -------------------------------------------
@@ -354,9 +366,17 @@ def main():
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
             from utils.data import custom_collate_fn
             update_dataset = update_dataloader.dataset
+
+            sampler = None
+            if use_ddp:
+                sampler = DistributedSampler(update_dataset, shuffle=False, drop_last=False)
+
             update_dataloader = DataLoader(
-                update_dataset, batch_size=args.batch_size, shuffle=False,
-                collate_fn=custom_collate_fn
+                update_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=custom_collate_fn,
+                sampler=sampler
             )
 
         # Initialize SI, EWC, Replay Buffer
@@ -408,6 +428,7 @@ def main():
         # Save final model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
+
     # -------------------------------------------
     # RUN MODE
     # -------------------------------------------
@@ -566,6 +587,7 @@ def main():
                     f"Win Rate: {sector_win_rate:.2f}%, "
                     f"Profit Factor: {sector_profit_factor:.4f}"
                 )
+
     # -------------------------------------------
     # TEST_FORGETTING
     # -------------------------------------------
@@ -605,6 +627,7 @@ def main():
     # Clean up DDP
     if use_ddp:
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
