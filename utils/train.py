@@ -338,8 +338,8 @@ def train_model(
                 with amp.autocast(device_type='cuda', dtype=torch.float16):
                     try:
                         # Embed all contexts and main article
-                        context_embs = model.get_embeddings(candidate_tensors).half()  # [num_candidates, embed_dim]
-                        main_emb = model.get_embeddings(main_ids[i].unsqueeze(0).repeat(num_candidates, 1)).half()  # [num_candidates, embed_dim]
+                        context_embs = model.module.get_embeddings(candidate_tensors).half()  # [num_candidates, embed_dim]
+                        main_emb = model.module.get_embeddings(main_ids[i].unsqueeze(0).repeat(num_candidates, 1)).half()  # [num_candidates, embed_dim]
                         logging.debug(f"    context_embs shape: {context_embs.shape}, main_emb shape: {main_emb.shape}")
                     except Exception as e:
                         logging.error(f"    Error during embedding: {e}")
