@@ -192,7 +192,10 @@ def main():
         logging.info(f"Overriding block_size to {config.BLOCK_SIZE}")
     if args.epochs is not None:
         config.EPOCHS = args.epochs
-        logging.info(f"Overriding EPOCHS to {config.EPOCHS}")
+        logging.info(f"Overriding epochs to {config.EPOCHS}")
+    if args.batch_size is not None:
+        config.BATCH_SIZE = args.batch_size
+        logging.info(f"Overriding batch_size to {config.BATCH_SIZE}")
 
     # Check if running with DDP
     use_ddp = (torch.cuda.device_count() > 1) and args.use_ddp
@@ -247,7 +250,7 @@ def main():
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=True
+                find_unused_parameters=False
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
