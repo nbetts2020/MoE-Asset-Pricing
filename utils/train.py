@@ -25,6 +25,12 @@ logging.basicConfig(
     ]
 )
 
+def get_wrapped_model(model):
+    """
+    Returns the underlying model whether it's wrapped with DistributedDataParallel or not.
+    """
+    return model.module if hasattr(model, 'module') else model
+
 def train_model(
     model,
     optimizer,
@@ -117,6 +123,11 @@ def train_model(
         logging.info(f"==== Epoch {epoch+1}/{epochs} ====")
         total_loss = 0.0
         total_count = 0
+
+        # Set the epoch for DistributedSampler if present
+        if hasattr(dataloader.sampler, 'set_epoch'):
+            dataloader.sampler.set_epoch(epoch)
+            logging.debug(f"Set epoch {epoch} for DistributedSampler.")
 
         # Example: dynamic # of contexts => pyramid: e.g., max(epochs - epoch, 5)
         if hasattr(args, 'ebm_num_samples_train') and args.ebm_num_samples_train is not None:
@@ -338,13 +349,14 @@ def train_model(
                 with amp.autocast(device_type='cuda', dtype=torch.float16):
                     try:
                         # Embed all contexts and main article
-                        context_embs = model.module.get_embeddings(candidate_tensors).half()  # [num_candidates, embed_dim]
-                        main_emb = model.module.get_embeddings(main_ids[i].unsqueeze(0).repeat(num_candidates, 1)).half()  # [num_candidates, embed_dim]
+                        wrapped_model = get_wrapped_model(model)
+                        context_embs = wrapped_model.get_embeddings(candidate_tensors).half()  # [num_candidates, embed_dim]
+                        main_emb = wrapped_model.get_embeddings(main_ids[i].unsqueeze(0).repeat(num_candidates, 1)).half()  # [num_candidates, embed_dim]
                         logging.debug(f"    context_embs shape: {context_embs.shape}, main_emb shape: {main_emb.shape}")
                     except Exception as e:
                         logging.error(f"    Error during embedding: {e}")
-                        context_embs = torch.zeros(num_candidates, config.EMBED_DIM, device=device, dtype=torch.float16)
-                        main_emb = torch.zeros(num_candidates, config.EMBED_DIM, device=device, dtype=torch.float16)
+                        context_embs = torch.zeros(num_candidates, config.N_EMBED, device=device, dtype=torch.float16)
+                        main_emb = torch.zeros(num_candidates, config.N_EMBED, device=device, dtype=torch.float16)
 
                     try:
                         pred_mse = ebm(main_emb, context_embs).float().squeeze()
@@ -378,7 +390,7 @@ def train_model(
                 chosen_contexts_toks.append(candidate_tensors)  # [num_candidates, seq_len]
 
             # Step E) EBM optimizer step
-            if ebm_optimizer:
+            if ebm_optimizer and ebm_count > 0:
                 try:
                     scaler.step(ebm_optimizer)
                     scaler.update()
@@ -398,8 +410,8 @@ def train_model(
                     logging.debug(f"  Sample {i + 1}: No contexts. Using main article only.")
                     with amp.autocast(device_type='cuda', dtype=torch.float16):
                         try:
-                            pred_val_i, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
-                            logging.debug(f"    pred_val_i shape: {pred_val_i.shape}, main_loss_i: {main_loss_i.item():.4f}")
+                            preds, main_loss_i = model(input_ids=combined_tokens, targets=label_i)
+                            logging.debug(f"    preds shape: {preds.shape}, main_loss_i: {main_loss_i.item():.4f}")
                         except Exception as e:
                             logging.error(f"    Error during model forward pass for sample {i} without context: {e}")
                             main_loss_i = torch.tensor(0.0, device=device, requires_grad=True)
