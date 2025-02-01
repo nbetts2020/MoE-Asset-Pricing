@@ -382,6 +382,7 @@ def custom_collate_fn(batch):
     old_price_list = []
     sector_list    = []
     idx_list       = []
+    rfr_list       = []
 
     for sample in batch:
         input_ids_list.append(sample['input_ids'])
@@ -389,6 +390,7 @@ def custom_collate_fn(batch):
         old_price_list.append(sample['old_price'])
         sector_list.append(sample['sector'])
         idx_list.append(sample['idx'])
+        rfr_list.append(sample['risk_free_rate'])
 
     # Pad input_ids
     input_ids_padded = torch.nn.utils.rnn.pad_sequence(
@@ -397,11 +399,13 @@ def custom_collate_fn(batch):
     )
     labels_tensor    = torch.stack(labels_list)
     old_price_tensor = torch.stack(old_price_list)
+    rfr_tensor       = torch.stack(rfr_list)
 
     return {
         'input_ids':    input_ids_padded,
         'labels':       labels_tensor,
         'old_price':    old_price_tensor,
         'sector':       sector_list,  # CPU list of strings
-        'idx':          idx_list
+        'idx':          idx_list,
+        'risk_free_rate': rfr_list
     }
