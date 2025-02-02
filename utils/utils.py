@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
@@ -50,54 +51,133 @@ import torch.distributed as dist
 
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
 
+logger = logging.getLogger(__name__)
+
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
 
-def get_data(percent_data=100.0, run=False, update=False, args=None):
-    load_dotenv('/content/MoE-Asset-Pricing/.env')
-    hf_token = os.getenv('HF_TOKEN')
+def ensure_local_dataset_files():
+    """
+    Checks if the main and preprocessed parquet files exist in the local "data" directory.
+    If not, downloads them from Hugging Face using the correct repo type and saves them locally.
+    Returns the local paths for both files.
+    """
+    data_dir = "data"
+    os.makedirs(data_dir, exist_ok=True)
+    main_file = os.path.join(data_dir, "SC454k.parquet")
+    preprocessed_file = os.path.join(data_dir, "SC454k-preprocessed.parquet")
 
-    login(hf_token)
-    dataset = load_dataset("nbettencourt/SC454k")
-    df = dataset['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
+    if not os.path.exists(main_file):
+        logger.info("Main parquet file not found locally. Downloading from Hugging Face...")
+        main_file = hf_hub_download(
+            repo_id="nbettencourt/SC454k",
+            filename="SC454k_cleaned.parquet",
+            repo_type="dataset",
+            cache_dir=data_dir
+        )
+    else:
+        logger.info("Found main parquet file locally.")
 
-    total_samples = len(df)
-    num_samples = int((percent_data / 100.0) * total_samples)
+    if not os.path.exists(preprocessed_file):
+        logger.info("Preprocessed parquet file not found locally. Downloading from Hugging Face...")
+        preprocessed_file = hf_hub_download(
+            repo_id="nbettencourt/SC454k-preprocessed",
+            filename="sc454k-preprocessed-updated.parquet",
+            repo_type="dataset",
+            cache_dir=data_dir
+        )
+    else:
+        logger.info("Found preprocessed parquet file locally.")
 
-    df = df[
-        (df['weighted_avg_0_hrs'] > 0) &
-        (df['weighted_avg_720_hrs'] > 0)
-    ]
+    return main_file, preprocessed_file
 
-    df = df.head(num_samples)
+def get_total_rows(parquet_path):
+    # Read only the metadata (no columns) to get the number of rows
+    table = pq.read_table(parquet_path, columns=[])
+    return table.num_rows
 
-    dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")
-    df_preprocessed = dataset_preprocessed['train'].to_pandas().head(453932)
-    df_preprocessed = df_preprocessed.head(num_samples)
+def get_data_window(streaming_size, overlap, window_index, main_parquet_path, preprocessed_parquet_path):
+    """
+    Loads a rolling window (subset) of the data from the given parquet files.
+    The window is determined by:
+       window_start = window_index * (streaming_size - overlap)
+       window_end = window_start + streaming_size
+    After loading, for the preprocessed DataFrame we filter out indices that are less than:
+         threshold = max(0, window_start - streaming_size)
+    """
+    total_rows = get_total_rows(main_parquet_path)
+    window_start = window_index * (streaming_size - overlap)
+    window_end = min(window_start + streaming_size, total_rows)
+    logger.info(f"Loading rows {window_start} to {window_end} (window index {window_index}).")
 
-    safe_div = df['weighted_avg_720_hrs'].replace(0, np.nan)
-    df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
+    # Try to read only the needed rows using row_slice.
+    try:
+        main_table = pq.read_table(main_parquet_path, row_slice=(window_start, window_end - window_start))
+    except TypeError:
+        logger.warning("row_slice not supported for main file; reading full table and slicing (this may use extra memory).")
+        main_table = pq.read_table(main_parquet_path).slice(window_start, window_end - window_start)
 
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+    try:
+        pre_table = pq.read_table(preprocessed_parquet_path, row_slice=(window_start, window_end - window_start))
+    except TypeError:
+        logger.warning("row_slice not supported for preprocessed file; reading full table and slicing (this may use extra memory).")
+        pre_table = pq.read_table(preprocessed_parquet_path).slice(window_start, window_end - window_start)
 
-    # 70/15/15 split
-    split1 = int(len(df) * 0.7)
-    split2 = int(len(df) * 0.85)
+    df = main_table.to_pandas()
+    df_preprocessed = pre_table.to_pandas()
 
-    if args.mode == "train":
-        df = df[:split1]
-        df_preprocessed = df_preprocessed[:split1]
-
-    elif args.mode == "run":
-        df = df[split1:split2]
-        df_preprocessed = df_preprocessed[:split2]
-
-    elif args.mode == "update":
-        df = df[split2:]
-
+    # Filter the preprocessed index lists so that only indices >= threshold are kept.
+    threshold = max(0, window_start - streaming_size)
+    index_columns = ["use_ebm_economic", "use_ebm_industry", "use_ebm_sector", "use_ebm_historical", "use_ebm_top25"]
+    for col in index_columns:
+        if col in df_preprocessed.columns:
+            def filter_indices(cell):
+                if isinstance(cell, (list, np.ndarray)):
+                    return [int(x) for x in cell if int(x) >= threshold]
+                else:
+                    return cell
+            df_preprocessed[col] = df_preprocessed[col].apply(filter_indices)
     return df, df_preprocessed
+
+def get_data(percent_data=100.0, run=False, update=False, args=None):
+    """
+    If streaming mode is enabled (args.streaming is True), uses the rolling-window approach.
+    Otherwise, falls back to the original full-dataset loading.
+    """
+    if hasattr(args, "streaming") and args.streaming:
+        # Ensure that the parquet files exist locally (download if necessary)
+        main_parquet_path, preprocessed_parquet_path = ensure_local_dataset_files()
+        streaming_size = getattr(args, "streaming_size", 60000)
+        overlap = getattr(args, "overlap", streaming_size // 2)
+        window_index = getattr(args, "window_index", 0)
+        logger.info(f"Streaming mode enabled. Window index: {window_index}, streaming_size: {streaming_size}, overlap: {overlap}")
+        df, df_preprocessed = get_data_window(streaming_size, overlap, window_index, main_parquet_path, preprocessed_parquet_path)
+        return df, df_preprocessed
+    else:
+        from datasets import load_dataset
+        df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
+        total_samples = len(df)
+        num_samples = int((percent_data / 100.0) * total_samples)
+        df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
+        df = df.head(num_samples)
+        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
+        df_preprocessed = dataset_preprocessed.head(num_samples)
+        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
+        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+        split1 = int(len(df) * 0.7)
+        split2 = int(len(df) * 0.85)
+        if args.mode == "train":
+            df = df[:split1]
+            df_preprocessed = df_preprocessed[:split1]
+        elif args.mode == "run":
+            df = df[split1:split2]
+            df_preprocessed = df_preprocessed[:split2]
+        elif args.mode == "update":
+            df = df[split2:]
+        return df, df_preprocessed
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
@@ -518,7 +598,7 @@ def prepare_tasks(tokenizer, args, k=3):
         df_task = df[df['Sector'] == sector].copy()
         # For df_preprocessed (row-aligned), subset by the same index
         dfp_task = df_preprocessed.loc[df_task.index].copy()
-        
+
         loader = prepare_dataloader(
             df_task,
             dfp_task,
@@ -1063,7 +1143,7 @@ def evaluate_model(model, dataloader, device):
         win_rate,        # 7
         profit_factor    # 8
     )
-    
+
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
     """
     Load model and optimizer states from a checkpoint.
