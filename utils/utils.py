@@ -128,7 +128,7 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
     df_preprocessed = pre_table.to_pandas()
 
     # Filter the preprocessed index lists so that only indices >= threshold are kept.
-    threshold = max(0, window_start - streaming_size)
+    threshold = max(0, window_start - overlap)
     index_columns = ["use_ebm_economic", "use_ebm_industry", "use_ebm_sector", "use_ebm_historical", "use_ebm_top25"]
     for col in index_columns:
         if col in df_preprocessed.columns:
