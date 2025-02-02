@@ -1,7 +1,7 @@
 # utils/data.py
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 import torch.nn.functional as F
 import pandas as pd
 import logging
@@ -409,3 +409,59 @@ def custom_collate_fn(batch):
         'idx':          idx_list,
         'risk_free_rate': rfr_list
     }
+
+class RollingWindowDataset(IterableDataset):
+    def __init__(self, main_parquet_path, preprocessed_parquet_path, streaming_size, overlap, tokenizer, mode):
+        """
+        Loads data in rolling windows.
+
+        Args:
+            main_parquet_path (str): Path to main parquet file.
+            preprocessed_parquet_path (str): Path to preprocessed parquet file.
+            streaming_size (int): Number of rows in each window.
+            overlap (int): Overlap between successive windows.
+            tokenizer: Tokenizer instance.
+            mode (str): 'train', 'run', or 'update'
+        """
+        self.main_parquet_path = main_parquet_path
+        self.preprocessed_parquet_path = preprocessed_parquet_path
+        self.streaming_size = streaming_size
+        self.overlap = overlap
+        self.tokenizer = tokenizer
+        self.mode = mode
+        self.total_rows = self.get_total_rows(main_parquet_path)
+        self.current_window = 0
+
+    def get_total_rows(self, path):
+        table = pq.read_table(path, columns=[])
+        return table.num_rows
+
+    def __iter__(self):
+        window_start = 0
+        # Iterate over windows until we cover all rows
+        while window_start < self.total_rows:
+            window_end = min(window_start + self.streaming_size, self.total_rows)
+            logger.info(f"Loading window rows {window_start} to {window_end}")
+            main_table = pq.read_table(self.main_parquet_path, row_slice=(window_start, window_end - window_start))
+            pre_table = pq.read_table(self.preprocessed_parquet_path, row_slice=(window_start, window_end - window_start))
+            df = main_table.to_pandas()
+            # For simplicity, we ignore df_preprocessed here (you can load and pass it in each __getitem__)
+            for idx, row in df.iterrows():
+                # Process each row similar to your ArticlePriceDataset.__getitem__
+                article = row.get('Article', 'N/A')
+                future_price = row.get('weighted_avg_720_hrs', 0.0)
+                encoding = self.tokenizer(
+                    article,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=config.BLOCK_SIZE,
+                    return_tensors='pt'
+                )
+                input_ids = encoding['input_ids'].squeeze(0)
+                sample = {
+                    'input_ids': input_ids,
+                    'labels': torch.tensor(future_price, dtype=torch.float),
+                    'idx': int(idx + window_start)
+                }
+                yield sample
+            window_start = window_start + (self.streaming_size - self.overlap)
