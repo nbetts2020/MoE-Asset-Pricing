@@ -14,6 +14,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
 from utils.data import parallel_context_generation_worker
 from utils.utils import compute_l2_loss, load_checkpoint
+import math
 
 # Configure logging with debug level and file handler
 logging.basicConfig(
@@ -131,6 +132,23 @@ def train_model(
             dataloader.sampler.set_epoch(epoch)
             logging.debug(f"Set epoch {epoch} for DistributedSampler.")
 
+        # Possibly compute custom total_batches for tqdm
+        from tqdm import tqdm
+        if getattr(args, 'streaming', False):
+            from utils.utils import ensure_local_dataset_files, get_total_rows
+            main_parquet_path, _ = ensure_local_dataset_files()
+            total_rows = get_total_rows(main_parquet_path)
+            # Use 70% of data for training and adjust by percent_data:
+            train_rows = int(total_rows * 0.7 * (args.percent_data / 100.0))
+            total_batches = math.ceil(train_rows / args.batch_size)
+            if getattr(args, 'use_ddp', False):
+                world_size = torch.distributed.get_world_size()
+            else:
+                world_size = 1
+            batches_per_gpu = math.ceil(total_batches / world_size)
+        else:
+            batches_per_gpu = len(dataloader)
+
         # Possibly override # of contexts
         if hasattr(args, 'ebm_num_samples_train') and args.ebm_num_samples_train is not None:
             try:
@@ -144,7 +162,8 @@ def train_model(
             context_count = max(epochs - epoch, 5)
             logging.debug(f"ebm_num_samples_train not set. Using default context_count={context_count}")
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+        # Use tqdm with total_batches
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", total=batches_per_gpu)):
             # Zero out grads
             optimizer.zero_grad()
             if use_ebm and ebm_optimizer:
