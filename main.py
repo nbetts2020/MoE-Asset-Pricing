@@ -11,10 +11,10 @@ from utils.utils import (
     prepare_optimizer,
     initialize_si,
     initialize_replay_buffer,
+    save_ebm_model,
     save_model_and_states,
     kaiming_init_weights,
     prepare_data,
-    save_ebm_model,
     download_models_from_s3,
     evaluate_model,
     ebm_select_contexts
@@ -37,13 +37,11 @@ from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
 from utils.test import test_forgetting
-
 from utils.ebm import EnergyBasedModel
 from torch.utils.data.distributed import DistributedSampler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
-
 
 def main():
     pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
@@ -163,6 +161,16 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for training')
 
+    # NEW STREAMING ARGUMENTS
+    parser.add_argument('--streaming', action='store_true',
+                        help="Enable streaming mode (rolling window).")
+    parser.add_argument('--streaming_size', type=int, default=60000,
+                        help="Number of rows to load per window.")
+    parser.add_argument('--overlap', type=int, default=30000,
+                        help="Number of overlapping rows between windows.")
+    parser.add_argument('--window_index', type=int, default=0,
+                        help="Window index to load (starting from 0).")
+
     args = parser.parse_args()
 
     # Possibly override config for quick test
@@ -201,7 +209,6 @@ def main():
     use_ddp = (torch.cuda.device_count() > 1) and args.use_ddp
 
     if use_ddp:
-        # Initialize process group
         dist.init_process_group(backend='nccl', init_method='env://')
         local_rank = int(os.environ['LOCAL_RANK'])
         device = torch.device(f'cuda:{local_rank}')
@@ -218,7 +225,6 @@ def main():
     random.seed(random_seed)
     torch.cuda.manual_seed_all(random_seed)
     logging.info(f"Using random seed: {random_seed}")
-
     if not (0 < args.percent_data <= 100):
         raise ValueError("--percent_data must be between 0 and 100.")
 
@@ -234,17 +240,14 @@ def main():
     # TRAIN MODE
     # -------------------------------------------
     if args.mode == 'train':
-        # Initialize model from scratch
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
-        # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
 
-        # Possibly wrap DDP
         if use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -254,27 +257,20 @@ def main():
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
-        # Load data
         train_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
 
-        # Initialize EBM if using
         ebm = None
         ebm_optimizer = None
         if args.use_ebm:
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
-
             from utils.data import custom_collate_fn
             train_dataset = train_dataloader.dataset
-
-            # If you're using DDP, also shard this second data loader
-            # so that each rank only sees its subset for EBM:
             sampler = None
             if use_ddp:
                 sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=False)
-
             train_dataloader = DataLoader(
                 train_dataset,
                 batch_size=args.batch_size,
@@ -283,7 +279,6 @@ def main():
                 sampler=sampler
             )
 
-        # Initialize SI, EWC, Replay Buffer
         si = initialize_si(model, args) if args.use_si else None
         if args.use_ewc:
             ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
@@ -293,7 +288,6 @@ def main():
 
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
 
-        # Train the model
         train_model(
             model=model,
             optimizer=optimizer,
@@ -304,7 +298,7 @@ def main():
             si=si,
             ewc=ewc_list,
             replay_buffer=replay_buffer,
-            df=df,  # Main DataFrame
+            df=df,
             df_preprocessed=df_preprocessed,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
@@ -312,11 +306,9 @@ def main():
         )
         logging.info("Training completed.")
 
-        # Save EBM if applicable
         if ebm and (rank == 0):
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
 
-        # Save final model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
@@ -333,7 +325,6 @@ def main():
 
         download_models_from_s3(bucket=args.bucket)
 
-        # Initialize model and load weights
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -341,7 +332,6 @@ def main():
         model.eval()
         logging.info("Main transformer model loaded from S3.")
 
-        # Load EBM if using
         ebm = None
         ebm_optimizer = None
         if args.use_ebm:
@@ -352,10 +342,8 @@ def main():
             ebm.eval()
             logging.info("EBM model loaded from S3.")
 
-        # Prepare optimizer
         optimizer = prepare_optimizer(model, args)
 
-        # Wrap DDP if needed
         if use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -364,16 +352,13 @@ def main():
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
-        # Re-create DataLoader with custom collate_fn if using EBM
         if args.use_ebm and ebm is not None:
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
             from utils.data import custom_collate_fn
             update_dataset = update_dataloader.dataset
-
             sampler = None
             if use_ddp:
                 sampler = DistributedSampler(update_dataset, shuffle=False, drop_last=False)
-
             update_dataloader = DataLoader(
                 update_dataset,
                 batch_size=args.batch_size,
@@ -382,7 +367,6 @@ def main():
                 sampler=sampler
             )
 
-        # Initialize SI, EWC, Replay Buffer
         si = initialize_si(model, args) if args.use_si else None
         if args.use_ewc:
             ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
@@ -404,7 +388,6 @@ def main():
 
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
 
-        # Perform the update
         logging.info("Starting update...")
         train_model(
             model=model,
@@ -424,11 +407,9 @@ def main():
         )
         logging.info("Update completed.")
 
-        # Save EBM if applicable
         if ebm and (rank == 0):
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
 
-        # Save final model and states
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
@@ -436,21 +417,17 @@ def main():
     # RUN MODE
     # -------------------------------------------
     elif args.mode == 'run':
-        # Validate input arguments
         if (not args.test) and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("In 'run' mode with EBM (no --test), must provide --stock, --date, --text, --bucket.")
         elif args.test and not args.bucket:
             raise ValueError("When evaluating on test set, provide --bucket.")
 
-        # Prepare data
         run_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
 
-        # Download models
         download_models_from_s3(bucket=args.bucket)
 
-        # Initialize and load the main model
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -458,7 +435,6 @@ def main():
         model.eval()
         logging.info("Main transformer model loaded from S3.")
 
-        # Load EBM if using and not in test mode
         if args.use_ebm and (not args.test):
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
@@ -467,19 +443,17 @@ def main():
             ebm.eval()
             logging.info("EBM model loaded from S3.")
 
-            # Select context using EBM
             selected_context = ebm_select_contexts(
                 df=df,
                 stock=args.stock,
                 date=args.date,
-                text=args.text,  # Pass the input text
+                text=args.text,
                 model=model,
                 ebm=ebm,
                 tokenizer=tokenizer,
                 ebm_samples=args.ebm_num_samples
             )
             final_input = f"{selected_context}\n{args.text}"
-
             encoding = tokenizer(
                 final_input,
                 truncation=True,
@@ -488,13 +462,11 @@ def main():
                 return_tensors='pt'
             ).to(device)
             input_ids = encoding["input_ids"]
-
             with torch.no_grad():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
 
         elif not args.test:
-            # Simple run without EBM
             encoding = tokenizer(
                 args.text,
                 truncation=True,
@@ -508,7 +480,6 @@ def main():
             print(f"Predicted Price: {prediction.item()}")
 
         else:
-            # Evaluate on test set
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
                 prices=df['weighted_avg_720_hrs'].tolist(),
@@ -524,76 +495,46 @@ def main():
                 use_ebm=args.use_ebm
             )
 
-            # ---- Call evaluate_model and Unpack Metrics ----
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
-
-            # ---- Print and Log Overall Metrics ----
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
-
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
             logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-
             print(f"Sortino Ratio: {sortino_ratio:.4f}")
             logging.info(f"Sortino Ratio: {sortino_ratio:.4f}")
-
-            # ---- Print and Log New Metrics ----
             print(f"Average Return: {average_return:.4f}")
             logging.info(f"Average Return: {average_return:.4f}")
-
             print(f"Win Rate: {win_rate:.2f}%")
             logging.info(f"Win Rate: {win_rate:.2f}%")
-
             print(f"Profit Factor: {profit_factor:.4f}")
             logging.info(f"Profit Factor: {profit_factor:.4f}")
-
-            # ---- Print and Log Per-Sector Metrics ----
             print("Per-Sector Metrics:")
             logging.info("Per-Sector Metrics:")
-
             for sector, metrics in sector_metrics.items():
-                # Extract sector-specific metrics
-                sector_mse = metrics.get('mse', 0.0)
-                sector_r2 = metrics.get('r2', 0.0)
-                sector_trend_acc = metrics.get('trend_acc', 0.0)
-                sector_sharpe = metrics.get('sharpe', 0.0)
-                sector_sortino = metrics.get('sortino', 0.0)
-                sector_avg_return = metrics.get('average_return', 0.0)
-                sector_win_rate = metrics.get('win_rate', 0.0)
-                sector_profit_factor = metrics.get('profit_factor', 0.0)
-
-                # Print sector metrics
                 print(
                     f"Sector: {sector} - "
-                    f"MSE: {sector_mse:.4f}, "
-                    f"R²: {sector_r2:.4f}, "
-                    f"Trend Accuracy: {sector_trend_acc:.4f}, "
-                    f"Sharpe Ratio: {sector_sharpe:.4f}, "
-                    f"Sortino Ratio: {sector_sortino:.4f}, "
-                    f"Average Return: {sector_avg_return:.4f}, "
-                    f"Win Rate: {sector_win_rate:.2f}%, "
-                    f"Profit Factor: {sector_profit_factor:.4f}"
+                    f"MSE: {metrics.get('mse',0.0):.4f}, "
+                    f"R²: {metrics.get('r2',0.0):.4f}, "
+                    f"Trend Accuracy: {metrics.get('trend_acc',0.0):.4f}, "
+                    f"Sharpe Ratio: {metrics.get('sharpe',0.0):.4f}, "
+                    f"Sortino Ratio: {metrics.get('sortino',0.0):.4f}, "
+                    f"Average Return: {metrics.get('average_return',0.0):.4f}, "
+                    f"Win Rate: {metrics.get('win_rate',0.0):.2f}%, "
+                    f"Profit Factor: {metrics.get('profit_factor',0.0):.4f}"
                 )
-
-                # Log sector metrics
                 logging.info(
                     f"Sector: {sector} - "
-                    f"MSE: {sector_mse:.4f}, "
-                    f"R²: {sector_r2:.4f}, "
-                    f"Trend Accuracy: {sector_trend_acc:.4f}, "
-                    f"Sharpe Ratio: {sector_sharpe:.4f}, "
-                    f"Sortino Ratio: {sector_sortino:.4f}, "
-                    f"Average Return: {sector_avg_return:.4f}, "
-                    f"Win Rate: {sector_win_rate:.2f}%, "
-                    f"Profit Factor: {sector_profit_factor:.4f}"
+                    f"MSE: {metrics.get('mse',0.0):.4f}, "
+                    f"R²: {metrics.get('r2',0.0):.4f}, "
+                    f"Trend Accuracy: {metrics.get('trend_acc',0.0):.4f}, "
+                    f"Sharpe Ratio: {metrics.get('sharpe',0.0):.4f}, "
+                    f"Sortino Ratio: {metrics.get('sortino',0.0):.4f}, "
+                    f"Average Return: {metrics.get('average_return',0.0):.4f}, "
+                    f"Win Rate: {metrics.get('win_rate',0.0):.2f}%, "
+                    f"Profit Factor: {metrics.get('profit_factor',0.0):.4f}"
                 )
-
-    # -------------------------------------------
-    # TEST_FORGETTING
-    # -------------------------------------------
     elif args.mode == 'test_forgetting':
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info("Initialized model for catastrophic forgetting testing.")
@@ -623,14 +564,11 @@ def main():
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
         with open(os.path.join(args.save_dir, 'test_forgetting_results.json'), 'w') as f:
             json.dump(test_results, f, indent=4)
-
     else:
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', or 'test_forgetting'.")
 
-    # Clean up DDP
     if use_ddp:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
