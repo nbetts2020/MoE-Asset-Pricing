@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 
 from utils.config import config
-from utils.data import ArticlePriceDataset
+from utils.data import ArticlePriceDataset, custom_collate_fn
 from utils.model import SparseMoELanguageModel
 
 import os
@@ -534,15 +534,9 @@ def process_data(df,
         symbols, industries, risk_free_rates
     )
 
-def prepare_dataloader(df,
-                       df_preprocessed,
-                       tokenizer,
-                       batch_size,
-                       shuffle,
-                       args):
+def prepare_dataloader(df, df_preprocessed, tokenizer, batch_size, shuffle, args):
     """
-    Pass df and df_preprocessed to process_data.
-    Then wrap the resulting data in ArticlePriceDataset -> DataLoader.
+    Processes df and df_preprocessed to create an ArticlePriceDataset and returns a DataLoader.
     """
     (articles, prices, sectors, dates,
      related_stocks, prices_current,
@@ -569,12 +563,13 @@ def prepare_dataloader(df,
         use_ebm=args.use_ebm
     )
 
+    num_workers = max(cpu_count() - 1, 1)
     if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         from torch.utils.data.distributed import DistributedSampler
         sampler = DistributedSampler(dataset, shuffle=False)
-        return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True, collate_fn=custom_collate_fn)
     else:
-        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, collate_fn=custom_collate_fn)
 
 def prepare_tasks(tokenizer, args, k=3):
     """
