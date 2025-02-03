@@ -258,8 +258,8 @@ def train_model(
                         main_emb = main_emb.detach()
 
                         try:
-                            pred_mse = ebm(main_emb, context_embs).float()
-                            # Simple L2 to 0 for demonstration
+                            wrapped_ebm = get_wrapped_model(ebm)
+                            pred_mse = wrapped_ebm(main_emb, context_embs).float()
                             ebm_loss_i = torch.mean(pred_mse**2)
                             ebm_losses.append(ebm_loss_i)
                         except Exception as e:
