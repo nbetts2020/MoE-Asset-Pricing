@@ -13,7 +13,7 @@ import deepspeed  # NEW
 
 from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
-from utils.data import parallel_context_generation_worker
+from utils.data import parallel_context_generation_worker, GLOBAL_TOKENIZER
 from utils.utils import compute_l2_loss, load_checkpoint
 import torch.distributed as dist
 
