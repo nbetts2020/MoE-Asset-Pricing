@@ -1,9 +1,16 @@
-# main.py
-
 import torch
 import os
 import argparse
 import logging
+import numpy as np
+import random
+import pandas as pd
+import json
+from multiprocessing import cpu_count
+
+import deepspeed  # NEW: DeepSpeed integration
+from transformers import AutoTokenizer
+
 from utils.model import SparseMoELanguageModel
 from utils.train import train_model
 from utils.utils import (
@@ -23,15 +30,8 @@ from utils.config import config
 from torch.utils.data import DataLoader
 from utils.data import ArticlePriceDataset, custom_collate_fn
 from sklearn.model_selection import train_test_split
-from transformers import AutoTokenizer
-import torch.distributed as dist
-import numpy as np
-import random
-import pandas as pd
-import json
 
 from pandarallel import pandarallel
-from multiprocessing import cpu_count
 
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
@@ -171,6 +171,10 @@ def main():
     parser.add_argument('--window_index', type=int, default=0,
                         help="Window index to load (starting from 0).")
 
+    # DeepSpeed config path (assumed to be in utils/deepspeed_config.json)
+    parser.add_argument('--deepspeed_config', type=str, default="utils/deepspeed_config.json",
+                        help="Path to the DeepSpeed config file.")
+
     args = parser.parse_args()
 
     # Possibly override config for quick test
@@ -205,18 +209,11 @@ def main():
         config.BATCH_SIZE = args.batch_size
         logging.info(f"Overriding batch_size to {config.BATCH_SIZE}")
 
-    # Check if running with DDP
-    use_ddp = (torch.cuda.device_count() > 1) and args.use_ddp
-
-    if use_ddp:
-        dist.init_process_group(backend='nccl', init_method='env://')
-        local_rank = int(os.environ['LOCAL_RANK'])
-        device = torch.device(f'cuda:{local_rank}')
-        torch.cuda.set_device(device)
-        rank = dist.get_rank()
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        rank = 0
+    # DeepSpeed will handle distributed initialization if launched via its CLI.
+    # (Do not manually call dist.init_process_group if using DeepSpeed launcher.)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    rank = int(os.environ.get('RANK', 0))  # set by DeepSpeed
+    logging.info(f"Using device: {device}, rank: {rank}")
 
     # Set seeds
     random_seed = args.random_seed
@@ -228,35 +225,35 @@ def main():
     if not (0 < args.percent_data <= 100):
         raise ValueError("--percent_data must be between 0 and 100.")
 
-    logging.info(f"Using device: {device}")
-
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # -------------------------------------------
-    # TRAIN MODE
-    # -------------------------------------------
+    # ----------------------------------------------------------------
+    # MAIN LOGIC (Modes)
+    # ----------------------------------------------------------------
     if args.mode == 'train':
+        # Create the model
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
-        optimizer = prepare_optimizer(model, args)
+        # Prepare base optimizer; DeepSpeed will wrap it
+        base_optimizer = prepare_optimizer(model, args)
 
-        if use_ddp:
-            model = torch.nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=False
-            )
-            logging.info("Model wrapped with DistributedDataParallel.")
+        # Initialize DeepSpeed (this also handles distributed setup)
+        engine, engine_optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=base_optimizer,
+            model_parameters=model.parameters(),
+            config=args.deepspeed_config
+        )
 
+        # Prepare DataLoader (DistributedSampler is still needed)
         train_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
@@ -269,7 +266,7 @@ def main():
             from utils.data import custom_collate_fn
             train_dataset = train_dataloader.dataset
             sampler = None
-            if use_ddp:
+            if args.use_ddp:
                 sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=False)
             train_dataloader = DataLoader(
                 train_dataset,
@@ -279,18 +276,19 @@ def main():
                 sampler=sampler
             )
 
-        si = initialize_si(model, args) if args.use_si else None
+        si = initialize_si(engine, args) if args.use_si else None
         if args.use_ewc:
-            ewc_instance = ElasticWeightConsolidation(model, train_dataloader, device, args)
+            ewc_instance = ElasticWeightConsolidation(engine, train_dataloader, device, args)
             ewc_list = [ewc_instance]
         else:
             ewc_list = None
 
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
 
+        # Call training loop with DeepSpeed flag set to True.
         train_model(
-            model=model,
-            optimizer=optimizer,
+            model=engine,
+            optimizer=engine_optimizer,
             epochs=config.EPOCHS,
             device=device,
             dataloader=train_dataloader,
@@ -302,7 +300,8 @@ def main():
             df_preprocessed=df_preprocessed,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            use_deepspeed=True
         )
         logging.info("Training completed.")
 
@@ -310,17 +309,14 @@ def main():
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
 
         if rank == 0:
-            save_model_and_states(model, si, replay_buffer, ewc_list, args)
+            save_model_and_states(engine.module, si, replay_buffer, ewc_list, args)
 
-    # -------------------------------------------
-    # UPDATE MODE
-    # -------------------------------------------
     elif args.mode == 'update':
         update_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
 
-        if not all([args.bucket]):
+        if not args.bucket:
             raise ValueError("When using EBM sampling in 'update', --bucket is required.")
 
         download_models_from_s3(bucket=args.bucket)
@@ -344,7 +340,7 @@ def main():
 
         optimizer = prepare_optimizer(model, args)
 
-        if use_ddp:
+        if args.use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[local_rank],
@@ -357,7 +353,7 @@ def main():
             from utils.data import custom_collate_fn
             update_dataset = update_dataloader.dataset
             sampler = None
-            if use_ddp:
+            if args.use_ddp:
                 sampler = DistributedSampler(update_dataset, shuffle=False, drop_last=False)
             update_dataloader = DataLoader(
                 update_dataset,
@@ -403,7 +399,8 @@ def main():
             df_preprocessed=df_preprocessed,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            use_deepspeed=False  # or True if you want DS for update mode as well
         )
         logging.info("Update completed.")
 
@@ -413,9 +410,6 @@ def main():
         if rank == 0:
             save_model_and_states(model, si, replay_buffer, ewc_list, args)
 
-    # -------------------------------------------
-    # RUN MODE
-    # -------------------------------------------
     elif args.mode == 'run':
         if (not args.test) and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("In 'run' mode with EBM (no --test), must provide --stock, --date, --text, --bucket.")
@@ -465,7 +459,6 @@ def main():
             with torch.no_grad():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
-
         elif not args.test:
             encoding = tokenizer(
                 args.text,
@@ -478,7 +471,6 @@ def main():
             with torch.no_grad():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
-
         else:
             dataset = ArticlePriceDataset(
                 articles=df['Article'].tolist(),
@@ -543,7 +535,6 @@ def main():
         if use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
                                                               output_device=local_rank)
-
         optimizer = prepare_optimizer(model.module if use_ddp else model, args)
         si = initialize_si(model, args) if args.use_si else None
         ewc_list = [] if args.use_ewc else None
@@ -567,10 +558,9 @@ def main():
     else:
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', or 'test_forgetting'.")
 
-    if use_ddp:
+    if args.use_ddp:
         dist.destroy_process_group()
 
 if __name__ == "__main__":
-    import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
+    # Launch using DeepSpeed CLI (e.g. deepspeed --num_gpus=4 main.py --mode train ...)
     main()
