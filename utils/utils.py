@@ -48,6 +48,7 @@ import ast
 from pandarallel import pandarallel
 
 import torch.distributed as dist
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
 
@@ -754,10 +755,11 @@ def prepare_optimizer(model, args):
             'weight_decay': 0.0
         })
 
-    optimizer = torch.optim.AdamW(param_groups)
-    logging.info("Initialized AdamW optimizer with layer-wise learning rate decay and weight decay.")
+    # Replace standard AdamW with DeepSpeed's CPUAdam when using ZeRO-Offload.
+    optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE)
+    logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
-
+    
 def prepare_data(args, tokenizer):
     """
     Loads df and df_preprocessed from get_data().
