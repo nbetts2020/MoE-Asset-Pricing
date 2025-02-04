@@ -1,20 +1,22 @@
 # utils/data.py
 
+import os
+# Disable tokenizer parallelism to avoid warnings after fork.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 from torch.utils.data import Dataset, IterableDataset
 import torch.nn.functional as F
 import pandas as pd
 import logging
-import os
-import concurrent.futures
 import numpy as np
-
 import random
 import ast
+from tqdm import tqdm
 
+from transformers import AutoTokenizer
 from utils.sampling import sample_articles
 from utils.config import config
-
 from concurrent.futures import ProcessPoolExecutor
 
 logging.basicConfig(level=logging.INFO)
@@ -174,117 +176,259 @@ def format_concatenated_articles(sample: dict) -> str:
     concatenated_articles = "\n".join(formatted_articles)
     return concatenated_articles
 
+# -------------------------------------------------------------------------
+# GLOBAL TOKENIZER SETUP
+# -------------------------------------------------------------------------
+# For all references, we rely on a single tokenizer instance.
+# You can specify config.TOKENIZER_NAME in your config if desired.
+TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "gpt2")
+GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
+# Ensure block size aligns with config.BLOCK_SIZE
+GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
+
+# -------------------------------------------------------------------------
+# PRE-TOKENIZED FIXED STRINGS (HEADERS, ETC.)
+# -------------------------------------------------------------------------
+# These tokens are appended in build_candidate_context_tokens().
+def pretokenize_field(value):
+    """
+    Convert 'value' to string and return a list of token IDs
+    from the global tokenizer, with no special tokens.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    return GLOBAL_TOKENIZER.encode(value, add_special_tokens=False)
+
+FIXED_TOKENS = {
+    "newline": GLOBAL_TOKENIZER.encode("\n", add_special_tokens=False),
+    "date_prefix": GLOBAL_TOKENIZER.encode("Date: ", add_special_tokens=False),
+    "title_prefix": GLOBAL_TOKENIZER.encode("Title: ", add_special_tokens=False),
+    "article_prefix": GLOBAL_TOKENIZER.encode("Article: ", add_special_tokens=False),
+
+    "section_header_economic":
+        GLOBAL_TOKENIZER.encode("Broader Economic Information:", add_special_tokens=False),
+    "section_header_industry":
+        GLOBAL_TOKENIZER.encode("Broader Industry Information:", add_special_tokens=False),
+    "section_header_sector":
+        GLOBAL_TOKENIZER.encode("Broader Sector Information:", add_special_tokens=False),
+    "section_header_movement":
+        GLOBAL_TOKENIZER.encode("Information Potentially Indicating Significant Market Movement Related to Current Stock:", add_special_tokens=False),
+    "section_header_last8":
+        GLOBAL_TOKENIZER.encode("Last 8 Articles for Current Stock:", add_special_tokens=False),
+
+    "main_article_label":
+        GLOBAL_TOKENIZER.encode("MAIN ARTICLE:\n", add_special_tokens=False),
+}
+
+
+# -------------------------------------------------------------------------
+# BUILDING CONTEXTS AS PRE-TOKENIZED LISTS
+# -------------------------------------------------------------------------
+def build_candidate_context_tokens(sample: dict) -> list:
+    """
+    Build a candidate context by concatenating pre-tokenized components
+    from the sample dictionary. Returns a single list of token IDs.
+    """
+    tokens = []
+
+    # 1) ECONOMIC SECTION
+    tokens += FIXED_TOKENS["section_header_economic"] + FIXED_TOKENS["newline"]
+    markets = sample.get("markets", pd.DataFrame()).head(5)
+    for _, row in markets.iterrows():
+        date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
+        title = row.get("Title", "N/A")
+        article = row.get("Article", "N/A")
+
+        tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
+    tokens += FIXED_TOKENS["newline"]
+
+    # 2) INDUSTRY SECTION
+    tokens += FIXED_TOKENS["section_header_industry"] + FIXED_TOKENS["newline"]
+    industry = sample.get("industry", pd.DataFrame()).head(5)
+    for _, row in industry.iterrows():
+        date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
+        title = row.get("Title", "N/A")
+        article = row.get("Article", "N/A")
+
+        tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
+    tokens += FIXED_TOKENS["newline"]
+
+    # 3) SECTOR SECTION
+    tokens += FIXED_TOKENS["section_header_sector"] + FIXED_TOKENS["newline"]
+    sector_df = sample.get("sector", pd.DataFrame()).head(5)
+    for _, row in sector_df.iterrows():
+        date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
+        title = row.get("Title", "N/A")
+        article = row.get("Article", "N/A")
+
+        tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
+    tokens += FIXED_TOKENS["newline"]
+
+    # 4) MARKET MOVEMENT SECTION
+    tokens += FIXED_TOKENS["section_header_movement"] + FIXED_TOKENS["newline"]
+    stock_df = sample.get("stock", pd.DataFrame())
+    if "Percentage Change" not in stock_df.columns:
+        stock_df = stock_df.head(5)
+    else:
+        stock_df = stock_df.nlargest(5, "Percentage Change")
+
+    for _, row in stock_df.iterrows():
+        date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
+        title = row.get("Title", "N/A")
+        article = row.get("Article", "N/A")
+
+        tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
+        tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
+    tokens += FIXED_TOKENS["newline"]
+
+    # 5) LAST 8 ARTICLES
+    tokens += FIXED_TOKENS["section_header_last8"] + FIXED_TOKENS["newline"]
+    df_last8 = sample.get("last_8", pd.DataFrame()).head(8)
+    for _, row in df_last8.iterrows():
+        # Date
+        date = row.get("Date", pd.Timestamp("1970-01-01"))
+        if not isinstance(date, pd.Timestamp):
+            date = pd.to_datetime(date, errors="coerce")
+            if pd.isna(date):
+                date = pd.Timestamp("1970-01-01")
+        date_str = date.strftime("%Y-%m-%d")
+        tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
+        # Title
+        title = row.get("Title", "N/A")
+        tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
+        # Article
+        article = row.get("Article", "N/A")
+        tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
+        # Stock Price info
+        sp_4d = row.get("weighted_avg_-96_hrs", "N/A")
+        sp_2d = row.get("weighted_avg_-48_hrs", "N/A")
+        sp_1d = row.get("weighted_avg_-24_hrs", "N/A")
+        sp_release = row.get("weighted_avg_0_hrs", "N/A")
+        tokens += pretokenize_field(f"Stock Price 4 days before: {sp_4d}\n")
+        tokens += pretokenize_field(f"Stock Price 2 days before: {sp_2d}\n")
+        tokens += pretokenize_field(f"Stock Price 1 day before: {sp_1d}\n")
+        tokens += pretokenize_field(f"Stock Price at release: {sp_release}\n")
+        # Risk-Free Rate
+        rfr = row.get("Risk_Free_Rate", "N/A")
+        tokens += pretokenize_field(f"Risk-Free Rate at release: {rfr}\n")
+        tokens += FIXED_TOKENS["newline"]
+
+    # 6) MAIN ARTICLE
+    tokens += FIXED_TOKENS["main_article_label"]
+    current_df = sample.get("current", pd.DataFrame()).head(1)
+    if not current_df.empty:
+        row = current_df.iloc[0]
+        # Date
+        date_val = row.get("Date", pd.Timestamp("1970-01-01"))
+        date_str = _safe_date_str(date_val)
+        tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
+        # Title
+        title = row.get("Title", "N/A")
+        tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
+        # Article
+        main_article = row.get("Article", "N/A")
+        tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(main_article) + FIXED_TOKENS["newline"]
+        # Stock Price info (mirroring the last_8 section)
+        sp_4d = row.get("weighted_avg_-96_hrs", "N/A")
+        sp_2d = row.get("weighted_avg_-48_hrs", "N/A")
+        sp_1d = row.get("weighted_avg_-24_hrs", "N/A")
+        sp_release = row.get("weighted_avg_0_hrs", "N/A")
+        tokens += pretokenize_field(f"Stock Price 4 days before: {sp_4d}\n")
+        tokens += pretokenize_field(f"Stock Price 2 days before: {sp_2d}\n")
+        tokens += pretokenize_field(f"Stock Price 1 day before: {sp_1d}\n")
+        tokens += pretokenize_field(f"Stock Price at release: {sp_release}\n")
+        rfr = row.get("Risk_Free_Rate", "N/A")
+        tokens += pretokenize_field(f"Risk-Free Rate at release: {rfr}\n")
+    else:
+        tokens += pretokenize_field("N/A") + FIXED_TOKENS["newline"]
+
+    return tokens
+
+def _safe_date_str(date_val):
+    """Convert date_val to a safe YYYY-MM-DD string."""
+    if not isinstance(date_val, pd.Timestamp):
+        date_val = pd.to_datetime(date_val, errors="coerce")
+        if pd.isna(date_val):
+            date_val = pd.Timestamp("1970-01-01")
+    return date_val.strftime("%Y-%m-%d")
+
 def parallel_context_generation_worker(args):
     """
-    CPU-only worker that generates multiple prompt contexts (strings) for one batch sample
-    in the EBM approach. No GPU logic here.
-
-    Args:
-        args (tuple): A tuple of:
-          - idx (int): index in df (the main DataFrame)
-          - df (pd.DataFrame): the "master" DataFrame (with 'Article', 'Date', 'Percentage Change', etc.)
-          - df_preprocessed (pd.DataFrame): row-aligned with df, containing columns like
-                'use_ebm_economic', 'use_ebm_industry', 'use_ebm_sector', 'use_ebm_historical'
-                (each a NumPy array of row indices referencing df).
-          - total_epochs (int): total training epochs
-          - current_epoch (int): current epoch
-          - context_count (int): e.g., max(epochs - epoch, 5)
-            (how many distinct prompt contexts to generate for this single sample)
-
-    Returns:
-        List[str]: A list of prompt strings (one for each context_count) using format_concatenated_articles.
+    CPU-only worker that generates multiple candidate contexts for one sample in the EBM approach.
+    Instead of returning raw strings, it returns lists of token IDs built by concatenating pre-tokenized fields.
     """
-    (
-        idx,
-        df,
-        df_preprocessed,
-        total_epochs,
-        current_epoch,
-        context_count
-    ) = args
+    (idx, df, df_preprocessed, total_epochs, current_epoch, context_count) = args
     candidate_contexts = []
 
-    # Step 1: Validate idx and gather main row
     if idx < 0 or idx >= len(df):
-        logging.error(f"Index {idx} is out-of-bounds for the main DataFrame.")
-        return candidate_contexts  # out-of-bounds => empty
+        logger.error(f"Index {idx} is out-of-bounds for the main DataFrame.")
+        return candidate_contexts
 
     main_row = df.iloc[idx]
-    preproc_row = df_preprocessed.iloc[idx]  # row-aligned with df
-    symbol = main_row.get('Symbol', 'Unknown Symbol')
+    preproc_row = df_preprocessed.iloc[idx]
 
-    # Define how many samples to take from each category
+    # These are the maximum # of references we take from each category
     sample_map = {
         'use_ebm_economic': 5,
         'use_ebm_industry': 5,
         'use_ebm_sector': 5,
         'use_ebm_top25': 5,
-        # We do NOT sample from 'use_ebm_historical'; we take the full list.
     }
 
-    # Step 2: Build multiple contexts, each one is used by the EBM
     for _ in range(context_count):
-        # A) ECONOMIC -> "markets" in your final dict
-        econ_array = preproc_row.get('use_ebm_economic', np.array([]))
+        # Pull references from the columns in preproc_row
+        econ_array = preproc_row.get('use_ebm_economic', [])
+        ind_array = preproc_row.get('use_ebm_industry', [])
+        sec_array = preproc_row.get('use_ebm_sector', [])
+        hist_array = preproc_row.get('use_ebm_historical', [])
+        top25_array = preproc_row.get('use_ebm_top25', [])
+
+        # ECON
         econ_needed = min(len(econ_array), sample_map['use_ebm_economic'])
         if econ_needed > 0:
-            if econ_needed > len(econ_array):
-                logging.warning(f"Requested {econ_needed} econ samples, but only {len(econ_array)} available.")
-                econ_indices = econ_array  # Take all available
-            else:
-                econ_indices = np.random.choice(econ_array, size=econ_needed, replace=False)
+            econ_indices = np.random.choice(econ_array, size=econ_needed, replace=False)
         else:
             econ_indices = np.array([], dtype=int)
         markets_df = df.loc[econ_indices].copy() if econ_indices.size > 0 else pd.DataFrame()
 
-        # B) INDUSTRY -> "industry"
-        ind_array = preproc_row.get('use_ebm_industry', np.array([]))
+        # IND
         ind_needed = min(len(ind_array), sample_map['use_ebm_industry'])
         if ind_needed > 0:
-            if ind_needed > len(ind_array):
-                logging.warning(f"Requested {ind_needed} industry samples, but only {len(ind_array)} available.")
-                ind_indices = ind_array
-            else:
-                ind_indices = np.random.choice(ind_array, size=ind_needed, replace=False)
+            ind_indices = np.random.choice(ind_array, size=ind_needed, replace=False)
         else:
             ind_indices = np.array([], dtype=int)
         industry_df = df.loc[ind_indices].copy() if ind_indices.size > 0 else pd.DataFrame()
 
-        # C) SECTOR -> "sector"
-        sec_array = preproc_row.get('use_ebm_sector', np.array([]))
+        # SECTOR
         sec_needed = min(len(sec_array), sample_map['use_ebm_sector'])
         if sec_needed > 0:
-            if sec_needed > len(sec_array):
-                logging.warning(f"Requested {sec_needed} sector samples, but only {len(sec_array)} available.")
-                sec_indices = sec_array
-            else:
-                sec_indices = np.random.choice(sec_array, size=sec_needed, replace=False)
+            sec_indices = np.random.choice(sec_array, size=sec_needed, replace=False)
         else:
             sec_indices = np.array([], dtype=int)
         sector_df = df.loc[sec_indices].copy() if sec_indices.size > 0 else pd.DataFrame()
 
-        # D) HISTORICAL -> "last_8"
-        # We take **all** references (no sampling), partial if <8 is handled by .head(8) in your formatting
-        hist_array = preproc_row.get('use_ebm_historical', np.array([]))
+        # HISTORICAL => 'last_8'
         last_8_df = df.loc[hist_array].copy() if len(hist_array) > 0 else pd.DataFrame()
 
-        # E) TOP25 -> "stock"
-        top25_array = preproc_row.get('use_ebm_top25', np.array([]))
+        # TOP25 => 'stock'
         top25_needed = min(len(top25_array), sample_map['use_ebm_top25'])
         if top25_needed > 0:
-            if top25_needed > len(top25_array):
-                logging.warning(f"Requested {top25_needed} top25 samples, but only {len(top25_array)} available.")
-                top25_indices = top25_array
-            else:
-                top25_indices = np.random.choice(top25_array, size=top25_needed, replace=False)
+            top25_indices = np.random.choice(top25_array, size=top25_needed, replace=False)
         else:
             top25_indices = np.array([], dtype=int)
         stock_df = df.loc[top25_indices].copy() if top25_indices.size > 0 else pd.DataFrame()
 
-        # F) CURRENT -> main article
         current_df = pd.DataFrame([main_row])
 
-        # Step 3: Build dict for format_concatenated_articles
+        # Build the sample dict
         sample_dict = {
             'markets': markets_df,
             'industry': industry_df,
@@ -294,35 +438,40 @@ def parallel_context_generation_worker(args):
             'current': current_df
         }
 
-        # Step 4: Convert to final string
-        prompt_str = format_concatenated_articles(sample_dict)
-
-        # Step 5: Add to our list of contexts
-        candidate_contexts.append(prompt_str)
+        # Build the candidate context tokens
+        token_list = build_candidate_context_tokens(sample_dict)
+        candidate_contexts.append(token_list)
 
     return candidate_contexts
 
+
+# -------------------------------------------------------------------------
+# DATASET/LOADER CLASSES
+# -------------------------------------------------------------------------
 class ArticlePriceDataset(Dataset):
+    """
+    Basic dataset that tokenizes each row's article (once) up front in __init__.
+    """
     def __init__(self,
                  articles: list,
                  prices: list,
                  sectors: list,
                  dates: list,
                  related_stocks_list: list,
-                 prices_current: list,       # old/current price
+                 prices_current: list,
                  symbols: list,
                  industries: list,
                  risk_free_rates: list,
                  tokenizer,
                  total_epochs: int,
-                 use_ebm: bool=False):
+                 use_ebm: bool = False):
         self.df = pd.DataFrame({
             'Article': articles,
-            'weighted_avg_720_hrs': prices,  # future price
+            'weighted_avg_720_hrs': prices,
             'Sector': sectors,
             'Date': dates,
             'RelatedStocksList': related_stocks_list,
-            'weighted_avg_0_hrs': prices_current,  # old/current price
+            'weighted_avg_0_hrs': prices_current,
             'Symbol': symbols,
             'Industry': industries,
             'Risk_Free_Rate': risk_free_rates
@@ -331,98 +480,47 @@ class ArticlePriceDataset(Dataset):
         self.total_epochs = total_epochs
         self.use_ebm = use_ebm
 
+        logger.info("Pre-tokenizing each article in ArticlePriceDataset...")
+        self.tokenized_articles = []
+        for article in tqdm(articles, desc="Pre-tokenizing", unit="article"):
+            encoding = self.tokenizer(
+                article,
+                truncation=True,
+                padding='max_length',
+                max_length=config.BLOCK_SIZE,
+                return_tensors='pt'
+            )
+            self.tokenized_articles.append(encoding['input_ids'].squeeze(0))
+
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
+        input_ids = self.tokenized_articles[idx]
         row = self.df.iloc[idx]
-        # Original article text
-        article = row.get('Article', 'N/A')
 
+        future_price = row.get('weighted_avg_720_hrs', 0.0)
+        old_price = row.get('weighted_avg_0_hrs', 0.0)
+        sector = row.get('Sector', 'Unknown Sector')
         risk_free = row.get('Risk_Free_Rate', 0.0)
 
-        # The label is the future price
-        future_price = row.get('weighted_avg_720_hrs', 0.0)
-
-        # The old/current price we also want for e.g. trend calc
-        old_price = row.get('weighted_avg_0_hrs', 0.0)
-
-        sector = row.get('Sector', 'Unknown Sector')
-
-        # Tokenize this updated article text
-        input_encoding = self.tokenizer(
-            article,
-            truncation=True,
-            padding='max_length',
-            max_length=config.BLOCK_SIZE,
-            return_tensors='pt'
-        )
-        input_ids = input_encoding['input_ids'].squeeze(0)
-
         sample = {
-            'input_ids':     input_ids,
-            'labels':        torch.tensor(future_price, dtype=torch.float),
-            'sector':        sector if sector is not None else "Unknown Sector",
-            'idx':           int(idx),
-            'old_price':     torch.tensor(old_price, dtype=torch.float),
-            'risk_free_rate':torch.tensor(risk_free, dtype=torch.float)
+            'input_ids': input_ids,
+            'labels': torch.tensor(future_price, dtype=torch.float),
+            'sector': sector if sector is not None else "Unknown Sector",
+            'idx': int(idx),
+            'old_price': torch.tensor(old_price, dtype=torch.float),
+            'risk_free_rate': torch.tensor(risk_free, dtype=torch.float)
         }
         return sample
 
-def worker_wrapper(args):
-    return parallel_context_generation_worker(*args)
-
-def custom_collate_fn(batch):
-    """
-    Minimal collate function: merges CPU data into a single batch,
-    but does NOT do large GPU calls or EBM logic.
-    """
-    input_ids_list = []
-    labels_list    = []
-    old_price_list = []
-    sector_list    = []
-    idx_list       = []
-    rfr_list       = []
-
-    for sample in batch:
-        input_ids_list.append(sample['input_ids'])
-        labels_list.append(sample['labels'])
-        old_price_list.append(sample['old_price'])
-        sector_list.append(sample['sector'])
-        idx_list.append(sample['idx'])
-        rfr_list.append(sample['risk_free_rate'])
-
-    # Pad input_ids
-    input_ids_padded = torch.nn.utils.rnn.pad_sequence(
-        input_ids_list, batch_first=True,
-        padding_value = 50256 # hardcoded padding id token for gpt2 tokenizer
-    )
-    labels_tensor    = torch.stack(labels_list)
-    old_price_tensor = torch.stack(old_price_list)
-    rfr_tensor       = torch.stack(rfr_list)
-
-    return {
-        'input_ids':    input_ids_padded,
-        'labels':       labels_tensor,
-        'old_price':    old_price_tensor,
-        'sector':       sector_list,  # CPU list of strings
-        'idx':          idx_list,
-        'risk_free_rate': rfr_list
-    }
 
 class RollingWindowDataset(IterableDataset):
+    """
+    An IterableDataset that loads data in rolling windows from a Parquet file.
+    For each row, it tokenizes the 'Article' text on the fly in __iter__.
+    """
     def __init__(self, main_parquet_path, preprocessed_parquet_path, streaming_size, overlap, tokenizer, mode):
-        """
-        Loads data in rolling windows.
-
-        Args:
-            main_parquet_path (str): Path to main parquet file.
-            preprocessed_parquet_path (str): Path to preprocessed parquet file.
-            streaming_size (int): Number of rows in each window.
-            overlap (int): Overlap between successive windows.
-            tokenizer: Tokenizer instance.
-            mode (str): 'train', 'run', or 'update'
-        """
         self.main_parquet_path = main_parquet_path
         self.preprocessed_parquet_path = preprocessed_parquet_path
         self.streaming_size = streaming_size
@@ -433,21 +531,16 @@ class RollingWindowDataset(IterableDataset):
         self.current_window = 0
 
     def get_total_rows(self, path):
-        table = pq.read_table(path, columns=[])
-        return table.num_rows
+        df = pd.read_parquet(path)
+        return len(df)
 
     def __iter__(self):
         window_start = 0
-        # Iterate over windows until we cover all rows
         while window_start < self.total_rows:
             window_end = min(window_start + self.streaming_size, self.total_rows)
             logger.info(f"Loading window rows {window_start} to {window_end}")
-            main_table = pq.read_table(self.main_parquet_path, row_slice=(window_start, window_end - window_start))
-            pre_table = pq.read_table(self.preprocessed_parquet_path, row_slice=(window_start, window_end - window_start))
-            df = main_table.to_pandas()
-            # For simplicity, we ignore df_preprocessed here (you can load and pass it in each __getitem__)
+            df = pd.read_parquet(self.main_parquet_path).iloc[window_start:window_end]
             for idx, row in df.iterrows():
-                # Process each row similar to your ArticlePriceDataset.__getitem__
                 article = row.get('Article', 'N/A')
                 future_price = row.get('weighted_avg_720_hrs', 0.0)
                 encoding = self.tokenizer(
@@ -465,3 +558,44 @@ class RollingWindowDataset(IterableDataset):
                 }
                 yield sample
             window_start = window_start + (self.streaming_size - self.overlap)
+
+
+# -------------------------------------------------------------------------
+# CUSTOM COLLATE
+# -------------------------------------------------------------------------
+def custom_collate_fn(batch):
+    """
+    Minimal collate function: merges CPU data into a single batch.
+    """
+    input_ids_list = []
+    labels_list = []
+    old_price_list = []
+    sector_list = []
+    idx_list = []
+    rfr_list = []
+
+    for sample in batch:
+        input_ids_list.append(sample['input_ids'])
+        labels_list.append(sample['labels'])
+        old_price_list.append(sample.get('old_price', torch.tensor(0.0)))
+        sector_list.append(sample.get('sector', 'Unknown Sector'))
+        idx_list.append(sample.get('idx', -1))
+        rfr_list.append(sample.get('risk_free_rate', torch.tensor(0.0)))
+
+    # Pad input_ids
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(
+        input_ids_list, batch_first=True,
+        padding_value=GLOBAL_TOKENIZER.eos_token_id
+    )
+    labels_tensor = torch.stack(labels_list)
+    old_price_tensor = torch.stack(old_price_list)
+    rfr_tensor = torch.stack(rfr_list)
+
+    return {
+        'input_ids': input_ids_padded,
+        'labels': labels_tensor,
+        'old_price': old_price_tensor,
+        'sector': sector_list,
+        'idx': idx_list,
+        'risk_free_rate': rfr_tensor
+    }
