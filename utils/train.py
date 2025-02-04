@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import amp
+from torch.amp import GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
@@ -26,7 +27,9 @@ logging.basicConfig(
 )
 
 def get_wrapped_model(model):
-    # If using DDP, return model.module; otherwise, return as is.
+    """
+    Returns the underlying model whether it's wrapped with DistributedDataParallel or not.
+    """
     return model.module if hasattr(model, 'module') else model
 
 def train_model(
@@ -91,26 +94,38 @@ def train_model(
         if hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
 
-        # Determine number of batches per GPU
-        batches_per_gpu = len(dataloader)
+        # Accurate batch calculation when streaming is enabled
+        if getattr(args, 'streaming', False):
+            from utils.utils import ensure_local_dataset_files, get_total_rows
+            main_parquet_path, _ = ensure_local_dataset_files()
+            total_rows = get_total_rows(main_parquet_path)
+            train_rows = int(total_rows * 0.7 * (args.percent_data / 100.0))
+            total_batches = math.ceil(train_rows / args.batch_size)
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+            else:
+                world_size = 1
+            batches_per_gpu = math.ceil(total_batches / world_size)
+        else:
+            batches_per_gpu = len(dataloader)
 
-        # Determine the number of EBM context generations per batch
+        # Determine number of EBM context generations per sample
         if hasattr(args, 'ebm_num_samples_train') and args.ebm_num_samples_train is not None:
             try:
                 context_count = int(args.ebm_num_samples_train)
                 logging.debug(f"Using ebm_num_samples_train={context_count}")
             except (TypeError, ValueError):
-                logging.warning(f"Invalid ebm_num_samples_train value; using default.")
+                logging.warning("Invalid ebm_num_samples_train value; using default.")
                 context_count = max(epochs - epoch, 5)
         else:
             context_count = max(epochs - epoch, 5)
+        logging.debug(f"Context count for epoch {epoch+1}: {context_count}")
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", total=batches_per_gpu)):
             if not use_deepspeed:
                 optimizer.zero_grad()
             else:
                 model.zero_grad()
-
             if ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
@@ -120,50 +135,58 @@ def train_model(
             idx_list = batch.get('idx', None)
             B = main_ids.size(0)
 
+            logging.debug(f"Processing batch {batch_idx+1} with size {B}.")
+            logging.debug(f"main_ids shape: {main_ids.shape}, future_vals shape: {future_vals.shape}")
+
+            if future_vals.dim() == 2 and future_vals.size(1) == 1:
+                future_vals = future_vals.squeeze(1)
+            elif future_vals.dim() not in (1, 2):
+                future_vals = future_vals.view(-1)
+
             with amp.autocast(device_type='cuda', dtype=torch.float16):
                 ebm_loss = None
                 if ebm and idx_list is not None:
                     cpu_args_list = []
                     for idx_val in idx_list:
                         cpu_args_list.append((idx_val, df, df_preprocessed, epochs, epoch, context_count))
-                    results = pool.imap_unordered(parallel_context_generation_worker, cpu_args_list)
-                    # Reassemble results in order using the idx value
-                    all_contexts_batch_unsorted = list(results)
-                    all_contexts_batch = [contexts for _, contexts in sorted(all_contexts_batch_unsorted, key=lambda x: x[0])]
+                    # Use ordered mapping (pool.map) to preserve order.
+                    all_contexts_batch = list(pool.map(parallel_context_generation_worker, cpu_args_list))
+                    logging.debug("Context generation complete for current batch.")
                     wrapped_model = get_wrapped_model(model)
                     ebm_losses = []
                     for i in range(B):
-                        context_str_list = all_contexts_batch[i]
-                        if not context_str_list:
+                        candidate_contexts = all_contexts_batch[i]  # Already a list of token ID lists
+                        if not candidate_contexts:
                             continue
                         candidate_tensors_list = []
-                        for c_str in context_str_list:
-                            c_str = c_str.strip()
-                            if not c_str:
-                                continue
+                        for token_list in candidate_contexts:
                             try:
-                                enc = tokenizer(
-                                    c_str,
-                                    truncation=True,
-                                    padding='max_length',
-                                    max_length=config.BLOCK_SIZE,
-                                    return_tensors='pt'
-                                )
-                                candidate_tensors_list.append(enc['input_ids'].squeeze(0))
+                                candidate_tensor = torch.tensor(token_list, dtype=torch.long)
                             except Exception as e:
-                                logging.error(f"Error tokenizing context: {e}")
+                                logging.error(f"Error converting candidate tokens to tensor: {e}")
                                 continue
+                            # Truncate/pad each candidate individually:
+                            if candidate_tensor.size(0) > config.BLOCK_SIZE:
+                                # Keep only the last config.BLOCK_SIZE tokens
+                                candidate_tensor = candidate_tensor[-config.BLOCK_SIZE:]
+                            elif candidate_tensor.size(0) < config.BLOCK_SIZE:
+                                pad_length = config.BLOCK_SIZE - candidate_tensor.size(0)
+                                # Pad at the beginning so that the end is preserved
+                                candidate_tensor = torch.nn.functional.pad(
+                                    candidate_tensor, (pad_length, 0),
+                                    value=GLOBAL_TOKENIZER.eos_token_id
+                                )
+                            candidate_tensors_list.append(candidate_tensor)
                         if not candidate_tensors_list:
                             continue
                         try:
-                            candidate_tensors = torch.stack(candidate_tensors_list, dim=0).to(device, dtype=torch.long)
+                            candidate_tensors = torch.stack(candidate_tensors_list, dim=0).to(device)
                         except Exception as e:
                             logging.error(f"Error stacking candidate tensors: {e}")
                             continue
                         with torch.no_grad():
-                            # Using .half() conversion as in your original code
-                            context_embs = wrapped_model.get_embeddings(candidate_tensors).half()
-                            main_emb = wrapped_model.get_embeddings(main_ids[i].unsqueeze(0)).half()
+                            context_embs = wrapped_model.get_embeddings(candidate_tensors)
+                            main_emb = wrapped_model.get_embeddings(main_ids[i].unsqueeze(0))
                             main_emb = main_emb.repeat(candidate_tensors.size(0), 1)
                         context_embs = context_embs.detach()
                         main_emb = main_emb.detach()
@@ -176,30 +199,39 @@ def train_model(
                             logging.error(f"Error in EBM forward pass: {e}")
                             continue
                     if ebm_losses:
-                        ebm_loss = torch.stack(ebm_losses).mean()
+                        ebm_loss = torch.stack(ebm_losses).mean() * 1e-3
+                        logging.debug(f"Computed EBM loss: {ebm_loss.item():.4f}")
 
                 outputs, main_loss = model(input_ids=main_ids, targets=future_vals)
+                logging.debug(f"Main model forward: preds shape: {outputs.shape}, main_loss: {main_loss.item():.4f}")
+
                 if si:
                     try:
-                        main_loss += si.penalty()
+                        si_penalty = si.penalty()
+                        main_loss += si_penalty
+                        logging.debug(f"Added SI penalty: {si_penalty.item():.4f}")
                     except Exception as e:
                         logging.error(f"Error adding SI penalty: {e}")
                 if ewc:
-                    for ewc_obj in ewc:
+                    for idx_ewc, ewc_obj in enumerate(ewc):
                         try:
-                            main_loss += args.lambda_ewc * ewc_obj.penalty(model)
+                            ewc_penalty = args.lambda_ewc * ewc_obj.penalty(model)
+                            main_loss += ewc_penalty
+                            logging.debug(f"Added EWC penalty {idx_ewc}: {ewc_penalty.item():.4f}")
                         except Exception as e:
-                            logging.error(f"Error adding EWC penalty: {e}")
+                            logging.error(f"Error adding EWC penalty {idx_ewc}: {e}")
                 if getattr(args, 'use_l2', False):
                     try:
-                        main_loss += args.lambda_l2 * compute_l2_loss(model)
+                        l2_loss = args.lambda_l2 * compute_l2_loss(model)
+                        main_loss += l2_loss
+                        logging.debug(f"Added L2 loss: {l2_loss.item():.4f}")
                     except Exception as e:
-                        logging.error(f"Error adding L2 penalty: {e}")
+                        logging.error(f"Error adding L2 loss: {e}")
+
                 total_loss_batch = main_loss
                 if ebm_loss is not None:
                     total_loss_batch += ebm_loss
 
-                # Backward and step depending on DS flag
                 if not use_deepspeed:
                     scaler.scale(total_loss_batch).backward()
                     scaler.step(optimizer)
@@ -211,7 +243,10 @@ def train_model(
             if ebm and ebm_optimizer:
                 ebm_optimizer.step()
 
-            optimizer.zero_grad()
+            if not use_deepspeed:
+                optimizer.zero_grad()
+            else:
+                model.zero_grad()
             if ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
@@ -228,6 +263,7 @@ def train_model(
                     })
                 try:
                     replay_buffer.add_examples(replay_samples, [0]*B)
+                    logging.debug(f"Added {B} samples to replay buffer.")
                 except Exception as e:
                     logging.error(f"Error adding to replay buffer: {e}")
 
