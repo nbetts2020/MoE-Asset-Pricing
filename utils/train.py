@@ -1,15 +1,14 @@
-# utils/train.py
-
 import torch
 import torch.nn.functional as F
 from torch import amp
-from torch.amp import GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
 import logging
 from multiprocessing import Pool, cpu_count
 import math
+
+import deepspeed  # NEW
 
 from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
@@ -27,6 +26,7 @@ logging.basicConfig(
 )
 
 def get_wrapped_model(model):
+    # If using DDP, return model.module; otherwise, return as is.
     return model.module if hasattr(model, 'module') else model
 
 def train_model(
@@ -43,7 +43,8 @@ def train_model(
     df_preprocessed=None,
     ebm=None,
     ebm_optimizer=None,
-    tokenizer=None
+    tokenizer=None,
+    use_deepspeed=False
 ):
     # Enable cuDNN autotuning
     torch.backends.cudnn.benchmark = True
@@ -62,33 +63,16 @@ def train_model(
     else:
         logging.info("No checkpoint found or checkpoint path missing. Starting from scratch.")
 
-    use_ebm = (ebm is not None) and getattr(args, 'use_ebm', False)
-    if use_ebm:
+    if ebm:
         ebm.train()
-        logging.info("EBM set to training mode.")
-    else:
-        logging.info("EBM not in use.")
-
     model.train()
     logging.info("Main model set to train mode.")
 
-    try:
+    # For non-DeepSpeed path, use GradScaler for AMP.
+    scaler = None
+    if not use_deepspeed:
+        from torch.cuda.amp import GradScaler
         scaler = GradScaler()
-        logging.debug("Initialized GradScaler for mixed precision training.")
-    except Exception as e:
-        logging.error(f"Failed to initialize GradScaler: {e}")
-        raise e
-
-    if use_ebm and ebm_optimizer is not None:
-        if not list(ebm_optimizer.param_groups):
-            logging.error("EBM optimizer has no parameter groups.")
-            raise ValueError("EBM optimizer has no parameter groups.")
-        else:
-            logging.debug("EBM optimizer initialized correctly.")
-        for name, param in ebm.named_parameters():
-            if not param.requires_grad:
-                logging.warning(f"EBM parameter '{name}' does not require gradients. Setting requires_grad=True.")
-                param.requires_grad = True
 
     best_loss = float('inf')
     epochs_no_improve = 0
@@ -107,20 +91,10 @@ def train_model(
         if hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
 
-        if getattr(args, 'streaming', False):
-            from utils.utils import ensure_local_dataset_files, get_total_rows
-            main_parquet_path, _ = ensure_local_dataset_files()
-            total_rows = get_total_rows(main_parquet_path)
-            train_rows = int(total_rows * 0.7 * (args.percent_data / 100.0))
-            total_batches = math.ceil(train_rows / args.batch_size)
-            if getattr(args, 'use_ddp', False):
-                world_size = dist.get_world_size()
-            else:
-                world_size = 1
-            batches_per_gpu = math.ceil(total_batches / world_size)
-        else:
-            batches_per_gpu = len(dataloader)
+        # Determine number of batches per GPU
+        batches_per_gpu = len(dataloader)
 
+        # Determine the number of EBM context generations per batch
         if hasattr(args, 'ebm_num_samples_train') and args.ebm_num_samples_train is not None:
             try:
                 context_count = int(args.ebm_num_samples_train)
@@ -132,8 +106,12 @@ def train_model(
             context_count = max(epochs - epoch, 5)
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", total=batches_per_gpu)):
-            optimizer.zero_grad()
-            if use_ebm and ebm_optimizer:
+            if not use_deepspeed:
+                optimizer.zero_grad()
+            else:
+                model.zero_grad()
+
+            if ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
             main_ids = batch['input_ids'].to(device, dtype=torch.long)
@@ -144,17 +122,10 @@ def train_model(
 
             with amp.autocast(device_type='cuda', dtype=torch.float16):
                 ebm_loss = None
-                if use_ebm and idx_list is not None:
+                if ebm and idx_list is not None:
                     cpu_args_list = []
                     for idx_val in idx_list:
-                        cpu_args_list.append((
-                            idx_val,
-                            df,
-                            df_preprocessed,
-                            epochs,
-                            epoch,
-                            context_count
-                        ))
+                        cpu_args_list.append((idx_val, df, df_preprocessed, epochs, epoch, context_count))
                     results = pool.imap_unordered(parallel_context_generation_worker, cpu_args_list)
                     # Reassemble results in order using the idx value
                     all_contexts_batch_unsorted = list(results)
@@ -190,6 +161,7 @@ def train_model(
                             logging.error(f"Error stacking candidate tensors: {e}")
                             continue
                         with torch.no_grad():
+                            # Using .half() conversion as in your original code
                             context_embs = wrapped_model.get_embeddings(candidate_tensors).half()
                             main_emb = wrapped_model.get_embeddings(main_ids[i].unsqueeze(0)).half()
                             main_emb = main_emb.repeat(candidate_tensors.size(0), 1)
@@ -205,7 +177,8 @@ def train_model(
                             continue
                     if ebm_losses:
                         ebm_loss = torch.stack(ebm_losses).mean()
-                preds, main_loss = model(input_ids=main_ids, targets=future_vals)
+
+                outputs, main_loss = model(input_ids=main_ids, targets=future_vals)
                 if si:
                     try:
                         main_loss += si.penalty()
@@ -225,18 +198,21 @@ def train_model(
                 total_loss_batch = main_loss
                 if ebm_loss is not None:
                     total_loss_batch += ebm_loss
-                scaler.scale(total_loss_batch).backward()
 
-            try:
-                scaler.step(optimizer)
-                if use_ebm and ebm_optimizer:
-                    scaler.step(ebm_optimizer)
-                scaler.update()
-            except Exception as e:
-                logging.error(f"Error stepping optimizers: {e}")
+                # Backward and step depending on DS flag
+                if not use_deepspeed:
+                    scaler.scale(total_loss_batch).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    model.backward(total_loss_batch)
+                    model.step()
+
+            if ebm and ebm_optimizer:
+                ebm_optimizer.step()
 
             optimizer.zero_grad()
-            if use_ebm and ebm_optimizer:
+            if ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
             total_loss += total_loss_batch.item() * B
