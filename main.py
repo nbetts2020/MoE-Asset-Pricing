@@ -8,7 +8,7 @@ import pandas as pd
 import json
 from multiprocessing import cpu_count
 
-import deepspeed  # NEW: DeepSpeed integration
+import deepspeed  # DeepSpeed integration
 from transformers import AutoTokenizer
 
 from utils.model import SparseMoELanguageModel
@@ -48,6 +48,10 @@ def main():
     logging.info("pandarallel initialized with parallel_apply.")
 
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
+
+    # Allow DeepSpeed launcher to pass local_rank.
+    parser.add_argument("--local_rank", type=int, default=0,
+                        help="Local rank passed by DeepSpeed launcher")
 
     # Modes and corresponding args
     parser.add_argument('mode', choices=['train', 'run', 'update', 'test_forgetting'],
@@ -209,10 +213,12 @@ def main():
         config.BATCH_SIZE = args.batch_size
         logging.info(f"Overriding batch_size to {config.BATCH_SIZE}")
 
-    # DeepSpeed will handle distributed initialization if launched via its CLI.
-    # (Do not manually call dist.init_process_group if using DeepSpeed launcher.)
+    # When using DeepSpeed, distributed initialization is handled by the launcher.
+    # Read local_rank if provided.
+    # (DeepSpeed launcher adds --local_rank automatically.)
+    local_rank = args.local_rank
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    rank = int(os.environ.get('RANK', 0))  # set by DeepSpeed
+    rank = int(os.environ.get('RANK', 0))
     logging.info(f"Using device: {device}, rank: {rank}")
 
     # Set seeds
@@ -235,7 +241,7 @@ def main():
     # MAIN LOGIC (Modes)
     # ----------------------------------------------------------------
     if args.mode == 'train':
-        # Create the model
+        # Initialize model from config
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
         if initialized_from_scratch:
@@ -245,7 +251,7 @@ def main():
         # Prepare base optimizer; DeepSpeed will wrap it
         base_optimizer = prepare_optimizer(model, args)
 
-        # Initialize DeepSpeed (this also handles distributed setup)
+        # Initialize DeepSpeed; this call handles distributed initialization.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=base_optimizer,
@@ -400,7 +406,7 @@ def main():
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
-            use_deepspeed=False  # or True if you want DS for update mode as well
+            use_deepspeed=False  # Update mode using plain PyTorch DDP (or set True if desired)
         )
         logging.info("Update completed.")
 
@@ -532,10 +538,10 @@ def main():
         logging.info("Initialized model for catastrophic forgetting testing.")
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
 
-        if use_ddp:
+        if args.use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
                                                               output_device=local_rank)
-        optimizer = prepare_optimizer(model.module if use_ddp else model, args)
+        optimizer = prepare_optimizer(model.module if args.use_ddp else model, args)
         si = initialize_si(model, args) if args.use_si else None
         ewc_list = [] if args.use_ewc else None
         replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
@@ -562,5 +568,4 @@ def main():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
-    # Launch using DeepSpeed CLI (e.g. deepspeed --num_gpus=4 main.py --mode train ...)
     main()
