@@ -105,25 +105,16 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
        window_start = window_index * (streaming_size - overlap)
        window_end = window_start + streaming_size
     After loading, for the preprocessed DataFrame we filter out indices that are less than:
-         threshold = max(0, window_start - streaming_size)
+         threshold = max(0, window_start - overlap)
     """
     total_rows = get_total_rows(main_parquet_path)
     window_start = window_index * (streaming_size - overlap)
     window_end = min(window_start + streaming_size, total_rows)
     logger.info(f"Loading rows {window_start} to {window_end} (window index {window_index}).")
 
-    # Try to read only the needed rows using row_slice.
-    try:
-        main_table = pq.read_table(main_parquet_path, row_slice=(window_start, window_end - window_start))
-    except TypeError:
-        logger.warning("row_slice not supported for main file; reading full table and slicing (this may use extra memory).")
-        main_table = pq.read_table(main_parquet_path).slice(window_start, window_end - window_start)
-
-    try:
-        pre_table = pq.read_table(preprocessed_parquet_path, row_slice=(window_start, window_end - window_start))
-    except TypeError:
-        logger.warning("row_slice not supported for preprocessed file; reading full table and slicing (this may use extra memory).")
-        pre_table = pq.read_table(preprocessed_parquet_path).slice(window_start, window_end - window_start)
+    # Always read the full table and then slice, since row_slice is not supported.
+    main_table = pq.read_table(main_parquet_path).slice(window_start, window_end - window_start)
+    pre_table = pq.read_table(preprocessed_parquet_path).slice(window_start, window_end - window_start)
 
     df = main_table.to_pandas()
     df_preprocessed = pre_table.to_pandas()
@@ -140,7 +131,7 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
                     return cell
             df_preprocessed[col] = df_preprocessed[col].apply(filter_indices)
     return df, df_preprocessed
-
+    
 def get_data(percent_data=100.0, run=False, update=False, args=None):
     """
     If streaming mode is enabled (args.streaming is True), uses the rolling-window approach.
