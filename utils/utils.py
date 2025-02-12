@@ -759,67 +759,71 @@ def prepare_optimizer(model, args):
     optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE)
     logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
-    
+
 def prepare_data(args, tokenizer):
     """
-    Loads df and df_preprocessed from get_data().
-    Returns:
-        (DataLoader, dict):
-          - The DataLoader for the current mode (train/run/update).
-          - A dictionary containing 'df', 'df_preprocessed'.
+    Loads data and returns either a single dataloader (non-streaming mode) or a generator of dataloaders (streaming mode).
+
+    In streaming mode, the function loads the full parquet files from disk, computes the training
+    limit based on the mode (e.g. first 70% for training), then iterates over rolling windows (with
+    given streaming_size and overlap) to create a new DataLoader for each window. This way, only one
+    window (a small subset) is loaded into VRAM at a time.
     """
-    # Load data
-    df, df_preprocessed = get_data(
-        percent_data=args.percent_data,
-        run=(args.mode == 'run'),
-        update=(args.mode == 'update'),
-        args=args
-    )
+    if hasattr(args, "streaming") and args.streaming:
+        # Ensure parquet files exist locally
+        main_parquet_path, preprocessed_parquet_path = ensure_local_dataset_files()
+        total_rows = get_total_rows(main_parquet_path)
+        # Determine training limit based on mode
+        if args.mode == 'train':
+            train_limit = int(total_rows * 0.7)
+        elif args.mode == 'run':
+            train_limit = int(total_rows * 0.85)
+        elif args.mode == 'update':
+            train_limit = total_rows
+        else:
+            raise ValueError(f"Invalid mode: {args.mode}")
 
-    data_bundle = {
-        'df': df,
-        'df_preprocessed': df_preprocessed
-    }
+        streaming_size = getattr(args, "streaming_size", 60000)
+        overlap = getattr(args, "overlap", streaming_size // 2)
 
-    if args.mode == 'train':
-        train_loader = prepare_dataloader(
-            df,
-            df_preprocessed,
-            tokenizer,
-            batch_size=config.BATCH_SIZE,
-            shuffle=False,
-            args=args
-        )
-        return train_loader, data_bundle
-
-    elif args.mode == 'run':
-        run_loader = prepare_dataloader(
-            df,
-            df_preprocessed,
-            tokenizer,
-            batch_size=config.BATCH_SIZE,
-            shuffle=False,
-            args=args
-        )
-        return run_loader, data_bundle
-
-    elif args.mode == 'update':
-        update_loader = prepare_dataloader(
-            df,
-            df_preprocessed,
-            tokenizer,
-            batch_size=config.BATCH_SIZE,
-            shuffle=False,
-            args=args
-        )
-        # Optionally combine with old training data
-        old_train_df, _, _ = get_data(percent_data=args.percent_data, run=False, update=False, args=args)
-        combined_df = pd.concat([old_train_df, df])
-        data_bundle['df'] = combined_df  # Update 'df' in the bundle
-        return update_loader, data_bundle
-
+        # Build a list of (DataLoader, data_bundle) for each window
+        windows = []
+        window_index = 0
+        while window_index * (streaming_size - overlap) < train_limit:
+            df, df_preprocessed = get_data_window(streaming_size, overlap, window_index, main_parquet_path, preprocessed_parquet_path)
+            data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
+            dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
+            windows.append((dataloader, data_bundle))
+            window_index += 1
+        # Return a generator that yields each (dataloader, data_bundle) tuple
+        return (window for window in windows)
     else:
-        raise ValueError(f"Invalid mode: {args.mode}")
+        # Non-streaming: use original full-dataset loading and splitting.
+        from datasets import load_dataset
+        df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
+        total_samples = len(df)
+        num_samples = int((args.percent_data / 100.0) * total_samples)
+        df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
+        df = df.head(num_samples)
+        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
+        df_preprocessed = dataset_preprocessed.head(num_samples)
+        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
+        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+        split1 = int(len(df) * 0.7)
+        split2 = int(len(df) * 0.85)
+        if args.mode == "train":
+            df = df[:split1]
+            df_preprocessed = df_preprocessed[:split1]
+        elif args.mode == "run":
+            df = df[split1:split2]
+            df_preprocessed = df_preprocessed[:split2]
+        elif args.mode == "update":
+            df = df[split2:]
+        data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
+        dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
+        return dataloader, data_bundle
 
 def initialize_si(model, args):
     """
@@ -856,7 +860,7 @@ def initialize_replay_buffer(args):
 def save_ebm_model(ebm, epoch, save_dir="models", args=None):
     """
     Saves the EBM model's state dictionary and optionally uploads it to AWS S3.
-    
+
     Args:
         ebm (torch.nn.Module): The Energy-Based Model to save.
         epoch (int): The current epoch number.
@@ -867,7 +871,7 @@ def save_ebm_model(ebm, epoch, save_dir="models", args=None):
     save_path = os.path.join(save_dir, f"ebm.pt")
     torch.save(ebm.state_dict(), save_path)
     print(f"EBM model saved to {save_path}")
-    
+
     # If a bucket is specified, upload the file to S3
     if args is not None and hasattr(args, "bucket") and args.bucket:
         try:
@@ -969,7 +973,7 @@ def evaluate_model(model, dataloader, device):
     """
     import torch.distributed as dist
     model.eval()
-    
+
     # Local overall data
     local_overall = {
         "predictions": [],
