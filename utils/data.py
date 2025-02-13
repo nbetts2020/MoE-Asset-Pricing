@@ -1,5 +1,3 @@
-# utils/data.py
-
 import os
 # Disable tokenizer parallelism to avoid warnings after fork.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -21,6 +19,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def format_concatenated_articles(sample: dict) -> str:
     """
@@ -88,25 +87,22 @@ def format_concatenated_articles(sample: dict) -> str:
     # Information Indicating Significant Market Movement Related to Current Stock
     formatted_articles.append("\nInformation Potentially Indicating Significant Market Movement Related to Current Stock:")
     stock_df = sample.get('stock', pd.DataFrame())
-
-    # **Check if 'Percentage Change' exists**
-    if 'Percentage Change' not in stock_df.columns:
-        logger.error(f"'Percentage Change' missing in stock_df. Columns: {stock_df.columns}")
-        stock = stock_df.head(5)  # Fallback to top 5 without sorting
+    if "Percentage Change" in stock_df.columns:
+        # Convert to numeric so that nlargest works properly.
+        stock_df["Percentage Change"] = pd.to_numeric(stock_df["Percentage Change"], errors="coerce")
+        stock_df = stock_df.nlargest(5, "Percentage Change")
     else:
-        stock = stock_df.nlargest(5, 'Percentage Change')
-    print("LALALAL")
-    if not stock.empty:
-        for _, row in stock.iterrows():
+        logger.error(f"'Percentage Change' missing in stock_df. Columns: {stock_df.columns}")
+        stock_df = stock_df.head(5)
+    if not stock_df.empty:
+        for _, row in stock_df.iterrows():
             date = row.get('Date', pd.Timestamp('1970-01-01'))
             if not isinstance(date, pd.Timestamp):
                 date = pd.to_datetime(date, errors='coerce')
                 if pd.isna(date):
                     date = pd.Timestamp('1970-01-01')
             date_str = date.strftime('%Y-%m-%d')
-            print("OOFA")
             percentage_change = row.get('Percentage Change', 0.0)
-            print("OOLA")
             formatted_articles.append(
                 f"Date: {date_str}\n"
                 f"Title: {row.get('Title', 'N/A')}\n"
@@ -144,7 +140,7 @@ def format_concatenated_articles(sample: dict) -> str:
             f"Risk-Free Rate at release: {row.get('Risk_Free_Rate', 'N/A')}\n"
         )
 
-    # Last for Current Stock
+    # Last 8 Articles for Current Stock (again)
     formatted_articles.append("\nLast 8 Articles for Current Stock:")
     current = sample.get('current', pd.DataFrame()).head(8)
     for _, row in current.iterrows():
@@ -172,29 +168,23 @@ def format_concatenated_articles(sample: dict) -> str:
             f"Risk-Free Rate at release: {row.get('Risk_Free_Rate', 'N/A')}\n"
         )
 
-
     concatenated_articles = "\n".join(formatted_articles)
     return concatenated_articles
 
 # -------------------------------------------------------------------------
 # GLOBAL TOKENIZER SETUP
 # -------------------------------------------------------------------------
-# For all references, we rely on a single tokenizer instance.
-# You can specify config.TOKENIZER_NAME in your config if desired.
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "gpt2")
 GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
-# Ensure block size aligns with config.BLOCK_SIZE
 GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
 
 # -------------------------------------------------------------------------
 # PRE-TOKENIZED FIXED STRINGS (HEADERS, ETC.)
 # -------------------------------------------------------------------------
-# These tokens are appended in build_candidate_context_tokens().
 def pretokenize_field(value):
     """
-    Convert 'value' to string and return a list of token IDs
-    from the global tokenizer, with no special tokens.
+    Convert 'value' to string and return a list of token IDs from the global tokenizer, with no special tokens.
     """
     if not isinstance(value, str):
         value = str(value)
@@ -221,14 +211,13 @@ FIXED_TOKENS = {
         GLOBAL_TOKENIZER.encode("MAIN ARTICLE:\n", add_special_tokens=False),
 }
 
-
 # -------------------------------------------------------------------------
 # BUILDING CONTEXTS AS PRE-TOKENIZED LISTS
 # -------------------------------------------------------------------------
 def build_candidate_context_tokens(sample: dict) -> list:
     """
-    Build a candidate context by concatenating pre-tokenized components
-    from the sample dictionary. Returns a single list of token IDs.
+    Build a candidate context by concatenating pre-tokenized components from the sample dictionary.
+    Returns a single list of token IDs.
     """
     tokens = []
 
@@ -239,7 +228,6 @@ def build_candidate_context_tokens(sample: dict) -> list:
         date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
         title = row.get("Title", "N/A")
         article = row.get("Article", "N/A")
-
         tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
@@ -252,7 +240,6 @@ def build_candidate_context_tokens(sample: dict) -> list:
         date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
         title = row.get("Title", "N/A")
         article = row.get("Article", "N/A")
-
         tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
@@ -265,7 +252,6 @@ def build_candidate_context_tokens(sample: dict) -> list:
         date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
         title = row.get("Title", "N/A")
         article = row.get("Article", "N/A")
-
         tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
@@ -274,16 +260,16 @@ def build_candidate_context_tokens(sample: dict) -> list:
     # 4) MARKET MOVEMENT SECTION
     tokens += FIXED_TOKENS["section_header_movement"] + FIXED_TOKENS["newline"]
     stock_df = sample.get("stock", pd.DataFrame())
-    if "Percentage Change" not in stock_df.columns:
-        stock_df = stock_df.head(5)
-    else:
+    if "Percentage Change" in stock_df.columns:
+        # Convert the column to numeric to ensure nlargest works correctly.
+        stock_df["Percentage Change"] = pd.to_numeric(stock_df["Percentage Change"], errors="coerce")
         stock_df = stock_df.nlargest(5, "Percentage Change")
-
+    else:
+        stock_df = stock_df.head(5)
     for _, row in stock_df.iterrows():
         date_str = _safe_date_str(row.get("Date", pd.Timestamp("1970-01-01")))
         title = row.get("Title", "N/A")
         article = row.get("Article", "N/A")
-
         tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
         tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
@@ -293,7 +279,6 @@ def build_candidate_context_tokens(sample: dict) -> list:
     tokens += FIXED_TOKENS["section_header_last8"] + FIXED_TOKENS["newline"]
     df_last8 = sample.get("last_8", pd.DataFrame()).head(8)
     for _, row in df_last8.iterrows():
-        # Date
         date = row.get("Date", pd.Timestamp("1970-01-01"))
         if not isinstance(date, pd.Timestamp):
             date = pd.to_datetime(date, errors="coerce")
@@ -301,13 +286,10 @@ def build_candidate_context_tokens(sample: dict) -> list:
                 date = pd.Timestamp("1970-01-01")
         date_str = date.strftime("%Y-%m-%d")
         tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
-        # Title
         title = row.get("Title", "N/A")
         tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
-        # Article
         article = row.get("Article", "N/A")
         tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(article) + FIXED_TOKENS["newline"]
-        # Stock Price info
         sp_4d = row.get("weighted_avg_-96_hrs", "N/A")
         sp_2d = row.get("weighted_avg_-48_hrs", "N/A")
         sp_1d = row.get("weighted_avg_-24_hrs", "N/A")
@@ -316,7 +298,6 @@ def build_candidate_context_tokens(sample: dict) -> list:
         tokens += pretokenize_field(f"Stock Price 2 days before: {sp_2d}\n")
         tokens += pretokenize_field(f"Stock Price 1 day before: {sp_1d}\n")
         tokens += pretokenize_field(f"Stock Price at release: {sp_release}\n")
-        # Risk-Free Rate
         rfr = row.get("Risk_Free_Rate", "N/A")
         tokens += pretokenize_field(f"Risk-Free Rate at release: {rfr}\n")
         tokens += FIXED_TOKENS["newline"]
@@ -326,17 +307,13 @@ def build_candidate_context_tokens(sample: dict) -> list:
     current_df = sample.get("current", pd.DataFrame()).head(1)
     if not current_df.empty:
         row = current_df.iloc[0]
-        # Date
         date_val = row.get("Date", pd.Timestamp("1970-01-01"))
         date_str = _safe_date_str(date_val)
         tokens += FIXED_TOKENS["date_prefix"] + pretokenize_field(date_str) + FIXED_TOKENS["newline"]
-        # Title
         title = row.get("Title", "N/A")
         tokens += FIXED_TOKENS["title_prefix"] + pretokenize_field(title) + FIXED_TOKENS["newline"]
-        # Article
         main_article = row.get("Article", "N/A")
         tokens += FIXED_TOKENS["article_prefix"] + pretokenize_field(main_article) + FIXED_TOKENS["newline"]
-        # Stock Price info (mirroring the last_8 section)
         sp_4d = row.get("weighted_avg_-96_hrs", "N/A")
         sp_2d = row.get("weighted_avg_-48_hrs", "N/A")
         sp_1d = row.get("weighted_avg_-24_hrs", "N/A")
@@ -366,16 +343,16 @@ def parallel_context_generation_worker(args):
     Instead of returning raw strings, it returns lists of token IDs built by concatenating pre-tokenized fields.
     """
     (idx, df, df_preprocessed, total_epochs, current_epoch, context_count) = args
+    # Adjust context_count based on the remaining epochs.
+    context_count = max(total_epochs - current_epoch, 5)
     candidate_contexts = []
-
     if idx < 0 or idx >= len(df):
         logger.error(f"Index {idx} is out-of-bounds for the main DataFrame.")
         return candidate_contexts
-
     main_row = df.iloc[idx]
     preproc_row = df_preprocessed.iloc[idx]
 
-    # These are the maximum # of references we take from each category
+    # These are the maximum number of references we take from each category
     sample_map = {
         'use_ebm_economic': 5,
         'use_ebm_industry': 5,
@@ -384,51 +361,53 @@ def parallel_context_generation_worker(args):
     }
 
     for _ in range(context_count):
-        # Pull references from the columns in preproc_row
+        # Get the reference lists and cast them to integers for valid indexing.
         econ_array = preproc_row.get('use_ebm_economic', [])
         ind_array = preproc_row.get('use_ebm_industry', [])
         sec_array = preproc_row.get('use_ebm_sector', [])
         hist_array = preproc_row.get('use_ebm_historical', [])
         top25_array = preproc_row.get('use_ebm_top25', [])
 
-        # ECON
-        econ_needed = min(len(econ_array), sample_map['use_ebm_economic'])
-        if econ_needed > 0:
-            econ_indices = np.random.choice(econ_array, size=econ_needed, replace=False)
+        if len(econ_array) > 0:
+            econ_indices = np.random.choice(np.array(econ_array, dtype=int),
+                                             size=min(len(econ_array), sample_map['use_ebm_economic']),
+                                             replace=False)
         else:
             econ_indices = np.array([], dtype=int)
         markets_df = df.loc[econ_indices].copy() if econ_indices.size > 0 else pd.DataFrame()
 
-        # IND
-        ind_needed = min(len(ind_array), sample_map['use_ebm_industry'])
-        if ind_needed > 0:
-            ind_indices = np.random.choice(ind_array, size=ind_needed, replace=False)
+        if len(ind_array) > 0:
+            ind_indices = np.random.choice(np.array(ind_array, dtype=int),
+                                            size=min(len(ind_array), sample_map['use_ebm_industry']),
+                                            replace=False)
         else:
             ind_indices = np.array([], dtype=int)
         industry_df = df.loc[ind_indices].copy() if ind_indices.size > 0 else pd.DataFrame()
 
-        # SECTOR
-        sec_needed = min(len(sec_array), sample_map['use_ebm_sector'])
-        if sec_needed > 0:
-            sec_indices = np.random.choice(sec_array, size=sec_needed, replace=False)
+        if len(sec_array) > 0:
+            sec_indices = np.random.choice(np.array(sec_array, dtype=int),
+                                            size=min(len(sec_array), sample_map['use_ebm_sector']),
+                                            replace=False)
         else:
             sec_indices = np.array([], dtype=int)
         sector_df = df.loc[sec_indices].copy() if sec_indices.size > 0 else pd.DataFrame()
 
-        # HISTORICAL => 'last_8'
-        last_8_df = df.loc[hist_array].copy() if len(hist_array) > 0 else pd.DataFrame()
+        if len(hist_array) > 0:
+            hist_indices = np.array(hist_array, dtype=int)
+        else:
+            hist_indices = np.array([], dtype=int)
+        last_8_df = df.loc[hist_indices].copy() if hist_indices.size > 0 else pd.DataFrame()
 
-        # TOP25 => 'stock'
-        top25_needed = min(len(top25_array), sample_map['use_ebm_top25'])
-        if top25_needed > 0:
-            top25_indices = np.random.choice(top25_array, size=top25_needed, replace=False)
+        if len(top25_array) > 0:
+            top25_indices = np.random.choice(np.array(top25_array, dtype=int),
+                                             size=min(len(top25_array), sample_map['use_ebm_top25']),
+                                             replace=False)
         else:
             top25_indices = np.array([], dtype=int)
         stock_df = df.loc[top25_indices].copy() if top25_indices.size > 0 else pd.DataFrame()
 
         current_df = pd.DataFrame([main_row])
 
-        # Build the sample dict
         sample_dict = {
             'markets': markets_df,
             'industry': industry_df,
@@ -438,19 +417,17 @@ def parallel_context_generation_worker(args):
             'current': current_df
         }
 
-        # Build the candidate context tokens
         token_list = build_candidate_context_tokens(sample_dict)
         candidate_contexts.append(token_list)
 
     return candidate_contexts
-
 
 # -------------------------------------------------------------------------
 # DATASET/LOADER CLASSES
 # -------------------------------------------------------------------------
 class ArticlePriceDataset(Dataset):
     """
-    Basic dataset that tokenizes each row's article (once) up front in __init__.
+    Basic dataset that tokenizes each row's article upfront in __init__.
     """
     def __init__(self,
                  articles: list,
@@ -514,11 +491,10 @@ class ArticlePriceDataset(Dataset):
         }
         return sample
 
-
 class RollingWindowDataset(IterableDataset):
     """
     An IterableDataset that loads data in rolling windows from a Parquet file.
-    For each row, it tokenizes the 'Article' text on the fly in __iter__.
+    Tokenization is performed on the fly in __iter__.
     """
     def __init__(self, main_parquet_path, preprocessed_parquet_path, streaming_size, overlap, tokenizer, mode):
         self.main_parquet_path = main_parquet_path
@@ -559,7 +535,6 @@ class RollingWindowDataset(IterableDataset):
                 yield sample
             window_start = window_start + (self.streaming_size - self.overlap)
 
-
 # -------------------------------------------------------------------------
 # CUSTOM COLLATE
 # -------------------------------------------------------------------------
@@ -582,7 +557,6 @@ def custom_collate_fn(batch):
         idx_list.append(sample.get('idx', -1))
         rfr_list.append(sample.get('risk_free_rate', torch.tensor(0.0)))
 
-    # Pad input_ids
     input_ids_padded = torch.nn.utils.rnn.pad_sequence(
         input_ids_list, batch_first=True,
         padding_value=GLOBAL_TOKENIZER.eos_token_id
