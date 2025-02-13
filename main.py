@@ -79,7 +79,7 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default="checkpoints",
                         help="Directory to save model checkpoints and states.")
     parser.add_argument('--checkpoint_path', type=str,
-                        help='Path to a checkpoint to resume training')
+                        help="Path to a checkpoint to resume training")
     parser.add_argument('--random_seed', type=int, default=42,
                         help="Random seed for reproducibility.")
     parser.add_argument('--num_tasks', type=int, default=3,
@@ -214,8 +214,6 @@ def main():
         logging.info(f"Overriding batch_size to {config.BATCH_SIZE}")
 
     # When using DeepSpeed, distributed initialization is handled by the launcher.
-    # Read local_rank if provided.
-    # (DeepSpeed launcher adds --local_rank automatically.)
     local_rank = args.local_rank
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rank = int(os.environ.get('RANK', 0))
@@ -241,17 +239,14 @@ def main():
     # MAIN LOGIC (Modes)
     # ----------------------------------------------------------------
     if args.mode == 'train':
-        # Initialize model from config
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
-        # Prepare base optimizer; DeepSpeed will wrap it
         base_optimizer = prepare_optimizer(model, args)
 
-        # Initialize DeepSpeed; this call handles distributed initialization.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=base_optimizer,
@@ -259,69 +254,33 @@ def main():
             config=args.deepspeed_config
         )
 
-        # Prepare DataLoader (DistributedSampler is still needed)
-        train_dataloader, data_bundle = prepare_data(args, tokenizer)
-        df = data_bundle['df']
-        df_preprocessed = data_bundle['df_preprocessed']
-
-        ebm = None
-        ebm_optimizer = None
-        if args.use_ebm:
-            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
-            from utils.data import custom_collate_fn
-            train_dataset = train_dataloader.dataset
-            sampler = None
-            if args.use_ddp:
-                sampler = DistributedSampler(train_dataset, shuffle=False, drop_last=False)
-            train_dataloader = DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=custom_collate_fn,
-                sampler=sampler
-            )
-
-        si = initialize_si(engine, args) if args.use_si else None
-        if args.use_ewc:
-            ewc_instance = ElasticWeightConsolidation(engine, train_dataloader, device, args)
-            ewc_list = [ewc_instance]
-        else:
-            ewc_list = None
-
-        replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
-
-        # Call training loop with DeepSpeed flag set to True.
+        # In train mode, let train_model call prepare_data internally.
         train_model(
             model=engine,
             optimizer=engine_optimizer,
             epochs=config.EPOCHS,
             device=device,
-            dataloader=train_dataloader,
+            dataloader=None,
             args=args,
-            si=si,
-            ewc=ewc_list,
-            replay_buffer=replay_buffer,
-            df=df,
-            df_preprocessed=df_preprocessed,
-            ebm=ebm,
-            ebm_optimizer=ebm_optimizer,
+            si=initialize_si(engine, args) if args.use_si else None,
+            ewc=[ElasticWeightConsolidation(engine, None, device, args)] if args.use_ewc else None,
+            replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
+            df=None,
+            df_preprocessed=None,
+            ebm=EnergyBasedModel(embedding_dim=config.N_EMBED).to(device) if args.use_ebm else None,
+            ebm_optimizer=torch.optim.AdamW(EnergyBasedModel(embedding_dim=config.N_EMBED).to(device).parameters(), lr=args.ebm_learning_rate * 0.1) if args.use_ebm else None,
             tokenizer=tokenizer,
             use_deepspeed=True
         )
         logging.info("Training completed.")
 
-        if ebm and (rank == 0):
+        if args.use_ebm and rank == 0:
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
-
         if rank == 0:
-            save_model_and_states(engine.module, si, replay_buffer, ewc_list, args)
+            save_model_and_states(engine.module, None, None, None, args)
 
     elif args.mode == 'update':
-        update_dataloader, data_bundle = prepare_data(args, tokenizer)
-        df = data_bundle['df']
-        df_preprocessed = data_bundle['df_preprocessed']
-
+        # In update mode, let train_model call prepare_data internally.
         if not args.bucket:
             raise ValueError("When using EBM sampling in 'update', --bucket is required.")
 
@@ -345,7 +304,6 @@ def main():
             logging.info("EBM model loaded from S3.")
 
         optimizer = prepare_optimizer(model, args)
-
         if args.use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -357,64 +315,29 @@ def main():
         if args.use_ebm and ebm is not None:
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
             from utils.data import custom_collate_fn
-            update_dataset = update_dataloader.dataset
-            sampler = None
-            if args.use_ddp:
-                sampler = DistributedSampler(update_dataset, shuffle=False, drop_last=False)
-            update_dataloader = DataLoader(
-                update_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=custom_collate_fn,
-                sampler=sampler
-            )
-
-        si = initialize_si(model, args) if args.use_si else None
-        if args.use_ewc:
-            ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
-            if os.path.exists(ewc_state_path):
-                ewc_states = torch.load(ewc_state_path, map_location=device)
-                ewc_list = []
-                for state in ewc_states:
-                    ewc_instance = ElasticWeightConsolidation(model, dataloader=None, device=device, args=args)
-                    ewc_instance.params = {n: p.to(device) for n, p in state['params'].items()}
-                    ewc_instance.fisher = {n: f.to(device) for n, f in state['fisher'].items()}
-                    ewc_list.append(ewc_instance)
-                logging.info(f"Loaded EWC state from '{ewc_state_path}'.")
-            else:
-                logging.info("No EWC state found. Starting fresh EWC.")
-                ewc_instance = ElasticWeightConsolidation(model, update_dataloader, device, args)
-                ewc_list = [ewc_instance]
-        else:
-            ewc_list = None
-
-        replay_buffer = initialize_replay_buffer(args) if args.use_replay_buffer else None
-
-        logging.info("Starting update...")
         train_model(
             model=model,
             optimizer=optimizer,
             epochs=config.EPOCHS,
             device=device,
-            dataloader=update_dataloader,
+            dataloader=None,
             args=args,
-            si=si,
-            ewc=ewc_list,
-            replay_buffer=replay_buffer,
-            df=df,
-            df_preprocessed=df_preprocessed,
+            si=initialize_si(model, args) if args.use_si else None,
+            ewc=[ElasticWeightConsolidation(model, None, device, args)] if args.use_ewc else None,
+            replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
+            df=None,
+            df_preprocessed=None,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
-            use_deepspeed=False  # Update mode using plain PyTorch DDP (or set True if desired)
+            use_deepspeed=False
         )
         logging.info("Update completed.")
 
-        if ebm and (rank == 0):
+        if args.use_ebm and rank == 0:
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
-
         if rank == 0:
-            save_model_and_states(model, si, replay_buffer, ewc_list, args)
+            save_model_and_states(model, None, None, None, args)
 
     elif args.mode == 'run':
         if (not args.test) and not all([args.stock, args.date, args.text, args.bucket]):
@@ -422,6 +345,8 @@ def main():
         elif args.test and not args.bucket:
             raise ValueError("When evaluating on test set, provide --bucket.")
 
+        # For run mode, we load the data (using non-streaming mode) to obtain the test split.
+        # This dataset is needed for EBM sampling.
         run_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
@@ -478,21 +403,7 @@ def main():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
         else:
-            dataset = ArticlePriceDataset(
-                articles=df['Article'].tolist(),
-                prices=df['weighted_avg_720_hrs'].tolist(),
-                sectors=df['Sector'].tolist(),
-                dates=df['Date'].tolist(),
-                related_stocks_list=df['RelatedStocksList'].tolist(),
-                prices_current=df['weighted_avg_0_hrs'].tolist(),
-                symbols=df['Symbol'].tolist(),
-                industries=df['Industry'].tolist(),
-                risk_free_rates=df['Risk_Free_Rate'].tolist(),
-                tokenizer=tokenizer,
-                total_epochs=1,
-                use_ebm=args.use_ebm
-            )
-
+            # If test flag is set, evaluate on the test split using the run_dataloader.
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
