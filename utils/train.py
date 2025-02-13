@@ -15,7 +15,7 @@ import deepspeed  # NEW
 from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
 from utils.data import parallel_context_generation_worker, GLOBAL_TOKENIZER
-from utils.utils import compute_l2_loss, load_checkpoint
+from utils.utils import compute_l2_loss, load_checkpoint, prepare_data
 import torch.distributed as dist
 
 logging.basicConfig(
@@ -38,7 +38,7 @@ def train_model(
     optimizer,
     epochs,
     device,
-    dataloader,  # either a DataLoader or a generator of (DataLoader, data_bundle) pairs in streaming mode
+    dataloader,  # In non-streaming mode, this is a DataLoader; in streaming mode this argument is ignored.
     args,
     si=None,
     ewc=None,
@@ -53,7 +53,6 @@ def train_model(
     # Determine if this is the main process for distributed training
     is_main_process = not dist.is_initialized() or dist.get_rank() == 0
 
-    # Enable cuDNN autotuning
     torch.backends.cudnn.benchmark = True
 
     start_epoch = 0
@@ -75,7 +74,6 @@ def train_model(
     model.train()
     logging.info("Main model set to train mode.")
 
-    # For non-DeepSpeed path, use GradScaler for AMP.
     scaler = None
     if not use_deepspeed:
         scaler = GradScaler()
@@ -89,32 +87,46 @@ def train_model(
     pool = Pool(processes=max_workers)
     logging.debug(f"Created multiprocessing Pool with {max_workers} workers.")
 
+    # If streaming is enabled, compute the total number of windows.
+    if getattr(args, 'streaming', False):
+        full_dataset_size = 453932  # Hard-coded total for SC454k
+        percent = float(getattr(args, "percent_data", 100.0))
+        global_limit = int(full_dataset_size * (percent / 100.0))
+        streaming_size = getattr(args, "streaming_size", 60000)
+        overlap = getattr(args, "overlap", streaming_size // 2)
+        effective_window_size = streaming_size - overlap
+        total_windows = math.ceil(global_limit / effective_window_size)
+        logging.info(f"Streaming mode: global limit = {global_limit} examples, total windows = {total_windows}")
+    else:
+        total_windows = 1  # Non-streaming: only one "window"
+
     for epoch in range(start_epoch, epochs):
         logging.info(f"==== Epoch {epoch+1}/{epochs} ====")
         total_loss = 0.0
         total_count = 0
 
         if getattr(args, 'streaming', False):
-            # Compute total batches in this epoch based on training split.
-            from utils.utils import ensure_local_dataset_files, get_total_rows
-            main_parquet_path, _ = ensure_local_dataset_files()
-            total_rows = get_total_rows(main_parquet_path)
-            # For training, assume first 70% of data
-            train_rows = int(total_rows * 0.7 * (args.percent_data / 100.0))
-            total_epoch_batches = math.ceil(train_rows / args.batch_size)
+            # Create a progress bar based on total examples in the target subset.
             if is_main_process:
-                epoch_pbar = tqdm(total=total_epoch_batches, desc=f"Epoch {epoch+1} Progress",
-                                  file=sys.stdout, mininterval=0.1, maxinterval=0.5, ascii=True, dynamic_ncols=False, ncols=120)
+                epoch_pbar = tqdm(total=global_limit // args.batch_size,
+                                  desc=f"Epoch {epoch+1} Progress",
+                                  file=sys.stdout, mininterval=0.1, maxinterval=0.5,
+                                  ascii=True, dynamic_ncols=False, ncols=120)
                 sys.stdout.flush()
-            # 'dataloader' is a generator of (window_loader, data_bundle) pairs.
-            for window_idx, (window_loader, window_data) in enumerate(dataloader):
-                logging.info(f"Processing streaming window {window_idx}")
-                window_batches = math.ceil(len(window_data['df']) / args.batch_size)
+
+            # Loop over all streaming windows
+            window_index = 0
+            while window_index < total_windows:
+                # Call prepare_data with current window_index
+                dataloader, data_bundle = prepare_data(args, tokenizer, window_index=window_index)
+                df = data_bundle['df']
+                df_preprocessed = data_bundle['df_preprocessed']
                 if is_main_process:
-                    inner_pbar = tqdm(total=window_batches, desc=f"Window {window_idx}", leave=False,
-                                      file=sys.stdout, mininterval=0.1, maxinterval=0.5, ascii=True, dynamic_ncols=False, ncols=120)
-                    sys.stdout.flush()
-                for batch_idx, batch in enumerate(window_loader):
+                    logging.info(f"Processing window {window_index} with {len(df)} examples")
+                # If this window is empty, break out of the window loop.
+                if len(df) == 0:
+                    break
+                for batch_idx, batch in enumerate(dataloader):
                     if not use_deepspeed:
                         optimizer.zero_grad()
                     else:
@@ -124,13 +136,10 @@ def train_model(
 
                     main_ids = batch['input_ids'].to(device, dtype=torch.long)
                     future_vals = batch['labels'].to(device, dtype=torch.float16)
-                    sector_list = batch.get('sector', None)
                     idx_list = batch.get('idx', None)
                     B = main_ids.size(0)
 
-                    logging.debug(f"Processing batch {batch_idx+1} (window {window_idx}) with size {B}.")
-                    logging.debug(f"main_ids shape: {main_ids.shape}, future_vals shape: {future_vals.shape}")
-
+                    logging.debug(f"Processing batch {batch_idx+1} from window {window_index} with size {B}.")
                     if future_vals.dim() == 2 and future_vals.size(1) == 1:
                         future_vals = future_vals.squeeze(1)
                     elif future_vals.dim() not in (1, 2):
@@ -242,19 +251,18 @@ def train_model(
                     total_loss += total_loss_batch.item() * B
                     total_count += B
                     if is_main_process:
-                        inner_pbar.update(1)
                         epoch_pbar.update(1)
                         sys.stdout.flush()
-                if is_main_process:
-                    inner_pbar.close()
+                window_index += 1
             if is_main_process:
                 epoch_pbar.close()
         else:
-            # Non-streaming mode: dataloader is a single DataLoader.
+            # Non-streaming branch: dataloader is a single DataLoader.
             total_epoch_batches = len(dataloader)
             if is_main_process:
                 epoch_pbar = tqdm(total=total_epoch_batches, desc=f"Epoch {epoch+1} Progress",
-                                  file=sys.stdout, mininterval=0.1, maxinterval=0.5, ascii=True, dynamic_ncols=False, ncols=120)
+                                  file=sys.stdout, mininterval=0.1, maxinterval=0.5,
+                                  ascii=True, dynamic_ncols=False, ncols=120)
                 sys.stdout.flush()
             for batch_idx, batch in enumerate(dataloader):
                 if not use_deepspeed:
@@ -266,13 +274,10 @@ def train_model(
 
                 main_ids = batch['input_ids'].to(device, dtype=torch.long)
                 future_vals = batch['labels'].to(device, dtype=torch.float16)
-                sector_list = batch.get('sector', None)
                 idx_list = batch.get('idx', None)
                 B = main_ids.size(0)
 
                 logging.debug(f"Processing batch {batch_idx+1} with size {B}.")
-                logging.debug(f"main_ids shape: {main_ids.shape}, future_vals shape: {future_vals.shape}")
-
                 if future_vals.dim() == 2 and future_vals.size(1) == 1:
                     future_vals = future_vals.squeeze(1)
                 elif future_vals.dim() not in (1, 2):
@@ -283,7 +288,7 @@ def train_model(
                     if ebm and idx_list is not None:
                         cpu_args_list = []
                         for idx_val in idx_list:
-                            cpu_args_list.append((idx_val, df, df_preprocessed, epochs, epoch, context_count))
+                            cpu_args_list.append((idx_val, df, df_preprocessed, epochs, epoch, getattr(args, "ebm_num_samples_train", 5)))
                         all_contexts_batch = list(pool.map(parallel_context_generation_worker, cpu_args_list))
                         logging.debug("Context generation complete for current batch.")
                         wrapped_model = get_wrapped_model(model)
