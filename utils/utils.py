@@ -104,10 +104,12 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
     The window is determined by:
        window_start = window_index * (streaming_size - overlap)
        window_end = window_start + streaming_size
-    After loading, for the preprocessed DataFrame we filter out indices that are less than:
-         threshold = max(0, window_start - overlap)
+    After loading, for the preprocessed DataFrame we filter out indices that fall outside the window range,
+    then subtract an offset (window_index * streaming_size) from each index so that they are relative
+    to the current window.
     """
-    total_rows = get_total_rows(main_parquet_path)
+    print("POOOOOOOOOOOO")
+    total_rows = 453932
     window_start = window_index * (streaming_size - overlap)
     window_end = min(window_start + streaming_size, total_rows)
     logger.info(f"Loading rows {window_start} to {window_end} (window index {window_index}).")
@@ -119,32 +121,68 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
     df = main_table.to_pandas()
     df_preprocessed = pre_table.to_pandas()
 
-    # Filter the preprocessed index lists so that only indices >= threshold are kept.
-    threshold = max(0, window_start - overlap)
+    # Define the offset to subtract from each reference index.
+    offset = window_index * streaming_size
+
+    # Filter and adjust the preprocessed index lists so that only indices within the global window are kept,
+    # and then subtract the offset to yield relative indices.
     index_columns = ["use_ebm_economic", "use_ebm_industry", "use_ebm_sector", "use_ebm_historical", "use_ebm_top25"]
     for col in index_columns:
         if col in df_preprocessed.columns:
-            def filter_indices(cell):
+            def filter_and_adjust(cell):
                 if isinstance(cell, (list, np.ndarray)):
-                    return [int(x) for x in cell if int(x) >= threshold]
+                    print("BBBBBBBBB")
+                    return [int(x) - offset for x in cell if window_start <= int(x) < window_end]
                 else:
+                    print("AAAAAAAAAAAAAAAAAA")
                     return cell
-            df_preprocessed[col] = df_preprocessed[col].apply(filter_indices)
+            df_preprocessed[col] = df_preprocessed[col].apply(filter_and_adjust)
     return df, df_preprocessed
-    
+
 def get_data(percent_data=100.0, run=False, update=False, args=None):
     """
-    If streaming mode is enabled (args.streaming is True), uses the rolling-window approach.
+    If streaming mode is enabled (args.streaming is True), uses the Hugging Face streaming API
+    to load data on the fly without reading the entire dataset into memory.
     Otherwise, falls back to the original full-dataset loading.
     """
-    if hasattr(args, "streaming") and args.streaming:
-        # Ensure that the parquet files exist locally (download if necessary)
-        main_parquet_path, preprocessed_parquet_path = ensure_local_dataset_files()
+    if args.streaming:
+        from datasets import load_dataset
+        # Use streaming mode so that we don't load the entire dataset into memory.
+        ds = load_dataset("nbettencourt/SC454k", split="train", streaming=True)
+        ds_pre = load_dataset("nbettencourt/SC454k-preprocessed", split="train", streaming=True)
         streaming_size = getattr(args, "streaming_size", 60000)
-        overlap = getattr(args, "overlap", streaming_size // 2)
-        window_index = getattr(args, "window_index", 0)
-        logger.info(f"Streaming mode enabled. Window index: {window_index}, streaming_size: {streaming_size}, overlap: {overlap}")
-        df, df_preprocessed = get_data_window(streaming_size, overlap, window_index, main_parquet_path, preprocessed_parquet_path)
+        data_list = []
+        pre_data_list = []
+        for i, example in enumerate(ds):
+            if i >= streaming_size:
+                break
+            data_list.append(example)
+        for i, example in enumerate(ds_pre):
+            if i >= streaming_size:
+                break
+            pre_data_list.append(example)
+        # Apply percent_data to use only a subset of the streamed examples.
+        percent = float(getattr(args, "percent_data", 100.0))
+        if percent < 100.0:
+            num_examples = int(len(data_list) * (percent / 100.0))
+            data_list = data_list[:num_examples]
+            pre_data_list = pre_data_list[:num_examples]
+        df = pd.DataFrame(data_list)
+        df_preprocessed = pd.DataFrame(pre_data_list)
+        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
+        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+        split1 = int(len(df) * 0.7)
+        split2 = int(len(df) * 0.85)
+        if args.mode == "train":
+            df = df[:split1]
+            df_preprocessed = df_preprocessed[:split1]
+        elif args.mode == "run":
+            df = df[split1:split2]
+            df_preprocessed = df_preprocessed[:split2]
+        elif args.mode == "update":
+            df = df[split2:]
         return df, df_preprocessed
     else:
         from datasets import load_dataset
@@ -751,46 +789,121 @@ def prepare_optimizer(model, args):
     logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
 
-def prepare_data(args, tokenizer):
+def prepare_data(args, tokenizer, window_index=None):
     """
-    Loads data and returns either a single dataloader (non-streaming mode) or a generator of dataloaders (streaming mode).
+    Loads data and returns either a single DataLoader (non-streaming mode) or a DataLoader plus
+    data_bundle tuple for a specific window when in streaming mode.
 
-    In streaming mode, the function loads the full parquet files from disk, computes the training
-    limit based on the mode (e.g. first 70% for training), then iterates over rolling windows (with
-    given streaming_size and overlap) to create a new DataLoader for each window. This way, only one
-    window (a small subset) is loaded into VRAM at a time.
+    In streaming mode, we use the Hugging Face streaming API to load a window of data defined by
+    streaming_size, overlap, and window_index. First, we compute a global limit based on
+    percent_data so that only the first percent_data% of the full dataset are considered.
+    Then, based on the mode, we define a target subset:
+      - train: the first 70% of the global examples
+      - run: the next 15% (i.e. from 70% to 85% of global examples)
+      - update: the final 15% (i.e. from 85% to 100% of global examples)
+    Finally, we skip the first (base_offset + window_index * (streaming_size - overlap))
+    examples within that target and take the next streaming_size examples.
+    After forming the dataframes, we adjust the index-lists in the preprocessed dataframe by
+    subtracting the skip value so that all indices are relative to the current window.
     """
+    from datasets import load_dataset
+    import pandas as pd
+    import numpy as np
+
+    if window_index is None:
+        window_index = getattr(args, "window_index", 0)
+    print(f"window_index: {window_index}")
+
     if hasattr(args, "streaming") and args.streaming:
-        # Ensure parquet files exist locally
-        main_parquet_path, preprocessed_parquet_path = ensure_local_dataset_files()
-        total_rows = get_total_rows(main_parquet_path)
-        # Determine training limit based on mode
-        if args.mode == 'train':
-            train_limit = int(total_rows * 0.7)
-        elif args.mode == 'run':
-            train_limit = int(total_rows * 0.85)
-        elif args.mode == 'update':
-            train_limit = total_rows
-        else:
-            raise ValueError(f"Invalid mode: {args.mode}")
+        # Use the Hugging Face streaming API
+        ds = load_dataset("nbettencourt/SC454k", split="train", streaming=True)
+        ds_pre = load_dataset("nbettencourt/SC454k-preprocessed", split="train", streaming=True)
 
         streaming_size = getattr(args, "streaming_size", 60000)
         overlap = getattr(args, "overlap", streaming_size // 2)
+        percent = float(getattr(args, "percent_data", 100.0))
 
-        # Build a list of (DataLoader, data_bundle) for each window
-        windows = []
-        window_index = 0
-        while window_index * (streaming_size - overlap) < train_limit:
-            df, df_preprocessed = get_data_window(streaming_size, overlap, window_index, main_parquet_path, preprocessed_parquet_path)
+        # Use ds.num_rows if available; otherwise, fallback to a hardcoded total.
+        total_rows = ds.num_rows if hasattr(ds, "num_rows") and ds.num_rows is not None else 453932
+        global_limit = int(total_rows * (percent / 100.0))
+
+        # Define target subset based on mode.
+        if args.mode == "train":
+            base_offset = 0
+            target_limit = int(global_limit * 0.7)
+        elif args.mode == "run":
+            base_offset = int(global_limit * 0.7)
+            target_limit = int(global_limit * 0.85)
+        elif args.mode == "update":
+            base_offset = int(global_limit * 0.85)
+            target_limit = global_limit
+        else:
+            raise ValueError(f"Invalid mode: {args.mode}")
+
+        # Calculate how many examples to skip within the target subset.
+        skip = base_offset + window_index * (streaming_size - overlap)
+        print(f"Global limit: {global_limit}, base_offset: {base_offset}, target_limit: {target_limit}, skip: {skip}")
+
+        # If skip exceeds the target subset, return empty data.
+        if skip >= target_limit:
+            df = pd.DataFrame()
+            df_preprocessed = pd.DataFrame()
             data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
+            from utils.utils import prepare_dataloader
             dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
-            windows.append((dataloader, data_bundle))
-            window_index += 1
-        # Return a generator that yields each (dataloader, data_bundle) tuple
-        return (window for window in windows)
+            return dataloader, data_bundle
+
+        data_list = []
+        pre_data_list = []
+        # Iterate over the stream until reaching the target limit.
+        for i, example in enumerate(ds):
+            if i >= target_limit:
+                break
+            if i < skip:
+                continue
+            if len(data_list) >= streaming_size:
+                break
+            data_list.append(example)
+        for i, example in enumerate(ds_pre):
+            if i >= target_limit:
+                break
+            if i < skip:
+                continue
+            if len(pre_data_list) >= streaming_size:
+                break
+            pre_data_list.append(example)
+
+        df = pd.DataFrame(data_list)
+        df_preprocessed = pd.DataFrame(pre_data_list)
+
+        # Ensure numeric types for computations.
+        df['weighted_avg_0_hrs'] = pd.to_numeric(df['weighted_avg_0_hrs'], errors='coerce')
+        df['weighted_avg_720_hrs'] = pd.to_numeric(df['weighted_avg_720_hrs'], errors='coerce')
+        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
+        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+
+        # Adjust the index-lists in the preprocessed dataframe.
+        index_columns = ["use_ebm_economic", "use_ebm_industry", "use_ebm_sector",
+                         "use_ebm_historical", "use_ebm_top25"]
+        for col in index_columns:
+            if col in df_preprocessed.columns:
+                def adjust_indices(cell):
+                    if isinstance(cell, (list, np.ndarray)):
+                        # Subtract the skip value so that indices are relative to this window.
+                        return [int(x) - skip for x in cell if int(x) - skip >= 0]
+                    else:
+                        return cell
+                df_preprocessed[col] = df_preprocessed[col].apply(adjust_indices)
+
+        data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
+        from utils.utils import prepare_dataloader
+        dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
+        return dataloader, data_bundle
+
     else:
         # Non-streaming: use original full-dataset loading and splitting.
-        from datasets import load_dataset
         df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
         total_samples = len(df)
         num_samples = int((args.percent_data / 100.0) * total_samples)
@@ -813,6 +926,7 @@ def prepare_data(args, tokenizer):
         elif args.mode == "update":
             df = df[split2:]
         data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
+        from utils.utils import prepare_dataloader
         dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
         return dataloader, data_bundle
 
