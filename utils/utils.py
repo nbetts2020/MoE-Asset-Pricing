@@ -990,7 +990,7 @@ def save_ebm_model(ebm, epoch, save_dir="models", args=None):
 
 def save_model_and_states(model, si, replay_buffer, ewc_list, args):
     """
-    Saves the model weights and states of SI, EWC, and Replay Buffer.
+    Saves the model weights and states of SI, EWC, and Replay Buffer locally and uploads them to S3 if --bucket is provided.
 
     Args:
         model (nn.Module): The transformer model.
@@ -999,22 +999,38 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
         ewc_list (list, optional): List of EWC instances.
         args (argparse.Namespace): Command-line arguments.
     """
+    import subprocess
+    import os
+    import torch.distributed as dist
+
     if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
         rank = dist.get_rank()
     else:
         rank = 0
 
+    # Only rank 0 saves the main model and EWC state
     if rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
         # Save model weights
+        model_filename = args.save_model_name if args.save_model_name else "model_weights.pth"
+        model_path = os.path.join(args.save_dir, model_filename)
         if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
             state_dict = model.module.state_dict()
         else:
             state_dict = model.state_dict()
-        torch.save(state_dict, os.path.join(args.save_dir, args.save_model_name if args.save_model_name else "model_weights.pth"))
-        logging.info(f"Model weights saved to '{os.path.join(args.save_dir, args.save_model_name if args.save_model_name else "model_weights.pth")}'.")
+        torch.save(state_dict, model_path)
+        logging.info(f"Model weights saved to '{model_path}'.")
 
-        # Save EWC state
+        # Upload model weights to S3 if bucket is provided
+        if hasattr(args, "bucket") and args.bucket:
+            try:
+                s3_model_path = f"s3://{args.bucket}/model/{model_filename}"
+                subprocess.run(["aws", "s3", "cp", model_path, s3_model_path], check=True)
+                logging.info(f"Model weights uploaded to '{s3_model_path}'.")
+            except Exception as e:
+                logging.error(f"Error uploading model weights to S3: {e}")
+
+        # Save EWC state if used
         if getattr(args, 'use_ewc', False) and ewc_list is not None:
             ewc_state_path = os.path.join(args.save_dir, 'ewc_state.pth')
             ewc_states = []
@@ -1026,18 +1042,46 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
             torch.save(ewc_states, ewc_state_path)
             logging.info(f"EWC state saved to '{ewc_state_path}'.")
 
+            # Upload EWC state to S3
+            if hasattr(args, "bucket") and args.bucket:
+                try:
+                    s3_ewc_path = f"s3://{args.bucket}/model/ewc_state.pth"
+                    subprocess.run(["aws", "s3", "cp", ewc_state_path, s3_ewc_path], check=True)
+                    logging.info(f"EWC state uploaded to '{s3_ewc_path}'.")
+                except Exception as e:
+                    logging.error(f"Error uploading EWC state to S3: {e}")
+
     # Save SI state for each rank
     if getattr(args, 'use_si', False) and si is not None:
-        si_state_path = os.path.join(args.save_dir, f'si_state_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'si_state.pth')
+        si_filename = f'si_state_rank_{rank}.pth' if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else 'si_state.pth'
+        si_state_path = os.path.join(args.save_dir, si_filename)
         si.save_state(si_state_path)
         logging.info(f"Rank {rank}: Synaptic Intelligence (SI) state saved to '{si_state_path}'.")
 
+        # Upload SI state to S3
+        if hasattr(args, "bucket") and args.bucket:
+            try:
+                s3_si_path = f"s3://{args.bucket}/model/{si_filename}"
+                subprocess.run(["aws", "s3", "cp", si_state_path, s3_si_path], check=True)
+                logging.info(f"Rank {rank}: SI state uploaded to '{s3_si_path}'.")
+            except Exception as e:
+                logging.error(f"Rank {rank}: Error uploading SI state to S3: {e}")
+
     # Save Replay Buffer for each rank
     if getattr(args, 'use_replay_buffer', False) and replay_buffer is not None:
-        replay_buffer_path = os.path.join(args.save_dir, f'replay_buffer_rank_{rank}.pth') if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else os.path.join(args.save_dir, 'replay_buffer.pth')
+        rb_filename = f'replay_buffer_rank_{rank}.pth' if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1 else 'replay_buffer.pth'
+        replay_buffer_path = os.path.join(args.save_dir, rb_filename)
         replay_buffer.save(replay_buffer_path)
         logging.info(f"Rank {rank}: Replay Buffer saved to '{replay_buffer_path}'.")
 
+        # Upload Replay Buffer to S3
+        if hasattr(args, "bucket") and args.bucket:
+            try:
+                s3_rb_path = f"s3://{args.bucket}/model/{rb_filename}"
+                subprocess.run(["aws", "s3", "cp", replay_buffer_path, s3_rb_path], check=True)
+                logging.info(f"Rank {rank}: Replay Buffer uploaded to '{s3_rb_path}'.")
+            except Exception as e:
+                logging.error(f"Rank {rank}: Error uploading Replay Buffer to S3: {e}")
 def compute_l2_loss(model):
     """
     Compute the L2 penalty (squared L2 norm) of the model parameters.
