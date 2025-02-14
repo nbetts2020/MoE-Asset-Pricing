@@ -978,7 +978,7 @@ def save_ebm_model(ebm, epoch, save_dir="models", args=None):
     print(f"EBM model saved to {save_path}")
 
     # If a bucket is specified, upload the file to S3
-    if args is not None and hasattr(args, "bucket") and args.bucket:
+    if hasattr(args, "bucket") and args.bucket:
         try:
             import subprocess
             s3_path = f"s3://{args.bucket}/models/ebm.pt"
@@ -1082,6 +1082,7 @@ def save_model_and_states(model, si, replay_buffer, ewc_list, args):
                 logging.info(f"Rank {rank}: Replay Buffer uploaded to '{s3_rb_path}'.")
             except Exception as e:
                 logging.error(f"Rank {rank}: Error uploading Replay Buffer to S3: {e}")
+
 def compute_l2_loss(model):
     """
     Compute the L2 penalty (squared L2 norm) of the model parameters.
