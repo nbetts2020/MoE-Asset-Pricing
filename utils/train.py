@@ -126,7 +126,7 @@ def train_model(
                 # If this window is empty, break out of the window loop.
                 if len(df) == 0:
                     break
-                for batch_idx, batch in enumerate(dataloader):
+                for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", ascii=True, dynamic_ncols=True)):
                     if not use_deepspeed:
                         optimizer.zero_grad()
                     else:
