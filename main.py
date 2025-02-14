@@ -239,14 +239,17 @@ def main():
     # MAIN LOGIC (Modes)
     # ----------------------------------------------------------------
     if args.mode == 'train':
+        # Initialize model from config
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
+        # Prepare base optimizer; DeepSpeed will wrap it
         base_optimizer = prepare_optimizer(model, args)
 
+        # Initialize DeepSpeed; this call handles distributed initialization.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=base_optimizer,
@@ -254,7 +257,15 @@ def main():
             config=args.deepspeed_config
         )
 
-        # In train mode, let train_model call prepare_data internally.
+        # Define EBM and its optimizer if needed
+        if args.use_ebm:
+            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
+        else:
+            ebm = None
+            ebm_optimizer = None
+
+        # Let train_model call prepare_data internally.
         train_model(
             model=engine,
             optimizer=engine_optimizer,
@@ -267,15 +278,15 @@ def main():
             replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
             df=None,
             df_preprocessed=None,
-            ebm=EnergyBasedModel(embedding_dim=config.N_EMBED).to(device) if args.use_ebm else None,
-            ebm_optimizer=torch.optim.AdamW(EnergyBasedModel(embedding_dim=config.N_EMBED).to(device).parameters(), lr=args.ebm_learning_rate * 0.1) if args.use_ebm else None,
+            ebm=ebm,
+            ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
             use_deepspeed=True
         )
         logging.info("Training completed.")
 
         if args.use_ebm and rank == 0:
-            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
+            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
         if rank == 0:
             save_model_and_states(engine.module, None, None, None, args)
 
@@ -302,8 +313,10 @@ def main():
             ebm.to(device)
             ebm.eval()
             logging.info("EBM model loaded from S3.")
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
 
         optimizer = prepare_optimizer(model, args)
+
         if args.use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -312,9 +325,6 @@ def main():
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
-        if args.use_ebm and ebm is not None:
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
-            from utils.data import custom_collate_fn
         train_model(
             model=model,
             optimizer=optimizer,
@@ -335,7 +345,7 @@ def main():
         logging.info("Update completed.")
 
         if args.use_ebm and rank == 0:
-            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models")
+            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
         if rank == 0:
             save_model_and_states(model, None, None, None, args)
 
@@ -346,7 +356,6 @@ def main():
             raise ValueError("When evaluating on test set, provide --bucket.")
 
         # For run mode, we load the data (using non-streaming mode) to obtain the test split.
-        # This dataset is needed for EBM sampling.
         run_dataloader, data_bundle = prepare_data(args, tokenizer)
         df = data_bundle['df']
         df_preprocessed = data_bundle['df_preprocessed']
@@ -403,7 +412,6 @@ def main():
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
         else:
-            # If test flag is set, evaluate on the test split using the run_dataloader.
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
