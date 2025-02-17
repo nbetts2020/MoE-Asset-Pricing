@@ -141,73 +141,42 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
 
 def get_data(percent_data=100.0, run=False, update=False, args=None):
     """
-    If streaming mode is enabled (args.streaming is True), uses the Hugging Face streaming API
-    to load data on the fly without reading the entire dataset into memory.
-    Otherwise, falls back to the original full-dataset loading.
+    Loads the entire dataset into RAM, then filters/splits as needed.
+    The 'streaming' option is removed, so we *always* load fully into memory.
     """
-    if args.streaming:
-        from datasets import load_dataset
-        # Use streaming mode so that we don't load the entire dataset into memory.
-        ds = load_dataset("nbettencourt/SC454k", split="train", streaming=True)
-        ds_pre = load_dataset("nbettencourt/SC454k-preprocessed", split="train", streaming=True)
-        streaming_size = getattr(args, "streaming_size", 60000)
-        data_list = []
-        pre_data_list = []
-        for i, example in enumerate(ds):
-            if i >= streaming_size:
-                break
-            data_list.append(example)
-        for i, example in enumerate(ds_pre):
-            if i >= streaming_size:
-                break
-            pre_data_list.append(example)
-        # Apply percent_data to use only a subset of the streamed examples.
-        percent = float(getattr(args, "percent_data", 100.0))
-        if percent < 100.0:
-            num_examples = int(len(data_list) * (percent / 100.0))
-            data_list = data_list[:num_examples]
-            pre_data_list = pre_data_list[:num_examples]
-        df = pd.DataFrame(data_list)
-        df_preprocessed = pd.DataFrame(pre_data_list)
-        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
-        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-        split1 = int(len(df) * 0.7)
-        split2 = int(len(df) * 0.85)
-        if args.mode == "train":
-            df = df[:split1]
-            df_preprocessed = df_preprocessed[:split1]
-        elif args.mode == "run":
-            df = df[split1:split2]
-            df_preprocessed = df_preprocessed[:split2]
-        elif args.mode == "update":
-            df = df[split2:]
-        return df, df_preprocessed
-    else:
-        from datasets import load_dataset
-        df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
-        total_samples = len(df)
-        num_samples = int((percent_data / 100.0) * total_samples)
-        df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
-        df = df.head(num_samples)
-        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
-        df_preprocessed = dataset_preprocessed.head(num_samples)
-        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
-        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-        split1 = int(len(df) * 0.7)
-        split2 = int(len(df) * 0.85)
-        if args.mode == "train":
-            df = df[:split1]
-            df_preprocessed = df_preprocessed[:split1]
-        elif args.mode == "run":
-            df = df[split1:split2]
-            df_preprocessed = df_preprocessed[:split2]
-        elif args.mode == "update":
-            df = df[split2:]
-        return df, df_preprocessed
+    # Load entire SC454k:
+    df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
+
+    # Possibly filter out zero prices:
+    df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
+
+    # Limit to `percent_data` of total:
+    df = df.head(int(len(df) * (percent_data / 100.0)))
+
+    # Load preprocessed version too:
+    df_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
+    df_preprocessed = df_preprocessed.head(len(df))  # match same length
+
+    # Extra columns
+    safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
+    df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp("1970-01-01"))
+    df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+
+    # Splits
+    split1 = int(len(df) * 0.7)
+    split2 = int(len(df) * 0.85)
+    if args.mode == "train":
+        df = df[:split1]
+        df_preprocessed = df_preprocessed[:split1]
+    elif args.mode == "run":
+        df = df[split1:split2]
+        df_preprocessed = df_preprocessed[split1:split2]
+    elif args.mode == "update":
+        df = df[split2:]
+        df_preprocessed = df_preprocessed[split2:]
+
+    return df, df_preprocessed
 
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
@@ -564,42 +533,31 @@ def process_data(df,
         symbols, industries, risk_free_rates
     )
 
-def prepare_dataloader(df, df_preprocessed, tokenizer, batch_size, shuffle, args):
+def prepare_dataloader(df, df_preprocessed, tokenizer, batch_size, shuffle, args, sampler=None):
     """
-    Processes df and df_preprocessed to create an ArticlePriceDataset and returns a DataLoader.
+    Prepare dataloader with optional distributed sampler support
     """
-    (articles, prices, sectors, dates,
-     related_stocks, prices_current,
-     symbols, industries, rfr) = process_data(
-         df,
-         df_preprocessed,
-         tokenizer,
-         use_ebm_format=args.use_ebm_format,
-         numeric_only=args.numeric_only
-     )
+    from utils.data import ArticlePriceDataset, custom_collate_fn
+    from torch.utils.data import DataLoader
 
     dataset = ArticlePriceDataset(
-        articles=articles,
-        prices=prices,
-        sectors=sectors,
-        dates=dates,
-        related_stocks_list=related_stocks,
-        prices_current=prices_current,
-        symbols=symbols,
-        industries=industries,
-        risk_free_rates=rfr,
+        df=df,
+        df_preprocessed=df_preprocessed,
         tokenizer=tokenizer,
-        total_epochs=config.EPOCHS,
-        use_ebm=args.use_ebm
+        block_size=config.BLOCK_SIZE
     )
 
-    num_workers = max(cpu_count() - 1, 1)
-    if getattr(args, 'use_ddp', False) and torch.cuda.device_count() > 1:
-        from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(dataset, shuffle=False)
-        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True, collate_fn=custom_collate_fn)
-    else:
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, collate_fn=custom_collate_fn)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(shuffle and sampler is None),  # Only shuffle if no sampler
+        sampler=sampler,
+        num_workers=0,  # Set to 0 for distributed training
+        collate_fn=custom_collate_fn,
+        pin_memory=True
+    )
+
+    return dataloader
 
 def prepare_tasks(tokenizer, args, k=3):
     """
@@ -789,146 +747,92 @@ def prepare_optimizer(model, args):
     logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
 
-def prepare_data(args, tokenizer, window_index=None):
+def prepare_data(args, tokenizer):
     """
-    Loads data and returns either a single DataLoader (non-streaming mode) or a DataLoader plus
-    data_bundle tuple for a specific window when in streaming mode.
-
-    In streaming mode, we use the Hugging Face streaming API to load a window of data defined by
-    streaming_size, overlap, and window_index. First, we compute a global limit based on
-    percent_data so that only the first percent_data% of the full dataset are considered.
-    Then, based on the mode, we define a target subset:
-      - train: the first 70% of the global examples
-      - run: the next 15% (i.e. from 70% to 85% of global examples)
-      - update: the final 15% (i.e. from 85% to 100% of global examples)
-    Finally, we skip the first (base_offset + window_index * (streaming_size - overlap))
-    examples within that target and take the next streaming_size examples.
-    After forming the dataframes, we adjust the index-lists in the preprocessed dataframe by
-    subtracting the skip value so that all indices are relative to the current window.
+    Centralized data loading on rank 0, then broadcast to other ranks.
+    Returns a DataLoader and a data_bundle containing df, df_preprocessed.
     """
-    from datasets import load_dataset
     import pandas as pd
-    import numpy as np
+    import torch.distributed as dist
+    import logging
+    from utils.data import ArticlePriceDataset
+    from torch.utils.data.distributed import DistributedSampler
 
-    if window_index is None:
-        window_index = getattr(args, "window_index", 0)
-    print(f"window_index: {window_index}")
-
-    if hasattr(args, "streaming") and args.streaming:
-        # Use the Hugging Face streaming API
-        ds = load_dataset("nbettencourt/SC454k", split="train", streaming=True)
-        ds_pre = load_dataset("nbettencourt/SC454k-preprocessed", split="train", streaming=True)
-
-        streaming_size = getattr(args, "streaming_size", 60000)
-        overlap = getattr(args, "overlap", streaming_size // 2)
-        percent = float(getattr(args, "percent_data", 100.0))
-
-        # Use ds.num_rows if available; otherwise, fallback to a hardcoded total.
-        total_rows = ds.num_rows if hasattr(ds, "num_rows") and ds.num_rows is not None else 453932
-        global_limit = int(total_rows * (percent / 100.0))
-
-        # Define target subset based on mode.
-        if args.mode == "train":
-            base_offset = 0
-            target_limit = int(global_limit * 0.7)
-        elif args.mode == "run":
-            base_offset = int(global_limit * 0.7)
-            target_limit = int(global_limit * 0.85)
-        elif args.mode == "update":
-            base_offset = int(global_limit * 0.85)
-            target_limit = global_limit
-        else:
-            raise ValueError(f"Invalid mode: {args.mode}")
-
-        # Calculate how many examples to skip within the target subset.
-        skip = base_offset + window_index * (streaming_size - overlap)
-        print(f"Global limit: {global_limit}, base_offset: {base_offset}, target_limit: {target_limit}, skip: {skip}")
-
-        # If skip exceeds the target subset, return empty data.
-        if skip >= target_limit:
-            df = pd.DataFrame()
-            df_preprocessed = pd.DataFrame()
-            data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
-            from utils.utils import prepare_dataloader
-            dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
-            return dataloader, data_bundle
-
-        data_list = []
-        pre_data_list = []
-        # Iterate over the stream until reaching the target limit.
-        for i, example in enumerate(ds):
-            if i >= target_limit:
-                break
-            if i < skip:
-                continue
-            if len(data_list) >= streaming_size:
-                break
-            data_list.append(example)
-        for i, example in enumerate(ds_pre):
-            if i >= target_limit:
-                break
-            if i < skip:
-                continue
-            if len(pre_data_list) >= streaming_size:
-                break
-            pre_data_list.append(example)
-
-        df = pd.DataFrame(data_list)
-        df_preprocessed = pd.DataFrame(pre_data_list)
-
-        # Ensure numeric types for computations.
-        df['weighted_avg_0_hrs'] = pd.to_numeric(df['weighted_avg_0_hrs'], errors='coerce')
-        df['weighted_avg_720_hrs'] = pd.to_numeric(df['weighted_avg_720_hrs'], errors='coerce')
-        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
-        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-
-        # Adjust the index-lists in the preprocessed dataframe.
-        index_columns = ["use_ebm_economic", "use_ebm_industry", "use_ebm_sector",
-                         "use_ebm_historical", "use_ebm_top25"]
-        for col in index_columns:
-            if col in df_preprocessed.columns:
-                def adjust_indices(cell):
-                    if isinstance(cell, (list, np.ndarray)):
-                        # Subtract the skip value so that indices are relative to this window.
-                        return [int(x) - skip for x in cell if int(x) - skip >= 0]
-                    else:
-                        return cell
-                df_preprocessed[col] = df_preprocessed[col].apply(adjust_indices)
-
-        data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
-        from utils.utils import prepare_dataloader
-        dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
-        return dataloader, data_bundle
-
+    # Check distributed setup
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        print(f"Distributed training initialized on rank {rank}.")
     else:
-        # Non-streaming: use original full-dataset loading and splitting.
-        df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
-        total_samples = len(df)
-        num_samples = int((args.percent_data / 100.0) * total_samples)
-        df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
-        df = df.head(num_samples)
-        dataset_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
-        df_preprocessed = dataset_preprocessed.head(num_samples)
-        safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
-        df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
-        split1 = int(len(df) * 0.7)
-        split2 = int(len(df) * 0.85)
-        if args.mode == "train":
-            df = df[:split1]
-            df_preprocessed = df_preprocessed[:split1]
-        elif args.mode == "run":
-            df = df[split1:split2]
-            df_preprocessed = df_preprocessed[:split2]
-        elif args.mode == "update":
-            df = df[split2:]
-        data_bundle = {'df': df, 'df_preprocessed': df_preprocessed}
-        from utils.utils import prepare_dataloader
-        dataloader = prepare_dataloader(df, df_preprocessed, tokenizer, batch_size=config.BATCH_SIZE, shuffle=False, args=args)
-        return dataloader, data_bundle
+        rank = 0
+        world_size = 1
+        print("Single-process (non-distributed) training.")
+
+    # On rank 0, load the dataset
+    if rank == 0:
+        df, df_preprocessed = get_data(
+            percent_data=args.percent_data,
+            run=(args.mode == "run"),
+            update=(args.mode == "update"),
+            args=args
+        )
+        logging.info(f"Rank {rank}: Loaded df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
+        data_dict = {
+            "df": df.to_dict("records"),
+            "df_preprocessed": df_preprocessed.to_dict("records")
+        }
+    else:
+        data_dict = None
+
+    # Broadcast the loaded data to all ranks
+    if world_size > 1:
+        dist.barrier()
+        object_list = [data_dict]
+        dist.broadcast_object_list(object_list, src=0)
+        data_dict = object_list[0]
+        dist.barrier()
+
+    # Convert to DataFrame on each rank
+    if rank != 0 or world_size == 1:
+        df = pd.DataFrame(data_dict["df"])
+        df_preprocessed = pd.DataFrame(data_dict["df_preprocessed"])
+        logging.info(f"Rank {rank}: Received df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
+
+    data_bundle = {"df": df, "df_preprocessed": df_preprocessed}
+
+    # Build the dataset
+    dataset = ArticlePriceDataset(
+        df=df,
+        df_preprocessed=df_preprocessed,
+        tokenizer=tokenizer,
+        block_size=config.BLOCK_SIZE
+    )
+
+    # Use a DistributedSampler if needed
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=(args.mode == "train")
+        )
+        shuffle_flag = False
+    else:
+        sampler = None
+        shuffle_flag = (args.mode == "train")
+
+    # Build the DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=shuffle_flag,
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=custom_collate_fn,
+        pin_memory=True
+    )
+
+    return dataloader, data_bundle
 
 def initialize_si(model, args):
     """
