@@ -24,7 +24,8 @@ from utils.utils import (
     prepare_data,
     download_models_from_s3,
     evaluate_model,
-    ebm_select_contexts
+    ebm_select_contexts,
+    get_data  # new: load dataset once
 )
 from utils.config import config
 from torch.utils.data import DataLoader
@@ -43,9 +44,30 @@ from torch.utils.data.distributed import DistributedSampler
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
+
+def print_debug_info(stage):
+    # Print robust debug information about the distributed environment.
+    print("=== Debug Info:", stage, "===")
+    print("Environment variables:")
+    print("  RANK:", os.environ.get("RANK"))
+    print("  LOCAL_RANK:", os.environ.get("LOCAL_RANK"))
+    print("  WORLD_SIZE:", os.environ.get("WORLD_SIZE"))
+    if torch.distributed.is_initialized():
+        print("torch.distributed.get_rank():", torch.distributed.get_rank())
+        print("torch.distributed.get_world_size():", torch.distributed.get_world_size())
+    else:
+        print("torch.distributed is NOT initialized")
+    print("CUDA device count:", torch.cuda.device_count())
+    print("====================================")
+
+
 def main():
+    # Initialize pandarallel
     pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
     logging.info("pandarallel initialized with parallel_apply.")
+
+    # Print debug info at startup
+    print_debug_info("START")
 
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
 
@@ -165,21 +187,13 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for training')
 
-    # NEW STREAMING ARGUMENTS
-    parser.add_argument('--streaming', action='store_true',
-                        help="Enable streaming mode (rolling window).")
-    parser.add_argument('--streaming_size', type=int, default=60000,
-                        help="Number of rows to load per window.")
-    parser.add_argument('--overlap', type=int, default=30000,
-                        help="Number of overlapping rows between windows.")
-    parser.add_argument('--window_index', type=int, default=0,
-                        help="Window index to load (starting from 0).")
-
-    # DeepSpeed config path (assumed to be in utils/deepspeed_config.json)
+    # DeepSpeed config path
     parser.add_argument('--deepspeed_config', type=str, default="utils/deepspeed_config.json",
                         help="Path to the DeepSpeed config file.")
 
     args = parser.parse_args()
+
+    print_debug_info("AFTER ARGPARSE")
 
     # Possibly override config for quick test
     if args.test_model:
@@ -218,6 +232,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rank = int(os.environ.get('RANK', 0))
     logging.info(f"Using device: {device}, rank: {rank}")
+    print_debug_info("BEFORE SEED SETTING")
 
     # Set seeds
     random_seed = args.random_seed
@@ -226,6 +241,7 @@ def main():
     random.seed(random_seed)
     torch.cuda.manual_seed_all(random_seed)
     logging.info(f"Using random seed: {random_seed}")
+
     if not (0 < args.percent_data <= 100):
         raise ValueError("--percent_data must be between 0 and 100.")
 
@@ -235,10 +251,13 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    print_debug_info("BEFORE MODE SWITCH")
+
     # ----------------------------------------------------------------
     # MAIN LOGIC (Modes)
     # ----------------------------------------------------------------
     if args.mode == 'train':
+        print_debug_info("TRAIN MODE START")
         # Initialize model from config
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
@@ -248,6 +267,10 @@ def main():
 
         # Prepare base optimizer; DeepSpeed will wrap it
         base_optimizer = prepare_optimizer(model, args)
+        # For debugging, force local_rank=0 here if needed for DeepSpeed; normally, do not override:
+        # args.local_rank = 0
+        print("LOCAL_RANK (train):", local_rank)
+        print("Available GPUs (train):", torch.cuda.device_count())
 
         # Initialize DeepSpeed; this call handles distributed initialization.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
@@ -256,6 +279,9 @@ def main():
             model_parameters=model.parameters(),
             config=args.deepspeed_config
         )
+        print_debug_info("AFTER DEEPSPEED INIT")
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print("Global rank (train):", global_rank)
 
         # Define EBM and its optimizer if needed
         if args.use_ebm:
@@ -265,19 +291,25 @@ def main():
             ebm = None
             ebm_optimizer = None
 
-        # Let train_model call prepare_data internally.
+        # Build DataLoader using prepare_data (do not pass extra df arguments)
+        train_dataloader, data_bundle = prepare_data(args, tokenizer)
+        df = data_bundle['df']
+        df_preprocessed = data_bundle['df_preprocessed']
+        print("DataLoader:", train_dataloader, "Length:", len(train_dataloader), "dl")
+        print("DataFrame shape:", df.shape, "Preprocessed shape:", df_preprocessed.shape)
+
         train_model(
             model=engine,
             optimizer=engine_optimizer,
             epochs=config.EPOCHS,
             device=device,
-            dataloader=None,
+            dataloader=train_dataloader,
             args=args,
             si=initialize_si(engine, args) if args.use_si else None,
             ewc=[ElasticWeightConsolidation(engine, None, device, args)] if args.use_ewc else None,
             replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
-            df=None,
-            df_preprocessed=None,
+            df=df,
+            df_preprocessed=df_preprocessed,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
@@ -285,13 +317,13 @@ def main():
         )
         logging.info("Training completed.")
 
-        if args.use_ebm and rank == 0:
-            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-        if rank == 0:
+        if global_rank == 0:
+            if args.use_ebm:
+                save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
             save_model_and_states(engine.module, None, None, None, args)
 
     elif args.mode == 'update':
-        # In update mode, let train_model call prepare_data internally.
+        print_debug_info("UPDATE MODE START")
         if not args.bucket:
             raise ValueError("When using EBM sampling in 'update', --bucket is required.")
 
@@ -325,18 +357,24 @@ def main():
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
+        update_dataloader, data_bundle = prepare_data(args, tokenizer)
+        df = data_bundle['df']
+        df_preprocessed = data_bundle['df_preprocessed']
+        print("Update DataLoader length:", len(update_dataloader))
+        print("Update DataFrame shape:", df.shape, "Preprocessed shape:", df_preprocessed.shape)
+
         train_model(
             model=model,
             optimizer=optimizer,
             epochs=config.EPOCHS,
             device=device,
-            dataloader=None,
+            dataloader=update_dataloader,
             args=args,
             si=initialize_si(model, args) if args.use_si else None,
             ewc=[ElasticWeightConsolidation(model, None, device, args)] if args.use_ewc else None,
             replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
-            df=None,
-            df_preprocessed=None,
+            df=df,
+            df_preprocessed=df_preprocessed,
             ebm=ebm,
             ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
@@ -344,21 +382,24 @@ def main():
         )
         logging.info("Update completed.")
 
-        if args.use_ebm and rank == 0:
-            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-        if rank == 0:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            if args.use_ebm:
+                save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
             save_model_and_states(model, None, None, None, args)
 
     elif args.mode == 'run':
+        print_debug_info("RUN MODE START")
         if (not args.test) and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("In 'run' mode with EBM (no --test), must provide --stock, --date, --text, --bucket.")
         elif args.test and not args.bucket:
             raise ValueError("When evaluating on test set, provide --bucket.")
 
-        # For run mode, we load the data (using non-streaming mode) to obtain the test split.
+        # Build DataLoader for the test split
         run_dataloader, data_bundle = prepare_data(args, tokenizer)
-        df = data_bundle['df']
-        df_preprocessed = data_bundle['df_preprocessed']
+        df_run = data_bundle['df']
+        df_run_preprocessed = data_bundle['df_preprocessed']
+        print("Run DataLoader length:", len(run_dataloader))
+        print("Run DataFrame shape:", df_run.shape, "Preprocessed shape:", df_run_preprocessed.shape)
 
         download_models_from_s3(bucket=args.bucket)
 
@@ -378,7 +419,7 @@ def main():
             logging.info("EBM model loaded from S3.")
 
             selected_context = ebm_select_contexts(
-                df=df,
+                df=df_run,
                 stock=args.stock,
                 date=args.date,
                 text=args.text,
@@ -413,8 +454,8 @@ def main():
             print(f"Predicted Price: {prediction.item()}")
         else:
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
-            print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-            logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+            print(f"Test MSE: {mse:.4f}, RÂ² Score: {r2:.4f}")
+            logging.info(f"Test MSE: {mse:.4f}, RÂ² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -433,7 +474,7 @@ def main():
                 print(
                     f"Sector: {sector} - "
                     f"MSE: {metrics.get('mse',0.0):.4f}, "
-                    f"R²: {metrics.get('r2',0.0):.4f}, "
+                    f"RÂ²: {metrics.get('r2',0.0):.4f}, "
                     f"Trend Accuracy: {metrics.get('trend_acc',0.0):.4f}, "
                     f"Sharpe Ratio: {metrics.get('sharpe',0.0):.4f}, "
                     f"Sortino Ratio: {metrics.get('sortino',0.0):.4f}, "
@@ -444,7 +485,7 @@ def main():
                 logging.info(
                     f"Sector: {sector} - "
                     f"MSE: {metrics.get('mse',0.0):.4f}, "
-                    f"R²: {metrics.get('r2',0.0):.4f}, "
+                    f"RÂ²: {metrics.get('r2',0.0):.4f}, "
                     f"Trend Accuracy: {metrics.get('trend_acc',0.0):.4f}, "
                     f"Sharpe Ratio: {metrics.get('sharpe',0.0):.4f}, "
                     f"Sortino Ratio: {metrics.get('sortino',0.0):.4f}, "
@@ -452,7 +493,9 @@ def main():
                     f"Win Rate: {metrics.get('win_rate',0.0):.2f}%, "
                     f"Profit Factor: {metrics.get('profit_factor',0.0):.4f}"
                 )
+
     elif args.mode == 'test_forgetting':
+        print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         logging.info("Initialized model for catastrophic forgetting testing.")
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
@@ -484,7 +527,9 @@ def main():
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', or 'test_forgetting'.")
 
     if args.use_ddp:
+        import torch.distributed as dist
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
