@@ -344,7 +344,6 @@ def parallel_context_generation_worker(args):
     """
     (idx, df, df_preprocessed, total_epochs, current_epoch, context_count) = args
     # Adjust context_count based on the remaining epochs.
-    context_count = max(total_epochs - current_epoch, 5)
     candidate_contexts = []
     if idx < 0 or idx >= len(df):
         logger.error(f"Index {idx} is out-of-bounds for the main DataFrame.")
@@ -420,45 +419,35 @@ def parallel_context_generation_worker(args):
         token_list = build_candidate_context_tokens(sample_dict)
         candidate_contexts.append(token_list)
 
-    return candidate_contexts
+    return (idx, candidate_contexts)
 
 # -------------------------------------------------------------------------
 # DATASET/LOADER CLASSES
 # -------------------------------------------------------------------------
 class ArticlePriceDataset(Dataset):
     """
-    Basic dataset that tokenizes each row's article upfront in __init__.
+    Dataset that loads the full DataFrame into memory and pre-tokenizes each article.
+    This replaces the previous rolling-window dataset.
     """
-    def __init__(self,
-                 articles: list,
-                 prices: list,
-                 sectors: list,
-                 dates: list,
-                 related_stocks_list: list,
-                 prices_current: list,
-                 symbols: list,
-                 industries: list,
-                 risk_free_rates: list,
-                 tokenizer,
-                 total_epochs: int,
-                 use_ebm: bool = False):
-        self.df = pd.DataFrame({
-            'Article': articles,
-            'weighted_avg_720_hrs': prices,
-            'Sector': sectors,
-            'Date': dates,
-            'RelatedStocksList': related_stocks_list,
-            'weighted_avg_0_hrs': prices_current,
-            'Symbol': symbols,
-            'Industry': industries,
-            'Risk_Free_Rate': risk_free_rates
-        })
+    def __init__(self, df: pd.DataFrame, tokenizer: AutoTokenizer, total_epochs: int, use_ebm: bool = False):
+        """
+        Args:
+            df (pd.DataFrame): DataFrame containing at least these columns:
+                'Article', 'weighted_avg_720_hrs', 'weighted_avg_0_hrs', 'Sector',
+                'Date', 'RelatedStocksList', 'Symbol', 'Industry', 'Risk_Free_Rate'
+            tokenizer: Pretrained tokenizer (e.g. GPT2).
+            total_epochs (int): Total number of training epochs.
+            use_ebm (bool): Whether EBM sampling is enabled.
+        """
+        self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.total_epochs = total_epochs
         self.use_ebm = use_ebm
 
-        logger.info("Pre-tokenizing each article in ArticlePriceDataset...")
+        logger.info("Pre-tokenizing all articles in ArticlePriceDataset...")
+        # Pre-tokenize each article and store the tokenized tensors.
         self.tokenized_articles = []
+        articles = self.df['Article'].tolist()
         for article in tqdm(articles, desc="Pre-tokenizing", unit="article"):
             encoding = self.tokenizer(
                 article,
@@ -467,19 +456,24 @@ class ArticlePriceDataset(Dataset):
                 max_length=config.BLOCK_SIZE,
                 return_tensors='pt'
             )
+            # Squeeze out the batch dimension
             self.tokenized_articles.append(encoding['input_ids'].squeeze(0))
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        input_ids = self.tokenized_articles[idx]
+        """
+        Returns a dictionary for one sample.
+        """
         row = self.df.iloc[idx]
+        # Retrieve the pre-tokenized article
+        input_ids = self.tokenized_articles[idx]
 
         future_price = row.get('weighted_avg_720_hrs', 0.0)
-        old_price = row.get('weighted_avg_0_hrs', 0.0)
-        sector = row.get('Sector', 'Unknown Sector')
-        risk_free = row.get('Risk_Free_Rate', 0.0)
+        old_price    = row.get('weighted_avg_0_hrs', 0.0)
+        sector       = row.get('Sector', 'Unknown Sector')
+        risk_free    = row.get('Risk_Free_Rate', 0.0)
 
         sample = {
             'input_ids': input_ids,
@@ -490,50 +484,6 @@ class ArticlePriceDataset(Dataset):
             'risk_free_rate': torch.tensor(risk_free, dtype=torch.float)
         }
         return sample
-
-class RollingWindowDataset(IterableDataset):
-    """
-    An IterableDataset that loads data in rolling windows from a Parquet file.
-    Tokenization is performed on the fly in __iter__.
-    """
-    def __init__(self, main_parquet_path, preprocessed_parquet_path, streaming_size, overlap, tokenizer, mode):
-        self.main_parquet_path = main_parquet_path
-        self.preprocessed_parquet_path = preprocessed_parquet_path
-        self.streaming_size = streaming_size
-        self.overlap = overlap
-        self.tokenizer = tokenizer
-        self.mode = mode
-        self.total_rows = self.get_total_rows(main_parquet_path)
-        self.current_window = 0
-
-    def get_total_rows(self, path):
-        df = pd.read_parquet(path)
-        return len(df)
-
-    def __iter__(self):
-        window_start = 0
-        while window_start < self.total_rows:
-            window_end = min(window_start + self.streaming_size, self.total_rows)
-            logger.info(f"Loading window rows {window_start} to {window_end}")
-            df = pd.read_parquet(self.main_parquet_path).iloc[window_start:window_end]
-            for idx, row in df.iterrows():
-                article = row.get('Article', 'N/A')
-                future_price = row.get('weighted_avg_720_hrs', 0.0)
-                encoding = self.tokenizer(
-                    article,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=config.BLOCK_SIZE,
-                    return_tensors='pt'
-                )
-                input_ids = encoding['input_ids'].squeeze(0)
-                sample = {
-                    'input_ids': input_ids,
-                    'labels': torch.tensor(future_price, dtype=torch.float),
-                    'idx': int(idx + window_start)
-                }
-                yield sample
-            window_start = window_start + (self.streaming_size - self.overlap)
 
 # -------------------------------------------------------------------------
 # CUSTOM COLLATE
