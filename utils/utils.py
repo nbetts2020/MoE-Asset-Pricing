@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 
 from utils.config import config
-from utils.data import ArticlePriceDataset, custom_collate_fn
+from utils.data import ArticlePriceDataset, custom_collate_fn, build_candidate_context_tokens
 from utils.model import SparseMoELanguageModel
 
 import os
@@ -232,46 +232,52 @@ def download_models_from_s3(bucket):
         logging.error(f"Error syncing 'models' directory: {e.stderr}")
         raise
 
-def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_samples):
+def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
     """
-    Generates and selects the best context based on EBM scoring.
+    Generates and selects the best context based on EBM scoring for a given sample index,
+    using data.py's formatting logic to build candidate contexts.
 
     Args:
-        df (pd.DataFrame): The entire dataset to sample from.
-        stock (str): Stock symbol to filter relevant articles.
-        date (str): Date to filter relevant articles.
-        sample_count (int): Number of samples to generate.
+        df (pd.DataFrame): The dataset to sample from.
+        idx (int): The index of the target sample in df.
+        text (str): Additional text to append.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
         tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
+        ebm_samples (int): Number of candidate contexts to generate.
 
     Returns:
         str: The selected context string.
     """
-    # Filter the dataframe based on stock and date
-    filtered_df = df[df['Date'] <= pd.to_datetime(date)]
+    # Get the target row and its stock symbol.
+    target_row = df.iloc[idx]
+    symbol = target_row['Symbol']
 
-    if filtered_df.empty:
-        raise ValueError("No data available for the specified stock and date.")
+    def safe_sample(data, n, seed):
+        return data.sample(n=n, random_state=seed) if len(data) >= n else data
 
     candidates = []
-    for _ in range(ebm_samples):
-        # sample_articles(...) returns a list of sample_dicts; grab the first
-        sampled_list = sample_articles(filtered_df, index_list=None, symbol=stock)
-        if not sampled_list:
-            continue  # skip if no samples returned
-        sample_dict = sampled_list[0]  # typically you get only one item
-
-        # Convert sample_dict into a single string
+    for i in range(ebm_samples):
+        # Use a random seed for each candidate to ensure variability.
+        seed = np.random.randint(0, 100000)
+        sample_dict = {
+            'markets': safe_sample(df, 5, seed),
+            'industry': safe_sample(df, 5, seed + 1),
+            'sector': safe_sample(df, 5, seed + 2),
+            'stock': safe_sample(df[df['Symbol'] == symbol], 5, seed + 3),
+            'last_8': safe_sample(df, 8, seed + 4),
+            'current': pd.DataFrame([target_row])
+        }
+        # Build candidate context string.
         context_str = format_concatenated_articles(sample_dict)
         candidates.append(context_str)
 
     if not candidates:
         raise ValueError("No candidate contexts could be generated.")
 
-    # Score each candidate with EBM
-    scores = [] # embed each article and context together???
-    device = next(model.parameters()).device  # or e.g. torch.device('cuda')
+    # Score each candidate using the EBM.
+    scores = []
+    device = next(model.parameters()).device
     for ctx in candidates:
         encoding = tokenizer(
             ctx + text,
@@ -280,18 +286,14 @@ def ebm_select_contexts(df, stock, date, text, model, ebm, tokenizer, ebm_sample
             max_length=config.BLOCK_SIZE,
             return_tensors='pt'
         ).to(device)
-
         with torch.no_grad():
-            # Get embeddings from the main model
-            embeddings = model.get_embeddings(encoding['input_ids'])  # shape: [1, embed_dim]
-            # Score with EBM
-            score = ebm(embeddings).item()  # single float
+            embeddings = model.get_embeddings(encoding['input_ids'])
+            score = ebm(embeddings).item()
         scores.append(score)
 
-    # Pick the best (lowest-scoring) context
-    min_idx = scores.index(min(scores))
-    best_context = candidates[min_idx]
+    best_context = candidates[scores.index(min(scores))]
     return best_context
+
 
 def get_model_from_hf(model_repo_id, device):
     """
@@ -750,25 +752,27 @@ def prepare_optimizer(model, args):
 def prepare_data(args, tokenizer):
     """
     Centralized data loading on rank 0, then broadcast to other ranks.
-    Returns a DataLoader and a data_bundle containing df, df_preprocessed.
+    Returns a DataLoader and a data_bundle containing df and df_preprocessed.
     """
     import pandas as pd
     import torch.distributed as dist
     import logging
-    from utils.data import ArticlePriceDataset
+    from utils.data import ArticlePriceDataset, custom_collate_fn
     from torch.utils.data.distributed import DistributedSampler
+    from torch.utils.data import DataLoader
 
     # Check distributed setup
     if dist.is_initialized():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        print(f"Distributed training initialized on rank {rank}.")
+        print("=== Debug Info: prepare_data START ===")
+        print(f"Global rank: {rank}, World size: {world_size}")
     else:
         rank = 0
         world_size = 1
-        print("Single-process (non-distributed) training.")
+        print("Distributed training not initialized.")
 
-    # On rank 0, load the dataset
+    # Only rank 0 loads the data
     if rank == 0:
         df, df_preprocessed = get_data(
             percent_data=args.percent_data,
@@ -793,19 +797,18 @@ def prepare_data(args, tokenizer):
         dist.barrier()
 
     # Convert to DataFrame on each rank
-    if rank != 0 or world_size == 1:
-        df = pd.DataFrame(data_dict["df"])
-        df_preprocessed = pd.DataFrame(data_dict["df_preprocessed"])
-        logging.info(f"Rank {rank}: Received df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
+    df = pd.DataFrame(data_dict["df"])
+    df_preprocessed = pd.DataFrame(data_dict["df_preprocessed"])
+    logging.info(f"Rank {rank}: Received df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
 
     data_bundle = {"df": df, "df_preprocessed": df_preprocessed}
 
-    # Build the dataset
+    # Create the dataset by passing total_epochs and use_ebm as required
     dataset = ArticlePriceDataset(
         df=df,
-        df_preprocessed=df_preprocessed,
         tokenizer=tokenizer,
-        block_size=config.BLOCK_SIZE
+        total_epochs=config.EPOCHS,   # total epochs from config (or args.epochs)
+        use_ebm=args.use_ebm
     )
 
     # Use a DistributedSampler if needed
@@ -831,7 +834,8 @@ def prepare_data(args, tokenizer):
         collate_fn=custom_collate_fn,
         pin_memory=True
     )
-
+    print("=== Debug Info: prepare_data END ===")
+    print(f"Rank {rank}: DataLoader length: {len(dataloader)}")
     return dataloader, data_bundle
 
 def initialize_si(model, args):
