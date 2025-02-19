@@ -240,7 +240,7 @@ def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
     Args:
         df (pd.DataFrame): The dataset to sample from.
         idx (int): The index of the target sample in df.
-        text (str): The article text for which context is being generated.
+        text (str): The article text for which context is generated.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
         tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
@@ -249,17 +249,14 @@ def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
     Returns:
         str: The selected context string.
     """
-    # Get the target row and its stock symbol.
     target_row = df.iloc[idx]
     symbol = target_row['Symbol']
-    
-    # Helper function: safely sample n rows from data using a given seed.
+
     def safe_sample(data, n, seed):
         return data.sample(n=n, random_state=seed) if len(data) >= n else data
 
     candidates = []
     for i in range(ebm_samples):
-        # Use a different random seed for each candidate for variability.
         seed = np.random.randint(0, 100000)
         sample_dict = {
             'markets': safe_sample(df, 5, seed),
@@ -269,27 +266,26 @@ def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
             'last_8': safe_sample(df, 8, seed + 4),
             'current': pd.DataFrame([target_row])
         }
-        # Build candidate context string using the data.py formatting function.
         context_str = format_concatenated_articles(sample_dict)
         candidates.append(context_str)
-    
+
     if not candidates:
         raise ValueError("No candidate contexts could be generated.")
-    
-    # Compute the embedding for the article text once.
+
     device = next(model.parameters()).device
-    article_encoding = tokenizer(
-        text,
-        truncation=True,
-        padding='max_length',
-        max_length=config.BLOCK_SIZE,
-        return_tensors='pt'
-    ).to(device)
-    article_embedding = model.get_embeddings(article_encoding['input_ids'])
-    
+    # Compute article embedding with autocast for FP16 compatibility.
+    with torch.cuda.amp.autocast():
+        article_encoding = tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=config.BLOCK_SIZE,
+            return_tensors='pt'
+        ).to(device)
+        article_embedding = model.get_embeddings(article_encoding['input_ids'])
+
     scores = []
     for ctx in candidates:
-        # Tokenize the candidate context separately.
         context_encoding = tokenizer(
             ctx,
             truncation=True,
@@ -297,15 +293,14 @@ def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
             max_length=config.BLOCK_SIZE,
             return_tensors='pt'
         ).to(device)
-        context_embedding = model.get_embeddings(context_encoding['input_ids'])
-        with torch.no_grad():
-            # Pass both embeddings to the EBM.
+        with torch.cuda.amp.autocast():
+            context_embedding = model.get_embeddings(context_encoding['input_ids'])
             score = ebm(article_embedding, context_embedding).item()
         scores.append(score)
-    
+
     best_context = candidates[scores.index(min(scores))]
     return best_context
-
+    
 def get_model_from_hf(model_repo_id, device):
     """
     Downloads the model configuration and weights from Hugging Face Hub and loads them into the SparseMoELanguageModel.
