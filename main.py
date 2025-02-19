@@ -129,6 +129,7 @@ def upload_checkpoint_to_s3(local_dir: str, bucket: str, remote_dir: str = "mode
         raise
 
 
+# MAIN FUNCTION
 def main():
     pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
     logging.info("pandarallel initialized with parallel_apply.")
@@ -371,7 +372,7 @@ def main():
 
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
-        # For single prediction mode, require stock, date, text, and bucket.
+        # For non-test mode, require stock, date, text, and bucket.
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
 
@@ -409,33 +410,26 @@ def main():
             if not np.issubdtype(df_run['Date'].dtype, np.datetime64):
                 df_run['Date'] = pd.to_datetime(df_run['Date'])
 
-            # Lists to accumulate metrics
             predictions = []
             actuals = []
             oldprices = []
             riskfree = []
             sectors = []
 
-            # Generate predictions for each row in the test set
+            # Loop over each row in the test dataframe.
             for idx, sample in df_run.iterrows():
-                # This is the article text for the current sample
                 sample_text = sample['Article']
-
-                # Use ebm_select_contexts with index-based sampling
-                # (We've updated ebm_select_contexts to accept an 'idx' argument.)
+                # Use ebm_select_contexts with index-based sampling.
                 best_context = ebm_select_contexts(
                     df=df_run,
-                    idx=idx,  # pass the row index
+                    idx=idx,
                     text=sample_text,
                     model=model,
                     ebm=ebm,
                     tokenizer=tokenizer,
                     ebm_samples=args.ebm_num_samples
                 )
-
-                # Concatenate the best context with the article text
                 final_input = f"{best_context}\n{sample_text}"
-
                 encoding = tokenizer(
                     final_input,
                     truncation=True,
@@ -444,19 +438,15 @@ def main():
                     return_tensors="pt"
                 ).to(device)
                 input_ids = encoding["input_ids"]
-
-                with torch.no_grad():
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                     pred, _ = model(input_ids=input_ids)
-
                 predictions.append(pred.item())
-                actuals.append(sample['Price'])       # Ground truth
-                oldprices.append(sample['old_price']) # Past price for trend
-                riskfree.append(sample['risk_free_rate'])
-                sectors.append(sample.get('sector', "Unknown"))
-
+                actuals.append(sample['weighted_avg_720_hrs'])
+                oldprices.append(sample['weighted_avg_0_hrs'])
+                riskfree.append(sample['Risk_Free_Rate'])
+                sectors.append(sample.get('Sector', "Unknown"))
                 print(f"Sample {idx} predicted price: {pred.item()}")
 
-            # Compute overall metrics
             predictions = np.array(predictions)
             actuals = np.array(actuals)
             oldprices = np.array(oldprices)
@@ -490,7 +480,6 @@ def main():
             gross_losses = -strategy_returns[strategy_returns < 0].sum()
             profit_factor = (gross_profits / gross_losses) if gross_losses > 1e-12 else float('inf')
 
-            # Compute per-sector metrics
             merged_sector_data = {}
             for s, p, a, o, r in zip(sectors, predictions, actuals, oldprices, riskfree):
                 if s not in merged_sector_data:
@@ -546,7 +535,6 @@ def main():
                     "profit_factor": sec_profit_factor
                 }
 
-            # Print overall metrics
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -595,7 +583,7 @@ def main():
                 return_tensors="pt"
             ).to(device)
             input_ids = encoding["input_ids"]
-            with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 prediction, _ = model(input_ids=input_ids)
             print(f"Predicted Price: {prediction.item()}")
 
