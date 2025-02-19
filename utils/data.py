@@ -327,6 +327,9 @@ def build_candidate_context_tokens(sample: dict) -> list:
     else:
         tokens += pretokenize_field("N/A") + FIXED_TOKENS["newline"]
 
+    if len(tokens) > config.BLOCK_SIZE:
+        tokens = tokens[-config.BLOCK_SIZE:]
+
     return tokens
 
 def _safe_date_str(date_val):
