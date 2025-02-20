@@ -823,13 +823,13 @@ def prepare_data(args, tokenizer):
             dataset,
             num_replicas=world_size,
             rank=rank,
-            shuffle=(args.mode == "train")
+            shuffle=False
         )
         shuffle_flag = False
     else:
         sampler = None
-        shuffle_flag = (args.mode == "train")
-
+        shuffle_flag = False
+        
     # Build the DataLoader
     dataloader = DataLoader(
         dataset,
