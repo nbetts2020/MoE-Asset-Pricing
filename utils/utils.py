@@ -139,42 +139,53 @@ def get_data_window(streaming_size, overlap, window_index, main_parquet_path, pr
             df_preprocessed[col] = df_preprocessed[col].apply(filter_and_adjust)
     return df, df_preprocessed
 
-def get_data(percent_data=100.0, run=False, update=False, args=None):
+def get_data(percent_data=100.0, args=None):
     """
-    Loads the entire dataset into RAM, then filters/splits as needed.
-    The 'streaming' option is removed, so we *always* load fully into memory.
+    Loads the entire dataset into RAM and performs data engineering.
+    This function loads the raw SC454k dataset and its preprocessed version,
+    drops rows with missing or zero prices, computes the Percentage Change,
+    converts dates, fills missing values, and drops unwanted columns.
+
+    Args:
+        percent_data (float): Percentage of the data to load.
+        args: Command-line arguments (to check mode, if needed).
+
+    Returns:
+        df, df_preprocessed: Fully processed DataFrames.
     """
-    # Load entire SC454k:
+    from datasets import load_dataset
+    import pandas as pd
+
+    # Load entire SC454k and drop rows with missing weighted_avg_720_hrs
     df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
-
-    # Possibly filter out zero prices:
+    # Filter out zero prices
     df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
-
-    # Limit to `percent_data` of total:
+    # Limit to a percentage of the data
     df = df.head(int(len(df) * (percent_data / 100.0)))
 
-    # Load preprocessed version too:
+    # Load the preprocessed dataset and match lengths
     df_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
-    df_preprocessed = df_preprocessed.head(len(df))  # match same length
+    df_preprocessed = df_preprocessed.head(len(df))
 
-    # Extra columns
+    # Data engineering: compute extra columns
     safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
     df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp("1970-01-01"))
     df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
 
-    # Splits
-    split1 = int(len(df) * 0.7)
-    split2 = int(len(df) * 0.85)
-    if args.mode == "train":
-        df = df[:split1]
-        df_preprocessed = df_preprocessed[:split1]
-    elif args.mode == "run":
-        df = df[split1:split2]
-        df_preprocessed = df_preprocessed[split1:split2]
-    elif args.mode == "update":
-        df = df[split2:]
-        df_preprocessed = df_preprocessed[split2:]
+    # Drop unwanted columns: weighted_avg_0.25_hrs, weighted_avg_0.50_hrs, weighted_avg_1_hrs,
+    # weighted_avg_2_hrs, weighted_avg_4_hrs, weighted_avg_6_hrs, weighted_avg_8_hrs,
+    # weighted_avg_12_hrs, weighted_avg_24_hrs, weighted_avg_48_hrs, weighted_avg_72_hrs,
+    # weighted_avg_96_hrs, weighted_avg_360_hrs, and the URL column.
+    drop_columns = [
+        'weighted_avg_0.25_hrs', 'weighted_avg_0.50_hrs', 'weighted_avg_1_hrs',
+        'weighted_avg_2_hrs', 'weighted_avg_4_hrs', 'weighted_avg_6_hrs',
+        'weighted_avg_8_hrs', 'weighted_avg_12_hrs', 'weighted_avg_24_hrs',
+        'weighted_avg_48_hrs', 'weighted_avg_72_hrs', 'weighted_avg_96_hrs',
+        'weighted_avg_360_hrs', 'URL'
+    ]
+    df.drop(columns=drop_columns, errors='ignore', inplace=True)
+    df_preprocessed.drop(columns=drop_columns, errors='ignore', inplace=True)
 
     return df, df_preprocessed
 
@@ -300,7 +311,7 @@ def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
 
     best_context = candidates[scores.index(min(scores))]
     return best_context
-    
+
 def get_model_from_hf(model_repo_id, device):
     """
     Downloads the model configuration and weights from Hugging Face Hub and loads them into the SparseMoELanguageModel.
@@ -757,8 +768,15 @@ def prepare_optimizer(model, args):
 
 def prepare_data(args, tokenizer):
     """
-    Centralized data loading on rank 0, then broadcast to other ranks.
-    Returns a DataLoader and a data_bundle containing df and df_preprocessed.
+    Loads processed data by calling get_data, then splits the data (train/run/update)
+    and creates a DataLoader.
+
+    Args:
+        args: Command-line arguments.
+        tokenizer: Pretrained tokenizer.
+
+    Returns:
+        dataloader, data_bundle: The DataLoader and a dictionary containing the DataFrames.
     """
     import pandas as pd
     import torch.distributed as dist
@@ -767,7 +785,6 @@ def prepare_data(args, tokenizer):
     from torch.utils.data.distributed import DistributedSampler
     from torch.utils.data import DataLoader
 
-    # Check distributed setup
     if dist.is_initialized():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -778,59 +795,46 @@ def prepare_data(args, tokenizer):
         world_size = 1
         print("Distributed training not initialized.")
 
-    # Only rank 0 loads the data
-    if rank == 0:
-        df, df_preprocessed = get_data(
-            percent_data=args.percent_data,
-            run=(args.mode == "run"),
-            update=(args.mode == "update"),
-            args=args
-        )
-        logging.info(f"Rank {rank}: Loaded df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
-        data_dict = {
-            "df": df.to_dict("records"),
-            "df_preprocessed": df_preprocessed.to_dict("records")
-        }
-    else:
-        data_dict = None
+    # Load and process the full dataset
+    df, df_preprocessed = get_data(percent_data=args.percent_data, args=args)
+    logging.info(f"Rank {rank}: Loaded df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
 
-    # Broadcast the loaded data to all ranks
-    if world_size > 1:
-        dist.barrier()
-        object_list = [data_dict]
-        dist.broadcast_object_list(object_list, src=0)
-        data_dict = object_list[0]
-        dist.barrier()
-
-    # Convert to DataFrame on each rank
-    df = pd.DataFrame(data_dict["df"])
-    df_preprocessed = pd.DataFrame(data_dict["df_preprocessed"])
-    logging.info(f"Rank {rank}: Received df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
+    # Chronologically split the data according to mode
+    split1 = int(len(df) * 0.7)
+    split2 = int(len(df) * 0.85)
+    if args.mode == "train":
+        df = df[:split1]
+        df_preprocessed = df_preprocessed[:split1]
+    elif args.mode == "run":
+        df = df[split1:split2]
+        df_preprocessed = df_preprocessed[split1:split2]
+    elif args.mode == "update":
+        df = df[split2:]
+        df_preprocessed = df_preprocessed[split2:]
 
     data_bundle = {"df": df, "df_preprocessed": df_preprocessed}
 
-    # Create the dataset by passing total_epochs and use_ebm as required
+    # Create the dataset instance
     dataset = ArticlePriceDataset(
         df=df,
         tokenizer=tokenizer,
-        total_epochs=config.EPOCHS,   # total epochs from config (or args.epochs)
+        total_epochs=config.EPOCHS,
         use_ebm=args.use_ebm
     )
 
-    # Use a DistributedSampler if needed
+    # Use DistributedSampler if applicable
     if world_size > 1:
         sampler = DistributedSampler(
             dataset,
             num_replicas=world_size,
             rank=rank,
-            shuffle=False
+            shuffle=False  # Chronological order
         )
         shuffle_flag = False
     else:
         sampler = None
         shuffle_flag = False
-        
-    # Build the DataLoader
+
     dataloader = DataLoader(
         dataset,
         batch_size=config.BATCH_SIZE,
