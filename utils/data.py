@@ -427,51 +427,40 @@ def parallel_context_generation_worker(args):
 # -------------------------------------------------------------------------
 # DATASET/LOADER CLASSES
 # -------------------------------------------------------------------------
+import pyarrow.parquet as pq
+
 class ArticlePriceDataset(Dataset):
     """
-    Dataset that loads the full DataFrame into memory and pre-tokenizes each article.
-    This replaces the previous rolling-window dataset.
+    Dataset that loads the DataFrame from a parquet file using memory mapping.
     """
-    def __init__(self, df: pd.DataFrame, tokenizer: AutoTokenizer, total_epochs: int, use_ebm: bool = False):
-        """
-        Args:
-            df (pd.DataFrame): DataFrame containing at least these columns:
-                'Article', 'weighted_avg_720_hrs', 'weighted_avg_0_hrs', 'Sector',
-                'Date', 'RelatedStocksList', 'Symbol', 'Industry', 'Risk_Free_Rate'
-            tokenizer: Pretrained tokenizer (e.g. GPT2).
-            total_epochs (int): Total number of training epochs.
-            use_ebm (bool): Whether EBM sampling is enabled.
-        """
+    def __init__(self, df, tokenizer: AutoTokenizer, total_epochs: int, use_ebm: bool = False):
+        # Here, df is already loaded via pd.read_parquet (which uses pyarrow's memory mapping internally).
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.total_epochs = total_epochs
         self.use_ebm = use_ebm
-
-        logger.info("Pre-tokenizing all articles in ArticlePriceDataset...")
-        # Pre-tokenize each article and store the tokenized tensors.
-        self.tokenized_articles = []
-        articles = self.df['Article'].tolist()
-        for article in tqdm(articles, desc="Pre-tokenizing", unit="article"):
-            encoding = self.tokenizer(
-                article,
-                truncation=True,
-                padding='max_length',
-                max_length=config.BLOCK_SIZE,
-                return_tensors='pt'
-            )
-            # Squeeze out the batch dimension
-            self.tokenized_articles.append(encoding['input_ids'].squeeze(0))
+        # Remove the full pre-tokenizing step; instead, tokenize on the fly and cache.
+        self.tokenized_cache = {}
+        logger.info("ArticlePriceDataset initialized with on-demand tokenization.")
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        """
-        Returns a dictionary for one sample.
-        """
         row = self.df.iloc[idx]
-        # Retrieve the pre-tokenized article
-        input_ids = self.tokenized_articles[idx]
+        # Use on-demand tokenization with caching.
+        if idx in self.tokenized_cache:
+            input_ids = self.tokenized_cache[idx]
+        else:
+            encoding = self.tokenizer(
+                row['Article'],
+                truncation=True,
+                padding='max_length',
+                max_length=config.BLOCK_SIZE,
+                return_tensors='pt'
+            )
+            input_ids = encoding['input_ids'].squeeze(0)
+            self.tokenized_cache[idx] = input_ids
 
         future_price = row.get('weighted_avg_720_hrs', 0.0)
         old_price    = row.get('weighted_avg_0_hrs', 0.0)
