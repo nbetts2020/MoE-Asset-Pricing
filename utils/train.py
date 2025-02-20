@@ -127,9 +127,10 @@ def train_model(
                         cpu_args_list.append((idx_val, df, df_preprocessed, epochs, epoch, context_count))
                     # Process in parallel using imap_unordered.
                     results = pool.imap_unordered(parallel_context_generation_worker, cpu_args_list)
-                    # Expect each result as a tuple: (idx, candidate_contexts)
-                    all_contexts_unsorted = list(results)
-                    all_contexts_batch = [contexts for _, contexts in sorted(all_contexts_unsorted, key=lambda x: x[0])]
+                    results_dict = {}
+                    for idx, contexts in results:
+                        results_dict[idx] = contexts
+                    all_contexts_batch = [results_dict[i] for i in sorted(results_dict.keys())]
                     wrapped_model = get_wrapped_model(model)
                     ebm_losses = []
                     for i in range(B):
