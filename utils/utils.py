@@ -97,48 +97,7 @@ def get_total_rows(parquet_path):
     # Read only the metadata (no columns) to get the number of rows
     table = pq.read_table(parquet_path, columns=[])
     return table.num_rows
-
-def get_data_window(streaming_size, overlap, window_index, main_parquet_path, preprocessed_parquet_path):
-    """
-    Loads a rolling window (subset) of the data from the given parquet files.
-    The window is determined by:
-       window_start = window_index * (streaming_size - overlap)
-       window_end = window_start + streaming_size
-    After loading, for the preprocessed DataFrame we filter out indices that fall outside the window range,
-    then subtract an offset (window_index * streaming_size) from each index so that they are relative
-    to the current window.
-    """
-    print("POOOOOOOOOOOO")
-    total_rows = 453932
-    window_start = window_index * (streaming_size - overlap)
-    window_end = min(window_start + streaming_size, total_rows)
-    logger.info(f"Loading rows {window_start} to {window_end} (window index {window_index}).")
-
-    # Always read the full table and then slice, since row_slice is not supported.
-    main_table = pq.read_table(main_parquet_path).slice(window_start, window_end - window_start)
-    pre_table = pq.read_table(preprocessed_parquet_path).slice(window_start, window_end - window_start)
-
-    df = main_table.to_pandas()
-    df_preprocessed = pre_table.to_pandas()
-
-    # Define the offset to subtract from each reference index.
-    offset = window_index * streaming_size
-
-    # Filter and adjust the preprocessed index lists so that only indices within the global window are kept,
-    # and then subtract the offset to yield relative indices.
-    index_columns = ["use_ebm_economic", "use_ebm_industry", "use_ebm_sector", "use_ebm_historical", "use_ebm_top25"]
-    for col in index_columns:
-        if col in df_preprocessed.columns:
-            def filter_and_adjust(cell):
-                if isinstance(cell, (list, np.ndarray)):
-                    print("BBBBBBBBB")
-                    return [int(x) - offset for x in cell if window_start <= int(x) < window_end]
-                else:
-                    print("AAAAAAAAAAAAAAAAAA")
-                    return cell
-            df_preprocessed[col] = df_preprocessed[col].apply(filter_and_adjust)
-    return df, df_preprocessed
-
+    
 def get_data(percent_data=100.0, args=None):
     """
     Loads the entire dataset into RAM and performs data engineering.
