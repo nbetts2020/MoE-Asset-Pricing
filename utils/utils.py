@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.nn import init
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
+from muon import Muon
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -98,56 +99,45 @@ def get_total_rows(parquet_path):
     table = pq.read_table(parquet_path, columns=[])
     return table.num_rows
     
-def get_data(percent_data=100.0, args=None):
+def get_data(epoch, window_index, global_offset, global_max, args=None):
     """
-    Loads the entire dataset into RAM and performs data engineering.
-    This function loads the raw SC454k dataset and its preprocessed version,
-    drops rows with missing or zero prices, computes the Percentage Change,
-    converts dates, fills missing values, and drops unwanted columns.
+    Loads a chunk of the train data (main only) from Hugging Face, building the file name
+    as "train_dataset_{window_index}{epoch_letter}.parquet". Uses global_offset/global_max
+    to limit how many rows are returned (partial data logic).
 
     Args:
-        percent_data (float): Percentage of the data to load.
-        args: Command-line arguments (to check mode, if needed).
+        epoch (int): 1 -> 'a', 2 -> 'b', etc.
+        window_index (int): 1..13
+        global_offset (int): number of rows used so far
+        global_max (int): total row limit
+        args: optional arguments for e.g. filters
 
     Returns:
-        df, df_preprocessed: Fully processed DataFrames.
+        df: DataFrame with up to (global_max - global_offset) rows from that chunk
     """
-    from datasets import load_dataset
-    import pandas as pd
+    # Convert epoch to a letter (1->'a', 2->'b', etc.)
+    epoch_letter = chr(ord('a') + epoch - 1)
+    filename = f"train_dataset_{window_index}{epoch_letter}.parquet"
 
-    # Load entire SC454k and drop rows with missing weighted_avg_720_hrs
-    df = load_dataset("nbettencourt/SC454k")['train'].to_pandas().dropna(subset=['weighted_avg_720_hrs'])
-    # Filter out zero prices
+    repo_id = "nbettencourt/sc454k-preprocessed-dfs"
+    file_path = hf_hub_download(repo_id=repo_id, filename=filename)
+
+    # Load data
+    df = pd.read_parquet(file_path).dropna(subset=['weighted_avg_720_hrs'])
     df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
-    # Limit to a percentage of the data
-    df = df.head(int(len(df) * (percent_data / 100.0)))
 
-    # Load the preprocessed dataset and match lengths
-    df_preprocessed = load_dataset("nbettencourt/SC454k-preprocessed")['train'].to_pandas()
-    df_preprocessed = df_preprocessed.head(len(df))
+    # If we've already hit the global_max, return empty
+    if global_offset >= global_max:
+        return pd.DataFrame()
 
-    # Data engineering: compute extra columns
-    safe_div = df['weighted_avg_720_hrs'].replace(0, pd.NA)
-    df['Percentage Change'] = (df['weighted_avg_0_hrs'] - safe_div) / safe_div
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp("1970-01-01"))
-    df['RelatedStocksList'] = df['RelatedStocksList'].fillna('')
+    chunk_rows = len(df)
+    # If adding this chunk would exceed the global_max, truncate
+    if global_offset + chunk_rows > global_max:
+        needed = global_max - global_offset
+        df = df.iloc[:needed]
 
-    # Drop unwanted columns: weighted_avg_0.25_hrs, weighted_avg_0.50_hrs, weighted_avg_1_hrs,
-    # weighted_avg_2_hrs, weighted_avg_4_hrs, weighted_avg_6_hrs, weighted_avg_8_hrs,
-    # weighted_avg_12_hrs, weighted_avg_24_hrs, weighted_avg_48_hrs, weighted_avg_72_hrs,
-    # weighted_avg_96_hrs, weighted_avg_360_hrs, and the URL column.
-    drop_columns = [
-        'weighted_avg_0.25_hrs', 'weighted_avg_0.50_hrs', 'weighted_avg_1_hrs',
-        'weighted_avg_2_hrs', 'weighted_avg_4_hrs', 'weighted_avg_6_hrs',
-        'weighted_avg_8_hrs', 'weighted_avg_12_hrs', 'weighted_avg_24_hrs',
-        'weighted_avg_48_hrs', 'weighted_avg_72_hrs', 'weighted_avg_96_hrs',
-        'weighted_avg_360_hrs', 'URL'
-    ]
-    df.drop(columns=drop_columns, errors='ignore', inplace=True)
-    df_preprocessed.drop(columns=drop_columns, errors='ignore', inplace=True)
-
-    return df, df_preprocessed
-
+    return df
+    
 def get_new_data(new_data_url):
     load_dotenv('/content/MoE-Asset-Pricing/.env')
     hf_token = os.getenv('HF_TOKEN')
@@ -204,73 +194,52 @@ def download_models_from_s3(bucket):
 
 def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
     """
-    Generates and selects the best context based on EBM scoring for a given sample index,
-    using data.py's formatting logic to build candidate contexts.
-
+    For the sample at the given index, select the best context from the precomputed candidate columns.
+    It assumes candidate context strings are stored in columns "iteration_1_text" ... "iteration_30_text".
+    
     Args:
-        df (pd.DataFrame): The dataset to sample from.
-        idx (int): The index of the target sample in df.
-        text (str): The article text for which context is generated.
+        df (pd.DataFrame): DataFrame containing the test samples with candidate context columns.
+        idx (int): Index of the target sample in df.
+        text (str): (Unused) The article text.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
         tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
-        ebm_samples (int): Number of candidate contexts to generate.
-
+        ebm_samples (int): Number of candidate contexts to sample (max 30).
+        
     Returns:
-        str: The selected context string.
+        str: The candidate context with energy closest to zero.
     """
-    target_row = df.iloc[idx]
-    symbol = target_row['Symbol']
-
-    def safe_sample(data, n, seed):
-        return data.sample(n=n, random_state=seed) if len(data) >= n else data
-
-    candidates = []
-    for i in range(ebm_samples):
-        seed = np.random.randint(0, 100000)
-        sample_dict = {
-            'markets': safe_sample(df, 5, seed),
-            'industry': safe_sample(df, 5, seed + 1),
-            'sector': safe_sample(df, 5, seed + 2),
-            'stock': safe_sample(df[df['Symbol'] == symbol], 5, seed + 3),
-            'last_8': safe_sample(df, 8, seed + 4),
-            'current': pd.DataFrame([target_row])
-        }
-        context_str = format_concatenated_articles(sample_dict)
-        candidates.append(context_str)
-
+    row = df.iloc[idx]
+    # Extract candidate texts from columns iteration_1_text through iteration_30_text.
+    candidates = [row.get(f"iteration_{i}_text") for i in range(1, 31) if row.get(f"iteration_{i}_text") is not None]
     if not candidates:
-        raise ValueError("No candidate contexts could be generated.")
+        raise ValueError("No candidate contexts found for this sample.")
+    
+    # Sample candidates if there are more than ebm_samples available.
+    if len(candidates) > ebm_samples:
+        sampled_candidates = random.sample(candidates, ebm_samples)
+    else:
+        sampled_candidates = candidates
 
+    candidate_energies = []
     device = next(model.parameters()).device
-    # Compute article embedding with autocast for FP16 compatibility.
-    with torch.cuda.amp.autocast():
-        article_encoding = tokenizer(
-            text,
+    for candidate in sampled_candidates:
+        encoding = tokenizer(
+            candidate,
             truncation=True,
-            padding='max_length',
+            padding="max_length",
             max_length=config.BLOCK_SIZE,
-            return_tensors='pt'
+            return_tensors="pt"
         ).to(device)
-        article_embedding = model.get_embeddings(article_encoding['input_ids'])
-
-    scores = []
-    for ctx in candidates:
-        context_encoding = tokenizer(
-            ctx,
-            truncation=True,
-            padding='max_length',
-            max_length=config.BLOCK_SIZE,
-            return_tensors='pt'
-        ).to(device)
-        with torch.cuda.amp.autocast():
-            context_embedding = model.get_embeddings(context_encoding['input_ids'])
-            score = ebm(article_embedding, context_embedding).item()
-        scores.append(score)
-
-    best_context = candidates[scores.index(min(scores))]
+        emb = model.get_embeddings(encoding["input_ids"]).half()  # (1, embedding_dim)
+        energy = ebm(emb).item()  # (1,) -> scalar
+        candidate_energies.append(energy)
+    
+    # Select the candidate whose energy (absolute value) is closest to zero.
+    best_idx = np.argmin([abs(e) for e in candidate_energies])
+    best_context = sampled_candidates[best_idx]
     return best_context
-
+    
 def get_model_from_hf(model_repo_id, device):
     """
     Downloads the model configuration and weights from Hugging Face Hub and loads them into the SparseMoELanguageModel.
@@ -646,167 +615,78 @@ def initialize_model(args, device, init_from_scratch=False):
 
 def prepare_optimizer(model, args):
     """
-    Prepares the optimizer with layer-wise learning rate decay and optional weight decay (L2 regularization).
+    Prepares a hybrid optimizer: 
+      - Uses AdamW (or DeepSpeed’s CPUAdam if desired) for low-dimensional parameters (embeddings, regression head, etc.)
+      - Uses Muon for high-dimensional parameters from the transformer blocks.
     """
     LR_DECAY = config.LR_DECAY
     LEARNING_RATE = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
 
-    param_groups = []
+    adam_param_groups = []
+    muon_params = []
 
-    # Embedding parameters
+    # Embedding parameters (optimize with AdamW)
     embedding_params_with_decay = []
     embedding_params_without_decay = []
-
     for name, param in list(model.token_embedding_table.named_parameters()) + list(model.position_embedding_table.named_parameters()):
         if param.requires_grad:
             if name.endswith('bias') or 'LayerNorm.weight' in name:
                 embedding_params_without_decay.append(param)
             else:
                 embedding_params_with_decay.append(param)
-
-    param_groups.append({
+    adam_param_groups.append({
         'params': embedding_params_with_decay,
         'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
         'weight_decay': weight_decay
     })
-    param_groups.append({
+    adam_param_groups.append({
         'params': embedding_params_without_decay,
         'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
         'weight_decay': 0.0
     })
 
-    # Regression head parameters
+    # Regression head parameters (optimize with AdamW)
     reg_params_with_decay = []
     reg_params_without_decay = []
-
     for name, param in model.regression_head.named_parameters():
         if param.requires_grad:
             if name.endswith('bias') or 'LayerNorm.weight' in name:
                 reg_params_without_decay.append(param)
             else:
                 reg_params_with_decay.append(param)
-
-    param_groups.append({
+    adam_param_groups.append({
         'params': reg_params_with_decay,
         'lr': LEARNING_RATE,
         'weight_decay': weight_decay
     })
-    param_groups.append({
+    adam_param_groups.append({
         'params': reg_params_without_decay,
         'lr': LEARNING_RATE,
         'weight_decay': 0.0
     })
 
-    # Block parameters with layer-wise learning rate decay
-    for i, block in enumerate(model.blocks):
-        block_params_with_decay = []
-        block_params_without_decay = []
+    # Block parameters (optimize with Muon)
+    # Assume all parameters in model.blocks are high-dimensional.
+    for block in model.blocks:
         for name, param in block.named_parameters():
             if param.requires_grad:
-                if name.endswith('bias') or 'LayerNorm.weight' in name:
-                    block_params_without_decay.append(param)
-                else:
-                    block_params_with_decay.append(param)
-        lr = LEARNING_RATE * (LR_DECAY ** (len(model.blocks) - i))
-        param_groups.append({
-            'params': block_params_with_decay,
-            'lr': lr,
-            'weight_decay': weight_decay
-        })
-        param_groups.append({
-            'params': block_params_without_decay,
-            'lr': lr,
-            'weight_decay': 0.0
-        })
+                muon_params.append(param)
 
-    # Replace standard AdamW with DeepSpeed's CPUAdam when using ZeRO-Offload.
-    optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE)
-    logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
-    return optimizer
-
-def prepare_data(args, tokenizer):
-    """
-    Loads processed data by calling get_data, then splits the data (train/run/update)
-    and creates a DataLoader.
-
-    Args:
-        args: Command-line arguments.
-        tokenizer: Pretrained tokenizer.
-
-    Returns:
-        dataloader, data_bundle: The DataLoader and a dictionary containing the DataFrames.
-    """
-    import pandas as pd
-    import torch.distributed as dist
-    import logging
-    from utils.data import ArticlePriceDataset, custom_collate_fn
-    from torch.utils.data.distributed import DistributedSampler
-    from torch.utils.data import DataLoader
-
-    if dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        print("=== Debug Info: prepare_data START ===")
-        print(f"Global rank: {rank}, World size: {world_size}")
-    else:
-        rank = 0
-        world_size = 1
-        print("Distributed training not initialized.")
-
-    # Load and process the full dataset
-    df, df_preprocessed = get_data(percent_data=args.percent_data, args=args)
-    logging.info(f"Rank {rank}: Loaded df shape {df.shape}, df_preprocessed shape {df_preprocessed.shape}.")
-
-    # Chronologically split the data according to mode
-    split1 = int(len(df) * 0.7)
-    split2 = int(len(df) * 0.85)
-    if args.mode == "train":
-        df = df[:split1]
-        df_preprocessed = df_preprocessed[:split1]
-    elif args.mode == "run":
-        df = df[split1:split2]
-        df_preprocessed = df_preprocessed[split1:split2]
-    elif args.mode == "update":
-        df = df[split2:]
-        df_preprocessed = df_preprocessed[split2:]
-
-    data_bundle = {"df": df, "df_preprocessed": df_preprocessed}
-
-    # Create the dataset instance
-    dataset = ArticlePriceDataset(
-        df=df,
-        tokenizer=tokenizer,
-        total_epochs=config.EPOCHS,
-        use_ebm=args.use_ebm
+    # Create the AdamW optimizer for the non-block parameters.
+    # (You could replace torch.optim.AdamW with DeepSpeedCPUAdam if desired.)
+    adam_optimizer = torch.optim.AdamW(
+        [p for group in adam_param_groups for p in group['params']],
+        lr=LEARNING_RATE,
+        weight_decay=weight_decay
     )
 
-    # Use DistributedSampler if applicable
-    if world_size > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False  # Chronological order
-        )
-        shuffle_flag = False
-    else:
-        sampler = None
-        shuffle_flag = False
+    # Create the Muon optimizer for block parameters.
+    muon_optimizer = Muon(muon_params, lr=LEARNING_RATE, momentum=0.95)
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=shuffle_flag,
-        sampler=sampler,
-        num_workers=0,
-        collate_fn=custom_collate_fn,
-        pin_memory=True
-    )
-    print("=== Debug Info: prepare_data END ===")
-    print(f"Rank {rank}: DataLoader length: {len(dataloader)}")
-    return dataloader, data_bundle
-
+    logging.info("Initialized hybrid optimizer: Muon for block parameters and AdamW for embeddings and head.")
+    return adam_optimizer, muon_optimizer
+    
 def initialize_si(model, args):
     """
     Initializes Synaptic Intelligence (SI) if specified.
@@ -999,9 +879,11 @@ def evaluate_model(model, dataloader, device):
         profit_factor (float): Profit factor.
     """
     import torch.distributed as dist
+    from sklearn.metrics import mean_squared_error, r2_score
+    from tqdm import tqdm
     model.eval()
 
-    # Local overall data
+    # Initialize overall accumulators.
     local_overall = {
         "predictions": [],
         "actuals": [],
@@ -1009,8 +891,6 @@ def evaluate_model(model, dataloader, device):
         "riskfree": []
     }
     sectors_list = []
-
-    # Local per-sector data (same as before)
     local_sector_data = {}
 
     with torch.no_grad():
@@ -1018,7 +898,7 @@ def evaluate_model(model, dataloader, device):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
             old_prices = batch['old_price'].to(device)
-            sectors = batch['sector']
+            sectors = batch['sector']  # assume sectors come as a list
             risk_free_rate = batch['risk_free_rate'].to(device)
 
             with torch.amp.autocast(device_type='cuda'):
@@ -1048,7 +928,7 @@ def evaluate_model(model, dataloader, device):
                 local_sector_data[sector]["oldprices"].append(old_prices_np[i])
                 local_sector_data[sector]["riskfree"].append(rf_np[i])
 
-    # Merge overall data from all GPUs if using DDP
+    # Merge overall data from all GPUs if using DDP.
     if dist.is_initialized():
         world_size = dist.get_world_size()
         gathered_overall = [None for _ in range(world_size)]
@@ -1062,7 +942,7 @@ def evaluate_model(model, dataloader, device):
     else:
         merged_overall = local_overall
 
-    # Compute overall metrics from merged data
+    # Compute overall metrics.
     predictions = np.array(merged_overall["predictions"])
     actuals = np.array(merged_overall["actuals"])
     oldprice_arr = np.array(merged_overall["oldprices"])
@@ -1097,7 +977,7 @@ def evaluate_model(model, dataloader, device):
     gross_losses = -strategy_returns[strategy_returns < 0].sum()
     profit_factor = (gross_profits / gross_losses) if gross_losses > 1e-12 else float('inf')
 
-    # Merge per-sector data across GPUs
+    # Merge per-sector data across GPUs.
     if dist.is_initialized():
         world_size = dist.get_world_size()
         gathered_sector_data = [None for _ in range(world_size)]
@@ -1162,15 +1042,15 @@ def evaluate_model(model, dataloader, device):
 
     model.train()
     return (
-        mse,             # 0
-        r2,              # 1
-        sector_metrics,  # 2
-        overall_trend_acc,  # 3
-        sharpe_ratio,    # 4
-        sortino_ratio,   # 5
-        average_return,  # 6
-        win_rate,        # 7
-        profit_factor    # 8
+        mse,             # Mean Squared Error
+        r2,              # R² Score
+        sector_metrics,  # Per-sector metrics
+        overall_trend_acc,  # Overall trend accuracy
+        sharpe_ratio,    # Sharpe Ratio
+        sortino_ratio,   # Sortino Ratio
+        average_return,  # Average Return
+        win_rate,        # Win Rate
+        profit_factor    # Profit Factor
     )
 
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
@@ -1244,3 +1124,53 @@ def initialize_replay_buffer(args):
         else:
             logging.info("No existing Memory Replay Buffer found. Starting fresh.")
     return replay_buffer
+
+def consolidate_checkpoint_to_pth(checkpoint_dir: str, tag: str, output_path: str) -> str:
+    import shutil
+    import tempfile
+    from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
+
+    final_path = os.path.join(output_path, f"consolidated_{tag}.pth")
+    if os.path.exists(final_path):
+        if os.path.isdir(final_path):
+            shutil.rmtree(final_path)
+        else:
+            os.remove(final_path)
+
+    temp_dir = tempfile.mkdtemp(prefix="ds_conversion_")
+    logging.info(f"Converting checkpoint from base_dir='{checkpoint_dir}', tag='{tag}'")
+    convert_zero_checkpoint_to_fp32_state_dict(
+        checkpoint_dir,
+        temp_dir,
+        tag=tag
+    )
+
+    converted_bin = os.path.join(temp_dir, "pytorch_model.bin")
+    if not os.path.isfile(converted_bin):
+        shutil.rmtree(temp_dir)
+        raise RuntimeError(f"Conversion failed; {converted_bin} not found.")
+
+    shutil.move(converted_bin, final_path)
+    shutil.rmtree(temp_dir)
+
+    if not os.path.isfile(final_path):
+        raise RuntimeError(f"Failed to create consolidated checkpoint file at {final_path}")
+
+    logging.info(f"Successfully created consolidated checkpoint at {final_path}")
+    return final_path
+
+def upload_checkpoint_to_s3(local_dir: str, bucket: str, remote_dir: str = "model"):
+    try:
+        logging.info(f"Uploading checkpoint from {local_dir} to s3://{bucket}/{remote_dir}")
+        result = subprocess.run(
+            ["aws", "s3", "sync", local_dir, f"s3://{bucket}/{remote_dir}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        logging.info(f"Checkpoint directory synchronized successfully.\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error syncing checkpoint directory: {e.stderr}")
+        raise
+
