@@ -9,12 +9,11 @@ from multiprocessing import Pool, cpu_count
 import math
 import sys
 
-import deepspeed  # NEW
+import deepspeed
 
 from sklearn.metrics import mean_squared_error, r2_score
 from utils.config import config
-from utils.data import parallel_context_generation_worker, GLOBAL_TOKENIZER
-from utils.utils import compute_l2_loss, load_checkpoint, prepare_dataloader
+from utils.utils import compute_l2_loss, load_checkpoint, prepare_dataloader, get_wrapped_model
 import torch.distributed as dist
 
 logging.basicConfig(
@@ -27,9 +26,7 @@ logging.basicConfig(
 )
 
 def get_wrapped_model(model):
-    """
-    Returns the underlying model whether it's wrapped with DistributedDataParallel or not.
-    """
+    """Returns the underlying model if wrapped by DistributedDataParallel."""
     return model.module if hasattr(model, 'module') else model
 
 def train_model(
@@ -37,19 +34,16 @@ def train_model(
     optimizer,
     epochs,
     device,
-    dataloader,  # DataLoader built from the full in-memory dataset.
+    dataloader,  # DataLoader built from the precomputed dataset.
     args,
     si=None,
     ewc=None,
     replay_buffer=None,
-    df=None,
-    df_preprocessed=None,
     ebm=None,
     ebm_optimizer=None,
     tokenizer=None,
     use_deepspeed=False
 ):
-    # Enable cuDNN autotuning.
     torch.backends.cudnn.benchmark = True
     start_epoch = 0
     if hasattr(args, 'checkpoint_path') and args.checkpoint_path and os.path.isfile(args.checkpoint_path):
@@ -64,19 +58,23 @@ def train_model(
         logging.info(f"Resumed training from epoch {start_epoch + 1}")
     else:
         logging.info("No checkpoint found or checkpoint path missing. Starting from scratch.")
+    
     if ebm:
         ebm.train()
     model.train()
-    logging.info("Main model set to train mode.")
+    logging.info("Set main model to train mode.")
+    
     scaler = None
     if not use_deepspeed:
         from torch.cuda.amp import GradScaler
         scaler = GradScaler()
+    
     best_loss = float('inf')
     epochs_no_improve = 0
     patience = getattr(args, 'early_stopping_patience', 5)
     logging.info(f"Early stopping patience: {patience} epochs.")
 
+    # If needed, create a multiprocessing Pool (if any CPU work is still needed)
     max_workers = max(cpu_count() - 1, 1)
     pool = Pool(processes=max_workers)
     logging.debug(f"Created multiprocessing Pool with {max_workers} workers.")
@@ -84,6 +82,7 @@ def train_model(
     total_epoch_batches = len(dataloader)
     if torch.cuda.device_count() > 1:
         logging.info(f"Total batches per epoch: {total_epoch_batches}")
+
     for epoch in range(start_epoch, epochs):
         logging.info(f"==== Epoch {epoch+1}/{epochs} ====")
         total_loss = 0.0
@@ -98,8 +97,7 @@ def train_model(
                               ascii=True, dynamic_ncols=False, ncols=120)
             sys.stdout.flush()
 
-        context_count = 8
-
+        # Process each batch
         for batch_idx, batch in enumerate(dataloader):
             if not use_deepspeed:
                 optimizer.zero_grad()
@@ -110,8 +108,6 @@ def train_model(
 
             main_ids = batch['input_ids'].to(device, dtype=torch.long)
             future_vals = batch['labels'].to(device, dtype=torch.float16)
-            sector_list = batch.get('sector', None)
-            idx_list = batch.get('idx', None)
             B = main_ids.size(0)
 
             if future_vals.dim() == 2 and future_vals.size(1) == 1:
@@ -120,55 +116,16 @@ def train_model(
                 future_vals = future_vals.view(-1)
 
             with amp.autocast(device_type='cuda', dtype=torch.float16):
+                # If using EBM, compute an auxiliary loss.
                 ebm_loss = None
-                if ebm and idx_list is not None:
-                    cpu_args_list = []
-                    for idx_val in idx_list:
-                        cpu_args_list.append((idx_val, df, df_preprocessed, epochs, epoch, context_count))
-                    # Process in parallel using imap_unordered.
-                    results = pool.imap_unordered(parallel_context_generation_worker, cpu_args_list)
-                    results_dict = {}
-                    for idx, contexts in results:
-                        results_dict[idx] = contexts
-                    all_contexts_batch = [results_dict[i] for i in sorted(results_dict.keys())]
-                    wrapped_model = get_wrapped_model(model)
-                    ebm_losses = []
-                    for i in range(B):
-                        candidate_contexts = all_contexts_batch[i]
-                        if not candidate_contexts:
-                            continue
-                        candidate_tensors_list = []
-                        # Assume each candidate is already a list of token IDs.
-                        for candidate in candidate_contexts:
-                            try:
-                                candidate_tensor = torch.tensor(candidate, dtype=torch.long)
-                                candidate_tensors_list.append(candidate_tensor)
-                            except Exception as e:
-                                logging.error(f"Error converting candidate to tensor: {e}")
-                                continue
-                        if not candidate_tensors_list:
-                            continue
-                        try:
-                            candidate_tensors = torch.stack(candidate_tensors_list, dim=0).to(device, dtype=torch.long)
-                        except Exception as e:
-                            logging.error(f"Error stacking candidate tensors: {e}")
-                            continue
-                        with torch.no_grad():
-                            context_embs = wrapped_model.get_embeddings(candidate_tensors).half()
-                            main_emb = wrapped_model.get_embeddings(main_ids[i].unsqueeze(0)).half()
-                            main_emb = main_emb.repeat(candidate_tensors.size(0), 1)
-                        context_embs = context_embs.detach()
-                        main_emb = main_emb.detach()
-                        try:
-                            wrapped_ebm = get_wrapped_model(ebm)
-                            pred_mse = wrapped_ebm(main_emb, context_embs).float()
-                            ebm_loss_i = torch.mean(pred_mse**2)
-                            ebm_losses.append(ebm_loss_i)
-                        except Exception as e:
-                            logging.error(f"Error in EBM forward pass: {e}")
-                            continue
-                    if ebm_losses:
-                        ebm_loss = torch.stack(ebm_losses).mean()
+                if ebm is not None:
+                    wrapped_ebm = get_wrapped_model(ebm)
+                    # Compute full embedding for the batch; this represents the combined text.
+                    full_emb = get_wrapped_model(model).get_embeddings(main_ids).half()
+                    energy = wrapped_ebm(full_emb)  # (batch_size,)
+                    # Use the mean squared energy as an auxiliary loss.
+                    ebm_loss = torch.mean(energy**2)
+                
                 outputs, main_loss = model(input_ids=main_ids, targets=future_vals)
                 if si:
                     try:
@@ -192,6 +149,7 @@ def train_model(
                         logging.debug(f"Added L2 loss: {l2_loss.item():.4f}")
                     except Exception as e:
                         logging.error(f"Error adding L2 loss: {e}")
+                
                 total_loss_batch = main_loss
                 if ebm_loss is not None:
                     total_loss_batch += ebm_loss
@@ -207,20 +165,18 @@ def train_model(
             if ebm and ebm_optimizer:
                 ebm_optimizer.step()
 
-            # --- Memory Replay Buffer update ---
+            # Update memory replay buffer if used.
             if replay_buffer:
                 replay_samples = []
                 for i in range(B):
                     replay_samples.append({
                         'input_ids': main_ids[i].detach().cpu(),
-                        'labels': future_vals[i].detach().cpu(),
-                        'sector': sector_list[i] if sector_list else 'Unknown'
+                        'labels': future_vals[i].detach().cpu()
                     })
                 try:
                     replay_buffer.add_examples(replay_samples, [0] * B)
                 except Exception as e:
                     logging.error(f"Error adding to replay buffer: {e}")
-            # --- End Replay Buffer update ---
 
             optimizer.zero_grad()
             if ebm and ebm_optimizer:
