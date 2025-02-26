@@ -31,7 +31,7 @@ def get_wrapped_model(model):
 
 def train_model(
     model,
-    optimizer,
+    optimizers,   # Now a tuple: (adam_optimizer, muon_optimizer)
     epochs,
     device,
     dataloader,  # DataLoader built from the precomputed dataset.
@@ -46,11 +46,12 @@ def train_model(
 ):
     torch.backends.cudnn.benchmark = True
     start_epoch = 0
+    # Load checkpoint if available.
     if hasattr(args, 'checkpoint_path') and args.checkpoint_path and os.path.isfile(args.checkpoint_path):
         logging.info(f"Loading checkpoint from {args.checkpoint_path}")
         start_epoch = load_checkpoint(
             model,
-            optimizer,
+            optimizers,
             ebm if (ebm and getattr(args, 'use_ebm', False)) else None,
             ebm_optimizer if (ebm and getattr(args, 'use_ebm', False)) else None,
             args.checkpoint_path
@@ -58,23 +59,22 @@ def train_model(
         logging.info(f"Resumed training from epoch {start_epoch + 1}")
     else:
         logging.info("No checkpoint found or checkpoint path missing. Starting from scratch.")
-    
+
     if ebm:
         ebm.train()
     model.train()
     logging.info("Set main model to train mode.")
-    
+
     scaler = None
     if not use_deepspeed:
         from torch.cuda.amp import GradScaler
         scaler = GradScaler()
-    
+
     best_loss = float('inf')
     epochs_no_improve = 0
     patience = getattr(args, 'early_stopping_patience', 5)
     logging.info(f"Early stopping patience: {patience} epochs.")
 
-    # If needed, create a multiprocessing Pool (if any CPU work is still needed)
     max_workers = max(cpu_count() - 1, 1)
     pool = Pool(processes=max_workers)
     logging.debug(f"Created multiprocessing Pool with {max_workers} workers.")
@@ -82,6 +82,9 @@ def train_model(
     total_epoch_batches = len(dataloader)
     if torch.cuda.device_count() > 1:
         logging.info(f"Total batches per epoch: {total_epoch_batches}")
+
+    # Unpack optimizers.
+    adam_optimizer, muon_optimizer = optimizers
 
     for epoch in range(start_epoch, epochs):
         logging.info(f"==== Epoch {epoch+1}/{epochs} ====")
@@ -97,12 +100,10 @@ def train_model(
                               ascii=True, dynamic_ncols=False, ncols=120)
             sys.stdout.flush()
 
-        # Process each batch
         for batch_idx, batch in enumerate(dataloader):
-            if not use_deepspeed:
-                optimizer.zero_grad()
-            else:
-                model.zero_grad()
+            # Zero gradients for both optimizers.
+            adam_optimizer.zero_grad()
+            muon_optimizer.zero_grad()
             if ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
@@ -116,16 +117,14 @@ def train_model(
                 future_vals = future_vals.view(-1)
 
             with amp.autocast(device_type='cuda', dtype=torch.float16):
-                # If using EBM, compute an auxiliary loss.
+                # Simplified EBM branch: compute auxiliary loss from the full text embedding.
                 ebm_loss = None
                 if ebm is not None:
                     wrapped_ebm = get_wrapped_model(ebm)
-                    # Compute full embedding for the batch; this represents the combined text.
                     full_emb = get_wrapped_model(model).get_embeddings(main_ids).half()
-                    energy = wrapped_ebm(full_emb)  # (batch_size,)
-                    # Use the mean squared energy as an auxiliary loss.
+                    energy = wrapped_ebm(full_emb)  # shape: (batch_size,)
                     ebm_loss = torch.mean(energy**2)
-                
+
                 outputs, main_loss = model(input_ids=main_ids, targets=future_vals)
                 if si:
                     try:
@@ -154,10 +153,13 @@ def train_model(
                 if ebm_loss is not None:
                     total_loss_batch += ebm_loss
 
+                # Backward pass: use GradScaler for the Adam branch.
                 if not use_deepspeed:
                     scaler.scale(total_loss_batch).backward()
-                    scaler.step(optimizer)
+                    scaler.step(adam_optimizer)
                     scaler.update()
+                    # For Muon, we assume it is stepped directly.
+                    muon_optimizer.step()
                 else:
                     model.backward(total_loss_batch)
                     model.step()
@@ -165,7 +167,6 @@ def train_model(
             if ebm and ebm_optimizer:
                 ebm_optimizer.step()
 
-            # Update memory replay buffer if used.
             if replay_buffer:
                 replay_samples = []
                 for i in range(B):
@@ -178,7 +179,8 @@ def train_model(
                 except Exception as e:
                     logging.error(f"Error adding to replay buffer: {e}")
 
-            optimizer.zero_grad()
+            adam_optimizer.zero_grad()
+            muon_optimizer.zero_grad()
             if ebm and ebm_optimizer:
                 ebm_optimizer.zero_grad()
 
