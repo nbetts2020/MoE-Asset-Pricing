@@ -1,40 +1,29 @@
+# train.py
+
+import os
+import gc
+import shutil
 import torch
 import torch.nn.functional as F
-from torch import amp
-import numpy as np
-import os
-from tqdm import tqdm
+from torch.utils.data import DataLoader, DistributedSampler
 import logging
-from multiprocessing import Pool, cpu_count
-import math
-import sys
 
-import deepspeed
-
-from sklearn.metrics import mean_squared_error, r2_score
-from utils.config import config
-from utils.utils import compute_l2_loss, load_checkpoint, prepare_dataloader, get_wrapped_model
-import torch.distributed as dist
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("train_debug.log"),
-        logging.StreamHandler()
-    ]
+from utils.utils import (
+    get_data,
+    prepare_dataloader,
+    compute_l2_loss
 )
-
-def get_wrapped_model(model):
-    """Returns the underlying model if wrapped by DistributedDataParallel."""
-    return model.module if hasattr(model, 'module') else model
+from utils.config import config
+from utils.ewc import ElasticWeightConsolidation
+from utils.si import SynapticIntelligence
+from utils.memory_replay_buffer import MemoryReplayBuffer
 
 def train_model(
     model,
-    optimizers,   # Now a tuple: (adam_optimizer, muon_optimizer)
+    optimizers,
     epochs,
     device,
-    dataloader,  # DataLoader built from the precomputed dataset.
+    dataloader,   # Not used in chunk mode, kept for API compatibility
     args,
     si=None,
     ewc=None,
@@ -44,170 +33,135 @@ def train_model(
     tokenizer=None,
     use_deepspeed=False
 ):
-    torch.backends.cudnn.benchmark = True
-    start_epoch = 0
-    # Load checkpoint if available.
-    if hasattr(args, 'checkpoint_path') and args.checkpoint_path and os.path.isfile(args.checkpoint_path):
-        logging.info(f"Loading checkpoint from {args.checkpoint_path}")
-        start_epoch = load_checkpoint(
-            model,
-            optimizers,
-            ebm if (ebm and getattr(args, 'use_ebm', False)) else None,
-            ebm_optimizer if (ebm and getattr(args, 'use_ebm', False)) else None,
-            args.checkpoint_path
-        )
-        logging.info(f"Resumed training from epoch {start_epoch + 1}")
-    else:
-        logging.info("No checkpoint found or checkpoint path missing. Starting from scratch.")
+    """
+    Example chunk-based training using global_offset/global_max logic to limit usage 
+    to (args.percent_data)% of the *training portion* of the dataset.
+    """
 
-    if ebm:
-        ebm.train()
-    model.train()
-    logging.info("Set main model to train mode.")
-
-    scaler = None
-    if not use_deepspeed:
-        from torch.cuda.amp import GradScaler
-        scaler = GradScaler()
-
-    best_loss = float('inf')
-    epochs_no_improve = 0
-    patience = getattr(args, 'early_stopping_patience', 5)
-    logging.info(f"Early stopping patience: {patience} epochs.")
-
-    max_workers = max(cpu_count() - 1, 1)
-    pool = Pool(processes=max_workers)
-    logging.debug(f"Created multiprocessing Pool with {max_workers} workers.")
-
-    total_epoch_batches = len(dataloader)
-    if torch.cuda.device_count() > 1:
-        logging.info(f"Total batches per epoch: {total_epoch_batches}")
-
-    # Unpack optimizers.
     adam_optimizer, muon_optimizer = optimizers
+    rank = 0
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
 
-    for epoch in range(start_epoch, epochs):
-        logging.info(f"==== Epoch {epoch+1}/{epochs} ====")
-        total_loss = 0.0
-        total_count = 0
+    # Calculate global_max based on your stated logic:
+    #   total_rows = 453932 (full dataset)
+    #   training split = 80% => 0.8 * 453932
+    #   then we only want (args.percent_data / 100) of that training split
+    total_for_training = 0.8 * 453932
+    global_max = int((args.percent_data / 100.0) * total_for_training)
 
-        if hasattr(dataloader.sampler, 'set_epoch'):
-            dataloader.sampler.set_epoch(epoch)
+    # We'll track how many rows we've used so far
+    global_offset = 0
 
-        if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
-            epoch_pbar = tqdm(total=total_epoch_batches, desc=f"Epoch {epoch+1} Progress",
-                              file=sys.stdout, mininterval=0.1, maxinterval=0.5,
-                              ascii=True, dynamic_ncols=False, ncols=120)
-            sys.stdout.flush()
+    logging.info(f"Using up to {global_max} rows from the training set, "
+                 f"which is {args.percent_data}% of the 80% split (total 453,932).")
 
-        for batch_idx, batch in enumerate(dataloader):
-            # Zero gradients for both optimizers.
-            adam_optimizer.zero_grad()
-            muon_optimizer.zero_grad()
-            if ebm and ebm_optimizer:
-                ebm_optimizer.zero_grad()
+    for epoch in range(1, epochs + 1):
+        model.train()
+        logging.info(f"=== Starting epoch {epoch}/{epochs} ===")
 
-            main_ids = batch['input_ids'].to(device, dtype=torch.long)
-            future_vals = batch['labels'].to(device, dtype=torch.float16)
-            B = main_ids.size(0)
+        for window_index in range(1, 14):
+            # Build the DataLoader for this chunk
+            loader = prepare_dataloader(
+                epoch=epoch,
+                window_index=window_index,
+                tokenizer=tokenizer,
+                batch_size=config.BATCH_SIZE,
+                shuffle=True,
+                global_offset=global_offset,
+                global_max=global_max,
+                args=args
+            )
 
-            if future_vals.dim() == 2 and future_vals.size(1) == 1:
-                future_vals = future_vals.squeeze(1)
-            elif future_vals.dim() not in (1, 2):
-                future_vals = future_vals.view(-1)
-
-            with amp.autocast(device_type='cuda', dtype=torch.float16):
-                # Simplified EBM branch: compute auxiliary loss from the full text embedding.
-                ebm_loss = None
-                if ebm is not None:
-                    wrapped_ebm = get_wrapped_model(ebm)
-                    full_emb = get_wrapped_model(model).get_embeddings(main_ids).half()
-                    energy = wrapped_ebm(full_emb)  # shape: (batch_size,)
-                    ebm_loss = torch.mean(energy**2)
-
-                outputs, main_loss = model(input_ids=main_ids, targets=future_vals)
-                if si:
-                    try:
-                        si_penalty = si.penalty()
-                        main_loss += si_penalty
-                        logging.debug(f"Added SI penalty: {si_penalty.item():.4f}")
-                    except Exception as e:
-                        logging.error(f"Error adding SI penalty: {e}")
-                if ewc:
-                    for idx_ewc, ewc_obj in enumerate(ewc):
-                        try:
-                            ewc_penalty = args.lambda_ewc * ewc_obj.penalty(model)
-                            main_loss += ewc_penalty
-                            logging.debug(f"Added EWC penalty {idx_ewc}: {ewc_penalty.item():.4f}")
-                        except Exception as e:
-                            logging.error(f"Error adding EWC penalty {idx_ewc}: {e}")
-                if getattr(args, 'use_l2', False):
-                    try:
-                        l2_loss = args.lambda_l2 * compute_l2_loss(model)
-                        main_loss += l2_loss
-                        logging.debug(f"Added L2 loss: {l2_loss.item():.4f}")
-                    except Exception as e:
-                        logging.error(f"Error adding L2 loss: {e}")
-                
-                total_loss_batch = main_loss
-                if ebm_loss is not None:
-                    total_loss_batch += ebm_loss
-
-                # Backward pass: use GradScaler for the Adam branch.
-                if not use_deepspeed:
-                    scaler.scale(total_loss_batch).backward()
-                    scaler.step(adam_optimizer)
-                    scaler.update()
-                    # For Muon, we assume it is stepped directly.
-                    muon_optimizer.step()
-                else:
-                    model.backward(total_loss_batch)
-                    model.step()
-
-            if ebm and ebm_optimizer:
-                ebm_optimizer.step()
-
-            if replay_buffer:
-                replay_samples = []
-                for i in range(B):
-                    replay_samples.append({
-                        'input_ids': main_ids[i].detach().cpu(),
-                        'labels': future_vals[i].detach().cpu()
-                    })
-                try:
-                    replay_buffer.add_examples(replay_samples, [0] * B)
-                except Exception as e:
-                    logging.error(f"Error adding to replay buffer: {e}")
-
-            adam_optimizer.zero_grad()
-            muon_optimizer.zero_grad()
-            if ebm and ebm_optimizer:
-                ebm_optimizer.zero_grad()
-
-            total_loss += total_loss_batch.item() * B
-            total_count += B
-
-            if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
-                epoch_pbar.update(1)
-                sys.stdout.flush()
-
-        if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
-            epoch_pbar.close()
-
-        avg_loss = total_loss / float(total_count) if total_count else 0.0
-        logging.info(f"Epoch {epoch+1} => train loss: {avg_loss:.4f}")
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            epochs_no_improve = 0
-            logging.info(f"New best loss: {best_loss:.4f}")
-        else:
-            epochs_no_improve += 1
-            logging.info(f"No improvement: patience {epochs_no_improve}/{patience}")
-            if epochs_no_improve >= patience:
-                logging.info(f"Stopping early after {epoch+1} epochs (no improvement).")
+            # If empty, it means either chunk is empty or we've hit global_max
+            if len(loader) == 0:
+                logging.info(
+                    f"No data returned for window_index={window_index} "
+                    f"(epoch {epoch}). Possibly reached the global_max. Stopping chunk loop."
+                )
                 break
 
-    pool.close()
-    pool.join()
-    logging.debug("Closed multiprocessing Pool.")
-    logging.info("Training loop completed.")
+            # Train on this chunk
+            for step, batch in enumerate(loader):
+                input_ids = batch['input_ids'].to(device)
+                labels = batch['labels'].to(device)
+
+                with torch.cuda.amp.autocast(enabled=True):
+                    outputs, _ = model(input_ids=input_ids)
+                    loss = F.mse_loss(outputs.squeeze(-1), labels.float())
+
+                    # Optional: L2
+                    if args.use_l2:
+                        loss += args.lambda_l2 * compute_l2_loss(model)
+
+                    # Optional: Replay buffer
+                    if replay_buffer and len(replay_buffer) > 0:
+                        replay_loss = replay_buffer.replay_and_calculate_loss(
+                            model,
+                            tokenizer,
+                            args.replay_batch_size,
+                            device,
+                            alpha=args.replay_buffer_weight
+                        )
+                        loss += replay_loss
+
+                    # Optional: EWC
+                    if args.use_ewc and ewc:
+                        for ewc_instance in ewc:
+                            loss += args.lambda_ewc * ewc_instance.penalty(model)
+
+                    # Optional: SI
+                    if args.use_si and si:
+                        loss += si.penalty(model)
+
+                adam_optimizer.zero_grad()
+                muon_optimizer.zero_grad()
+
+                if use_deepspeed and hasattr(model, "backward"):
+                    model.backward(loss)
+                    model.step()
+                else:
+                    loss.backward()
+                    adam_optimizer.step()
+                    muon_optimizer.step()
+
+                # SI online update
+                if args.use_si and si:
+                    si.update_weights(model)
+
+                # Add batch to replay buffer
+                if args.use_replay_buffer and replay_buffer:
+                    replay_buffer.add_batch(batch)
+
+            # Update global_offset by however many rows were in this chunk
+            if hasattr(loader.dataset, 'df'):
+                global_offset += len(loader.dataset.df)
+                logging.info(f"Updated global_offset to {global_offset}")
+
+            # Cleanup
+            loader = None
+            gc.collect()
+
+            # If we've now used up the entire global_max, break from chunk loop
+            if global_offset >= global_max:
+                logging.info("Reached global_max rows. Stopping further chunk loading.")
+                break
+
+        # End of epoch
+        logging.info(f"=== Finished epoch {epoch} ===")
+
+        # EWC consolidate
+        if args.use_ewc and ewc:
+            for ewc_instance in ewc:
+                ewc_instance.consolidate(model)
+
+        # SI finalize
+        if args.use_si and si:
+            si.update_omega(model)
+
+        # If we've used all rows, no need to start a new epoch
+        if global_offset >= global_max:
+            logging.info("global_offset already >= global_max, stopping training entirely.")
+            break
+
+    logging.info("All epochs completed (or hit global data limit).")
