@@ -480,26 +480,21 @@ def process_data(df,
         symbols, industries, risk_free_rates
     )
 
-def prepare_dataloader(df, df_preprocessed, tokenizer, batch_size, shuffle, args, sampler=None):
+def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
+                       global_offset, global_max, args, sampler=None):
     """
-    Prepare dataloader with optional distributed sampler support
+    Builds a DataLoader for a given chunk based on the provided epoch and window_index.
+    Loads data via get_data(), applies PrecomputedDataset, and creates DataLoader.
     """
-    from utils.data import ArticlePriceDataset, custom_collate_fn
-    from torch.utils.data import DataLoader
-
-    dataset = ArticlePriceDataset(
-        df=df,
-        df_preprocessed=df_preprocessed,
-        tokenizer=tokenizer,
-        block_size=config.BLOCK_SIZE
-    )
+    df = get_data(epoch, window_index, global_offset, global_max, args=args)  # Load DataFrame
+    dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
 
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(shuffle and sampler is None),  # Only shuffle if no sampler
+        shuffle=(shuffle and sampler is None),
         sampler=sampler,
-        num_workers=0,  # Set to 0 for distributed training
+        num_workers=0,
         collate_fn=custom_collate_fn,
         pin_memory=True
     )
