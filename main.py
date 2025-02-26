@@ -13,7 +13,7 @@ import deepspeed  # DeepSpeed integration
 from transformers import AutoTokenizer
 
 from utils.model import SparseMoELanguageModel, EnergyBasedModel
-from utils.train import train_model
+from utils.train import train_model, test_forgetting  # train_model now internally loads chunks
 from utils.utils import (
     initialize_model,
     prepare_optimizer,           # returns (adam_optimizer, muon_optimizer)
@@ -24,17 +24,15 @@ from utils.utils import (
     download_models_from_s3,
     ebm_select_contexts,
     get_data,
-    prepare_dataloader,
     consolidate_checkpoint_to_pth,
     upload_checkpoint_to_s3,
-    evaluate_model               # Moved metrics code here
+    evaluate_model
 )
 from utils.config import config
 from pandarallel import pandarallel
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
-from utils.test import test_forgetting
 from torch.utils.data.distributed import DistributedSampler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
@@ -117,7 +115,7 @@ def main():
 
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
-        config.EPOCHS = 3
+        config.EPOCHS = 15  # e.g. 15 epochs (each epoch processes its set of chunks)
         config.N_EMBED = 32
         config.N_HEAD = 4
         config.N_LAYER = 12
@@ -177,11 +175,10 @@ def main():
 
         # Prepare hybrid optimizer: returns (adam_optimizer, muon_optimizer)
         adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
+        logging.info(f"LOCAL_RANK (train): {local_rank}")
+        logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
-        print("LOCAL_RANK (train):", local_rank)
-        print("Available GPUs (train):", torch.cuda.device_count())
-
-        # Pass the AdamW optimizer branch to DeepSpeed
+        # Initialize DeepSpeed with the AdamW branch.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=adam_optimizer,
@@ -190,7 +187,7 @@ def main():
         )
         print_debug_info("AFTER DEEPSPEED INIT")
         global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        print("Global rank (train):", global_rank)
+        logging.info(f"Global rank (train): {global_rank}")
 
         if args.use_ebm:
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
@@ -199,17 +196,14 @@ def main():
             ebm = None
             ebm_optimizer = None
 
-        # Use new loader functions (prepare_dataloader) instead of prepare_data.
-        train_dataloader = prepare_dataloader(args)  # Assumes prepare_dataloader is updated accordingly.
-        logging.info(f"Train DataLoader length: {len(train_dataloader)}")
-
-        # Call train_model with a tuple of optimizers.
+        # Instead of passing an external dataloader, pass None.
+        # The train_model function will handle loading chunks from the Hugging Face repository.
         train_model(
             model=engine,
-            optimizer=(adam_optimizer, muon_optimizer),
+            optimizers=(adam_optimizer, muon_optimizer),
             epochs=config.EPOCHS,
             device=device,
-            dataloader=train_dataloader,
+            dataloader=None,
             args=args,
             si=initialize_si(engine, args) if args.use_si else None,
             ewc=[ElasticWeightConsolidation(engine, None, device, args)] if args.use_ewc else None,
@@ -264,12 +258,13 @@ def main():
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
-        update_dataloader = prepare_dataloader(args)  # New loader for update mode.
+        # For update mode, we still load data via the existing loader.
+        update_dataloader, data_bundle = prepare_dataloader(args)
         logging.info(f"Update DataLoader length: {len(update_dataloader)}")
 
         train_model(
             model=model,
-            optimizer=(adam_optimizer, muon_optimizer),
+            optimizers=(adam_optimizer, muon_optimizer),
             epochs=config.EPOCHS,
             device=device,
             dataloader=update_dataloader,
@@ -295,8 +290,7 @@ def main():
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
 
-        # Use the new loader; assume test data is loaded via get_data/prepare_dataloader.
-        run_dataloader = prepare_dataloader(args)
+        run_dataloader, data_bundle = prepare_dataloader(args)
         logging.info(f"Run DataLoader length: {len(run_dataloader)}")
 
         download_models_from_s3(bucket=args.bucket)
@@ -330,35 +324,18 @@ def main():
             riskfree = []
             sectors = []
 
-            # For each test sample, choose the best candidate context out of the 30 columns.
+            # For each test sample, select the best candidate context.
             for idx, sample in run_dataloader.dataset.df.iterrows():
-                candidates = [sample.get(f"iteration_{i}_text") for i in range(1, 31) if sample.get(f"iteration_{i}_text") is not None]
-                max_candidates = len(candidates)
-                k = args.ebm_num_samples if args.ebm_num_samples < max_candidates else max_candidates
-                if k < max_candidates:
-                    sampled_candidates = random.sample(candidates, k)
-                else:
-                    sampled_candidates = candidates
-
-                candidate_energies = []
-                for candidate in sampled_candidates:
-                    encoding = tokenizer(
-                        candidate,
-                        truncation=True,
-                        padding="max_length",
-                        max_length=config.BLOCK_SIZE,
-                        return_tensors="pt"
-                    ).to(device)
-                    emb = get_wrapped_model(model).get_embeddings(encoding["input_ids"]).half()
-                    energy = ebm(emb)
-                    candidate_energies.append(energy.item())
-                if candidate_energies:
-                    best_idx = np.argmin([abs(e) for e in candidate_energies])
-                    best_candidate = sampled_candidates[best_idx]
-                else:
-                    best_candidate = sampled_candidates[0]
-
-                final_input = best_candidate
+                best_context = ebm_select_contexts(
+                    df=run_dataloader.dataset.df,
+                    idx=idx,
+                    text=sample['Article'],
+                    model=model,
+                    ebm=ebm,
+                    tokenizer=tokenizer,
+                    ebm_samples=args.ebm_num_samples
+                )
+                final_input = best_context
                 encoding = tokenizer(
                     final_input,
                     truncation=True,
@@ -376,7 +353,6 @@ def main():
                 sectors.append(sample.get('Sector', "Unknown"))
                 print(f"Sample {idx} predicted price: {pred.item()}")
 
-            # Call the evaluation function from utils.py to compute metrics.
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
 
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
