@@ -34,7 +34,6 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.sampling import sample_articles
-from utils.data import format_concatenated_articles
 
 import logging
 import subprocess
