@@ -12,7 +12,8 @@ from sklearn.metrics import mean_squared_error, r2_score
 import deepspeed  # DeepSpeed integration
 from transformers import AutoTokenizer
 
-from utils.model import SparseMoELanguageModel, EnergyBasedModel
+from utils.model import SparseMoELanguageModel
+from utils.ebm import EnergyBasedModel
 from utils.train import train_model, test_forgetting  # train_model now internally loads chunks
 from utils.utils import (
     initialize_model,
