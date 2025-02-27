@@ -14,7 +14,8 @@ from transformers import AutoTokenizer
 
 from utils.model import SparseMoELanguageModel
 from utils.ebm import EnergyBasedModel
-from utils.train import train_model, test_forgetting  # train_model now internally loads chunks
+from utils.train import train_model
+from utils.test import test_forgetting
 from utils.utils import (
     initialize_model,
     prepare_optimizer,           # returns (adam_optimizer, muon_optimizer)
