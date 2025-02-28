@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
+from tqdm import tqdm
 
 from utils.utils import (
     get_data,
@@ -34,8 +35,9 @@ def train_model(
     use_deepspeed=False
 ):
     """
-    Example chunk-based training using global_offset/global_max logic to limit usage 
+    Example chunk-based training using global_offset/global_max logic to limit usage
     to (args.percent_data)% of the *training portion* of the dataset.
+    Includes tqdm progress bars for monitoring progress.
     """
 
     adam_optimizer, muon_optimizer = optimizers
@@ -59,8 +61,9 @@ def train_model(
     for epoch in range(1, epochs + 1):
         model.train()
         logging.info(f"=== Starting epoch {epoch}/{epochs} ===")
-
-        for window_index in range(1, 14):
+        
+        # Use tqdm to iterate over the 13 expected chunks
+        for window_index in tqdm(range(1, 14), desc=f"Epoch {epoch} chunks"):
             # Build the DataLoader for this chunk
             loader = prepare_dataloader(
                 epoch=epoch,
@@ -81,8 +84,8 @@ def train_model(
                 )
                 break
 
-            # Train on this chunk
-            for step, batch in enumerate(loader):
+            # Wrap the batch loop in tqdm for progress on current chunk
+            for step, batch in enumerate(tqdm(loader, desc=f"Chunk {window_index} batches", leave=False)):
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['labels'].to(device)
 
@@ -90,11 +93,11 @@ def train_model(
                     outputs, _ = model(input_ids=input_ids)
                     loss = F.mse_loss(outputs.squeeze(-1), labels.float())
 
-                    # Optional: L2
+                    # Optional: L2 Regularization
                     if args.use_l2:
                         loss += args.lambda_l2 * compute_l2_loss(model)
 
-                    # Optional: Replay buffer
+                    # Optional: Replay Buffer loss
                     if replay_buffer and len(replay_buffer) > 0:
                         replay_loss = replay_buffer.replay_and_calculate_loss(
                             model,
@@ -105,12 +108,12 @@ def train_model(
                         )
                         loss += replay_loss
 
-                    # Optional: EWC
+                    # Optional: EWC Regularization
                     if args.use_ewc and ewc:
                         for ewc_instance in ewc:
                             loss += args.lambda_ewc * ewc_instance.penalty(model)
 
-                    # Optional: SI
+                    # Optional: SI Regularization
                     if args.use_si and si:
                         loss += si.penalty(model)
 
@@ -135,10 +138,11 @@ def train_model(
 
             # Update global_offset by however many rows were in this chunk
             if hasattr(loader.dataset, 'df'):
-                global_offset += len(loader.dataset.df)
-                logging.info(f"Updated global_offset to {global_offset}")
+                num_rows = len(loader.dataset.df)
+                global_offset += num_rows
+                logging.info(f"Updated global_offset to {global_offset} (added {num_rows} rows)")
 
-            # Cleanup
+            # Cleanup for this chunk
             loader = None
             gc.collect()
 
