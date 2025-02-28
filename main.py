@@ -293,7 +293,18 @@ def main():
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
 
-        run_dataloader, data_bundle = prepare_dataloader(args)
+        # For run mode, we load a single chunk (epoch=1, window_index=1, no shuffling, full chronological order)
+        run_dataloader = prepare_dataloader(
+            epoch=1,
+            window_index=1,
+            tokenizer=tokenizer,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            global_offset=0,
+            global_max=int(1e12),
+            args=args
+        )
+        data_bundle = None
         logging.info(f"Run DataLoader length: {len(run_dataloader)}")
 
         download_models_from_s3(bucket=args.bucket)
