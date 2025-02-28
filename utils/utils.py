@@ -484,26 +484,28 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
     """
     Builds a DataLoader for a given chunk based on the provided epoch and window_index.
     Loads data via get_data(), applies PrecomputedDataset, and creates DataLoader.
-    Always uses a DistributedSampler.
+    Uses DistributedSampler only if torch.distributed is initialized.
     """
-    df = get_data(epoch, window_index, global_offset, global_max, args=args)  # Load DataFrame
+    df = get_data(epoch, window_index, global_offset, global_max, args=args)
     dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
 
-    # Always use DistributedSampler
-    sampler = DistributedSampler(dataset, shuffle=shuffle)
+    # Use DistributedSampler only if the default process group is initialized.
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        sampler = DistributedSampler(dataset, shuffle=shuffle)
+    else:
+        sampler = None
 
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,  # DistributedSampler takes care of shuffling
+        shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=0,
         collate_fn=custom_collate_fn,
         pin_memory=True
     )
-
     return dataloader
-
+                           
 def prepare_tasks(tokenizer, args, k=3):
     """
     For catastrophic-forgetting tests, pick k random sectors and build
