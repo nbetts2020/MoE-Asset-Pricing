@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import init
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 from muon import Muon
 
@@ -484,14 +484,18 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
     """
     Builds a DataLoader for a given chunk based on the provided epoch and window_index.
     Loads data via get_data(), applies PrecomputedDataset, and creates DataLoader.
+    Always uses a DistributedSampler.
     """
     df = get_data(epoch, window_index, global_offset, global_max, args=args)  # Load DataFrame
     dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
 
+    # Always use DistributedSampler
+    sampler = DistributedSampler(dataset, shuffle=shuffle)
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(shuffle and sampler is None),
+        shuffle=False,  # DistributedSampler takes care of shuffling
         sampler=sampler,
         num_workers=0,
         collate_fn=custom_collate_fn,
