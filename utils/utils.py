@@ -122,7 +122,7 @@ def get_data(epoch, window_index, global_offset, global_max, args=None):
 
     # Load data
     df = pd.read_parquet(file_path).dropna(subset=['weighted_avg_720_hrs'])
-    df = df[(df['weighted_avg_0_hrs'] > 0) & (df['weighted_avg_720_hrs'] > 0)]
+    df = df[df['weighted_avg_720_hrs'] > 0]
 
     # If we've already hit the global_max, return empty
     if global_offset >= global_max:
