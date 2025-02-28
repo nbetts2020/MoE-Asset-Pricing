@@ -609,7 +609,7 @@ def initialize_model(args, device, init_from_scratch=False):
 def prepare_optimizer(model, args):
     """
     Prepares a hybrid optimizer: 
-      - Uses AdamW (or DeepSpeed’s CPUAdam if desired) for low-dimensional parameters (embeddings, regression head, etc.)
+      - Uses DeepSpeed’s CPUAdam for low-dimensional parameters (embeddings, regression head, etc.)
       - Uses Muon for high-dimensional parameters from the transformer blocks.
     """
     LR_DECAY = config.LR_DECAY
@@ -619,7 +619,7 @@ def prepare_optimizer(model, args):
     adam_param_groups = []
     muon_params = []
 
-    # Embedding parameters (optimize with AdamW)
+    # Embedding parameters (optimize with CPUAdam)
     embedding_params_with_decay = []
     embedding_params_without_decay = []
     for name, param in list(model.token_embedding_table.named_parameters()) + list(model.position_embedding_table.named_parameters()):
@@ -639,7 +639,7 @@ def prepare_optimizer(model, args):
         'weight_decay': 0.0
     })
 
-    # Regression head parameters (optimize with AdamW)
+    # Regression head parameters (optimize with CPUAdam)
     reg_params_with_decay = []
     reg_params_without_decay = []
     for name, param in model.regression_head.named_parameters():
@@ -660,15 +660,13 @@ def prepare_optimizer(model, args):
     })
 
     # Block parameters (optimize with Muon)
-    # Assume all parameters in model.blocks are high-dimensional.
     for block in model.blocks:
         for name, param in block.named_parameters():
             if param.requires_grad:
                 muon_params.append(param)
 
-    # Create the AdamW optimizer for the non-block parameters.
-    # (You could replace torch.optim.AdamW with DeepSpeedCPUAdam if desired.)
-    adam_optimizer = torch.optim.AdamW(
+    # Create the CPUAdam optimizer for the non-block parameters.
+    adam_optimizer = DeepSpeedCPUAdam(
         [p for group in adam_param_groups for p in group['params']],
         lr=LEARNING_RATE,
         weight_decay=weight_decay
@@ -677,7 +675,7 @@ def prepare_optimizer(model, args):
     # Create the Muon optimizer for block parameters.
     muon_optimizer = Muon(muon_params, lr=LEARNING_RATE, momentum=0.95)
 
-    logging.info("Initialized hybrid optimizer: Muon for block parameters and AdamW for embeddings and head.")
+    logging.info("Initialized hybrid optimizer: Muon for block parameters and CPUAdam for embeddings and head.")
     return adam_optimizer, muon_optimizer
     
 def initialize_si(model, args):
