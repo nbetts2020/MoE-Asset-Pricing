@@ -346,7 +346,6 @@ def main():
                 best_context = ebm_select_contexts(
                     df=run_dataloader.dataset.df,
                     idx=idx,
-                    text=sample['Article'],
                     model=model,
                     ebm=ebm,
                     tokenizer=tokenizer,
