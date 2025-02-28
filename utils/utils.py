@@ -15,7 +15,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 
 from utils.config import config
 from utils.model import SparseMoELanguageModel
-from utils.data import PrecomputedDataset
+from utils.data import PrecomputedDataset, custom_collate_fn
 
 import os
 from huggingface_hub import login
