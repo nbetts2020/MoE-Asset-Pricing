@@ -191,7 +191,7 @@ def download_models_from_s3(bucket):
         logging.error(f"Error syncing 'models' directory: {e.stderr}")
         raise
 
-def ebm_select_contexts(df, idx, text, model, ebm, tokenizer, ebm_samples):
+def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
     """
     For the sample at the given index, select the best context from the precomputed candidate columns.
     It assumes candidate context strings are stored in columns "iteration_1_text" ... "iteration_30_text".
