@@ -18,6 +18,7 @@ from utils.model import SparseMoELanguageModel
 from utils.data import PrecomputedDataset, custom_collate_fn
 
 import os
+import shutil
 from huggingface_hub import login
 from datasets import load_dataset
 from dotenv import load_dotenv
@@ -98,42 +99,58 @@ def get_total_rows(parquet_path):
     table = pq.read_table(parquet_path, columns=[])
     return table.num_rows
     
-def get_data(epoch, window_index, global_offset, global_max, args=None):
+def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
-    Loads a chunk of the train data (main only) from Hugging Face, building the file name
-    as "train_dataset_{window_index}{epoch_letter}.parquet". Uses global_offset/global_max
-    to limit how many rows are returned (partial data logic).
+    Loads a chunk of data from Hugging Face and deletes the local file afterward.
 
-    Args:
-        epoch (int): 1 -> 'a', 2 -> 'b', etc.
-        window_index (int): 1..13
-        global_offset (int): number of rows used so far
-        global_max (int): total row limit
-        args: optional arguments for e.g. filters
+    For training (mode=="train"), it loads a file named:
+       "train_dataset_{window_index}{epoch_letter}.parquet"
+    For run (mode=="run"), it loads a file named:
+       "run_dataset_{window_index}.parquet"
 
-    Returns:
-        df: DataFrame with up to (global_max - global_offset) rows from that chunk
+    Uses global_offset/global_max to limit the number of rows returned.
+    Files are downloaded to a custom cache directory and then deleted to free disk space.
     """
-    # Convert epoch to a letter (1->'a', 2->'b', etc.)
-    epoch_letter = chr(ord('a') + epoch - 1)
-    filename = f"train_dataset_{window_index}{epoch_letter}.parquet"
+    # Ensure cache directory exists
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    if args.mode == "train":
+        epoch_letter = chr(ord('a') + epoch - 1)
+        filename = f"train_dataset_{window_index}{epoch_letter}.parquet"
+    elif args.mode == "run":
+        filename = f"run_dataset_{window_index}.parquet"
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
     repo_id = "nbettencourt/sc454k-preprocessed-dfs"
-    file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
+    # Download file into the specified temporary cache directory
+    file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=cache_dir)
 
     # Load data
     df = pd.read_parquet(file_path).dropna(subset=['weighted_avg_720_hrs'])
     df = df[df['weighted_avg_720_hrs'] > 0]
 
-    # If we've already hit the global_max, return empty
+    # If we've already hit the global_max, return empty DataFrame
     if global_offset >= global_max:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        # Clear cache directory
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
         return pd.DataFrame()
 
     chunk_rows = len(df)
-    # If adding this chunk would exceed the global_max, truncate
+    # Truncate if adding this chunk exceeds the global_max
     if global_offset + chunk_rows > global_max:
         needed = global_max - global_offset
         df = df.iloc[:needed]
+
+    # Delete the file to free up space
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    # Clear the temporary cache directory after deletion
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     return df
     
