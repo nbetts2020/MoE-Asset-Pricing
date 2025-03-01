@@ -295,82 +295,77 @@ def main():
         print_debug_info("RUN MODE START")
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-
-        # For run mode, we load a single chunk (epoch=1, window_index=1, no shuffling, full chronological order)
-        run_dataloader = prepare_dataloader(
-            epoch=1,
-            window_index=1,
-            tokenizer=tokenizer,
-            batch_size=config.BATCH_SIZE,
-            shuffle=False,
-            global_offset=0,
-            global_max=int(1e12),
-            args=args
-        )
-        data_bundle = None
-        logging.info(f"Run DataLoader length: {len(run_dataloader)}")
-
+    
+        # Download models from S3 if needed.
         download_models_from_s3(bucket=args.bucket)
-
+    
         consolidated_model_path = consolidate_checkpoint_to_pth(
             checkpoint_dir=args.save_dir,
             tag="final",
             output_path=args.save_dir
         )
 
+        if args.percent_data < 100:
+            global_max = int(0.2 * 453932 * (args.percent_data / 100))
+        else:
+            global_max = int(1e12)
+
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from consolidated checkpoint.")
-
+    
         if args.test:
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
-
+    
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-
-            predictions = []
-            actuals = []
-            oldprices = []
-            riskfree = []
-            sectors = []
-
-            # For each test sample, select the best candidate context.
-            for idx, sample in run_dataloader.dataset.df.iterrows():
-                best_context = ebm_select_contexts(
-                    df=run_dataloader.dataset.df,
-                    idx=idx,
+    
+            # Initialize accumulators for overall results.
+            all_predictions = []
+            all_actuals = []
+            all_oldprices = []
+            all_riskfree = []
+            all_sectors = []
+    
+            # Loop over run_dataset_1.parquet to run_dataset_18.parquet.
+            for i in range(1, 19):
+                run_filename = f"run_dataset_{i}.parquet"
+                logging.info(f"Processing {run_filename}...")
+                preds, acts, olds, rf, sects = process_run_dataset(
+                    run_dataset_filename=run_filename,
+                    tokenizer=tokenizer,
                     model=model,
                     ebm=ebm,
-                    tokenizer=tokenizer,
-                    ebm_samples=args.ebm_num_samples
+                    args=args,
+                    device=device,
+                    batch_size=500,       # Process 500 rows at a time.
+                    global_offset=0,      # You can adjust these values as needed.
+                    global_max=global_max, # or based on args.percent_data if desired.
+                    cache_dir="/tmp/hf_cache_datasets_run"
                 )
-                final_input = best_context
-                encoding = tokenizer(
-                    final_input,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=config.BLOCK_SIZE,
-                    return_tensors="pt"
-                ).to(device)
-                input_ids = encoding["input_ids"]
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    pred, _ = model(input_ids=input_ids)
-                predictions.append(pred.item())
-                actuals.append(sample['weighted_avg_720_hrs'])
-                oldprices.append(sample['weighted_avg_0_hrs'])
-                riskfree.append(sample['Risk_Free_Rate'])
-                sectors.append(sample.get('Sector', "Unknown"))
-                print(f"Sample {idx} predicted price: {pred.item()}")
-
-            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor = evaluate_model(model, run_dataloader, device)
-
+                all_predictions.extend(preds)
+                all_actuals.extend(acts)
+                all_oldprices.extend(olds)
+                all_riskfree.extend(rf)
+                all_sectors.extend(sects)
+    
+            # Evaluate overall metrics using a helper function.
+            # (Ensure evaluate_model_from_lists is defined to accept lists.)
+            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
+            average_return, win_rate, profit_factor = evaluate_model_from_lists(
+                predictions=all_predictions,
+                actuals=all_actuals,
+                oldprices=all_oldprices,
+                riskfree=all_riskfree
+            )
+    
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -378,6 +373,7 @@ def main():
             print(f"Average Return: {average_return:.4f}")
             print(f"Win Rate: {win_rate:.2f}%")
             print(f"Profit Factor: {profit_factor:.4f}")
+    
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -385,7 +381,6 @@ def main():
             logging.info(f"Average Return: {average_return:.4f}")
             logging.info(f"Win Rate: {win_rate:.2f}%")
             logging.info(f"Profit Factor: {profit_factor:.4f}")
-            logging.info("Per-Sector Metrics:")
             for sector, metrics in sector_metrics.items():
                 print(
                     f"Sector: {sector} - "
