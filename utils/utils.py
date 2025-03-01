@@ -47,6 +47,7 @@ from multiprocessing import Pool, cpu_count
 import random
 import ast
 from pandarallel import pandarallel
+import gc
 
 import torch.distributed as dist
 from deepspeed.ops.adam import DeepSpeedCPUAdam
