@@ -298,7 +298,7 @@ def main():
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
     
-        # Download models from S3 if needed.
+        # Download models from S3 if necessary.
         download_models_from_s3(bucket=args.bucket)
     
         consolidated_model_path = consolidate_checkpoint_to_pth(
@@ -306,12 +306,7 @@ def main():
             tag="final",
             output_path=args.save_dir
         )
-
-        if args.percent_data < 100:
-            global_max = int(0.2 * 453932 * (args.percent_data / 100))
-        else:
-            global_max = int(1e12)
-
+    
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
@@ -326,41 +321,54 @@ def main():
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
-            ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
     
-            # Initialize accumulators for overall results.
+            # Define global_max for run mode based on percent_data.
+            # For example, if the full run datasets contain 20% of total rows (0.2 * 453932),
+            # and you want only a fraction of that:
+            if args.percent_data < 100:
+                global_max = int(0.2 * 453932 * (args.percent_data / 100))
+            else:
+                global_max = int(0.2 * 453932)
+    
+            cumulative_offset = 0
             all_predictions = []
             all_actuals = []
             all_oldprices = []
             all_riskfree = []
             all_sectors = []
     
-            # Loop over run_dataset_1.parquet to run_dataset_18.parquet.
+            # Loop over run dataset files 1 to 18.
             for i in range(1, 19):
+                # If we've already processed enough rows, break.
+                if cumulative_offset >= global_max:
+                    logging.info("Global max reached; stopping further file processing.")
+                    break
+    
                 run_filename = f"run_dataset_{i}.parquet"
-                logging.info(f"Processing {run_filename}...")
-                preds, acts, olds, rf, sects = process_run_dataset(
+                logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
+                preds, acts, olds, rf, sects, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
                     ebm=ebm,
                     args=args,
                     device=device,
-                    batch_size=50,       # Process 500 rows at a time.
-                    global_offset=0,      # You can adjust these values as needed.
-                    global_max=global_max, # or based on args.percent_data if desired.
+                    batch_size=500,
+                    current_offset=cumulative_offset,
+                    global_max=global_max,
                     cache_dir="/tmp/hf_cache_datasets_run"
                 )
+                cumulative_offset += processed_in_file
                 all_predictions.extend(preds)
                 all_actuals.extend(acts)
                 all_oldprices.extend(olds)
                 all_riskfree.extend(rf)
                 all_sectors.extend(sects)
+                logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
     
-            # Evaluate overall metrics using a helper function.
-            # (Ensure evaluate_model_from_lists is defined to accept lists.)
+            # Evaluate results using a helper that accepts lists.
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
             average_return, win_rate, profit_factor = evaluate_model_from_lists(
                 predictions=all_predictions,
@@ -407,6 +415,7 @@ def main():
                     f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
                     f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
                 )
+    
         else:
             encoding = tokenizer(
                 args.text,
