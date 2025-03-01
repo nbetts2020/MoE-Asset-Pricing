@@ -116,34 +116,31 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
     return df
 
 def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, device, 
-                        batch_size=500, global_offset=0, global_max=int(1e12), 
+                        batch_size=500, current_offset=0, global_max=int(1e12), 
                         cache_dir="/tmp/hf_cache_datasets_run"):
     """
-    Streams a run dataset from disk in small batches to avoid loading the entire file into RAM.
-    
-    It uses global_offset and global_max to process only a subset of rows (e.g., based on args.percent_data).
-    After processing, the downloaded file and the temporary cache directory are deleted to free disk space.
+    Streams a run dataset file in small batches and processes rows until the overall global_max is reached.
     
     Args:
-        run_dataset_filename (str): Filename for the run dataset (e.g., "run_dataset_1.parquet").
+        run_dataset_filename (str): Name of the run dataset file (e.g. "run_dataset_1.parquet").
         tokenizer: The transformer tokenizer.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The energy-based model.
         args: Command-line arguments (expects args.ebm_num_samples, etc.).
-        device: The device (CUDA/CPU) to run on.
-        batch_size (int): Number of rows to process per record batch.
-        global_offset (int): Total number of rows to skip before processing.
-        global_max (int): Maximum total rows to process.
-        cache_dir (str): Temporary directory to download the file to.
+        device: The device (CUDA/CPU).
+        batch_size (int): Number of rows to process per batch.
+        current_offset (int): Number of rows already processed (from previous datasets).
+        global_max (int): Total number of rows to process across all files.
+        cache_dir (str): Temporary directory for downloads.
     
     Returns:
-        predictions, actuals, oldprices, riskfree, sectors: Lists of results aggregated across batches.
+        predictions, actuals, oldprices, riskfree, sectors: Lists of results for this file.
+        processed_in_file (int): Number of rows processed from this file.
     """
-    # Ensure the temporary cache directory exists.
+    # Ensure cache directory exists
     os.makedirs(cache_dir, exist_ok=True)
     
     repo_id = "nbettencourt/sc454k-preprocessed-dfs"
-    # Download the file into our temporary cache directory.
     file_path = hf_hub_download(
         repo_id=repo_id, 
         filename=run_dataset_filename, 
@@ -151,7 +148,6 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
         cache_dir=cache_dir
     )
     
-    # Open the parquet file with PyArrow without loading it all into RAM.
     parquet_file = pq.ParquetFile(file_path)
     
     predictions = []
@@ -160,32 +156,30 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
     riskfree = []
     sectors = []
     
-    processed = 0  # Count total rows processed so far.
-    
+    processed_in_file = 0  # Count of rows processed in this file
+
+    # Iterate over batches using PyArrow's streaming API.
     for batch in parquet_file.iter_batches(batch_size=batch_size):
-        # Convert the current record batch into a Pandas DataFrame.
         df_chunk = batch.to_pandas()
-        # Apply filtering as in get_data.
+        # Filter as in your get_data logic:
         df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
         df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0]
         
         num_rows = len(df_chunk)
-        # If we haven't yet reached our global_offset, skip the appropriate number of rows.
-        if processed < global_offset:
-            if processed + num_rows <= global_offset:
-                processed += num_rows
-                continue
-            else:
-                start_idx = global_offset - processed
-        else:
-            start_idx = 0
         
-        # Determine end index, ensuring we do not exceed global_max.
+        # Determine indices in this chunk to process, based on cumulative offset.
+        # If the cumulative count (current_offset + processed_in_file) is already >= global_max, break.
+        if current_offset + processed_in_file >= global_max:
+            break
+        
+        # Compute the effective start and end indices in this chunk.
+        start_idx = 0
         end_idx = num_rows
-        if processed + end_idx > global_max:
-            end_idx = global_max - processed
+        if current_offset + processed_in_file + num_rows > global_max:
+            # Only process a part of this chunk.
+            end_idx = global_max - (current_offset + processed_in_file)
         
-        # Process rows in the slice [start_idx:end_idx]
+        # Process rows in [start_idx, end_idx)
         for idx in range(start_idx, end_idx):
             sample = df_chunk.iloc[idx]
             try:
@@ -198,8 +192,9 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
                     ebm_samples=args.ebm_num_samples
                 )
             except Exception as e:
-                print(f"Error processing row {processed+idx}: {e}")
+                print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
+            
             final_input = best_context
             encoding = tokenizer(
                 final_input,
@@ -216,21 +211,26 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
             oldprices.append(sample['weighted_avg_0_hrs'])
             riskfree.append(sample['Risk_Free_Rate'])
             sectors.append(sample.get('Sector', "Unknown"))
-            print(f"Processed row {processed + idx}: predicted price {pred.item()}")
+            print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred.item()}")
         
-        processed += num_rows
+        processed_in_file += num_rows
+        
+        # Cleanup the chunk.
         del df_chunk
         gc.collect()
-        if processed >= global_max:
+        torch.cuda.empty_cache()
+        
+        # If cumulative limit reached, break out of loop.
+        if current_offset + processed_in_file >= global_max:
             break
 
-    # Cleanup: delete the downloaded file and clear the temporary cache directory.
+    # Cleanup the downloaded file and cache directory.
     if os.path.exists(file_path):
         os.remove(file_path)
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir, ignore_errors=True)
     
-    return predictions, actuals, oldprices, riskfree, sectors
+    return predictions, actuals, oldprices, riskfree, sectors, processed_in_file
 
 def load_model_weights(model, weights_path, device):
     if os.path.exists(weights_path):
