@@ -38,6 +38,7 @@ from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
 from torch.utils.data.distributed import DistributedSampler
+import gc
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
@@ -346,7 +347,7 @@ def main():
                     ebm=ebm,
                     args=args,
                     device=device,
-                    batch_size=500,       # Process 500 rows at a time.
+                    batch_size=50,       # Process 500 rows at a time.
                     global_offset=0,      # You can adjust these values as needed.
                     global_max=global_max, # or based on args.percent_data if desired.
                     cache_dir="/tmp/hf_cache_datasets_run"
