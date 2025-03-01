@@ -326,6 +326,7 @@ def main():
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
+            ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
     
