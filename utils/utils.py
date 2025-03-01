@@ -58,46 +58,6 @@ logger = logging.getLogger(__name__)
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
-
-def ensure_local_dataset_files():
-    """
-    Checks if the main and preprocessed parquet files exist in the local "data" directory.
-    If not, downloads them from Hugging Face using the correct repo type and saves them locally.
-    Returns the local paths for both files.
-    """
-    data_dir = "data"
-    os.makedirs(data_dir, exist_ok=True)
-    main_file = os.path.join(data_dir, "SC454k.parquet")
-    preprocessed_file = os.path.join(data_dir, "SC454k-preprocessed.parquet")
-
-    if not os.path.exists(main_file):
-        logger.info("Main parquet file not found locally. Downloading from Hugging Face...")
-        main_file = hf_hub_download(
-            repo_id="nbettencourt/SC454k",
-            filename="SC454k_cleaned.parquet",
-            repo_type="dataset",
-            cache_dir=data_dir
-        )
-    else:
-        logger.info("Found main parquet file locally.")
-
-    if not os.path.exists(preprocessed_file):
-        logger.info("Preprocessed parquet file not found locally. Downloading from Hugging Face...")
-        preprocessed_file = hf_hub_download(
-            repo_id="nbettencourt/SC454k-preprocessed",
-            filename="sc454k-preprocessed-updated.parquet",
-            repo_type="dataset",
-            cache_dir=data_dir
-        )
-    else:
-        logger.info("Found preprocessed parquet file locally.")
-
-    return main_file, preprocessed_file
-
-def get_total_rows(parquet_path):
-    # Read only the metadata (no columns) to get the number of rows
-    table = pq.read_table(parquet_path, columns=[])
-    return table.num_rows
     
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
@@ -153,15 +113,123 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     return df
-    
-def get_new_data(new_data_url):
-    load_dotenv('/content/MoE-Asset-Pricing/.env')
-    hf_token = os.getenv('HF_TOKEN')
 
-    login(hf_token)
-    dataset = load_dataset(new_data_url)
-    df = dataset['test'].to_pandas()
-    return df
+def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, device, 
+                        batch_size=500, global_offset=0, global_max=int(1e12), 
+                        cache_dir="/tmp/hf_cache_datasets_run"):
+    """
+    Streams a run dataset from disk in small batches to avoid loading the entire file into RAM.
+    
+    It uses global_offset and global_max to process only a subset of rows (e.g., based on args.percent_data).
+    After processing, the downloaded file and the temporary cache directory are deleted to free disk space.
+    
+    Args:
+        run_dataset_filename (str): Filename for the run dataset (e.g., "run_dataset_1.parquet").
+        tokenizer: The transformer tokenizer.
+        model (torch.nn.Module): The main transformer model.
+        ebm (torch.nn.Module): The energy-based model.
+        args: Command-line arguments (expects args.ebm_num_samples, etc.).
+        device: The device (CUDA/CPU) to run on.
+        batch_size (int): Number of rows to process per record batch.
+        global_offset (int): Total number of rows to skip before processing.
+        global_max (int): Maximum total rows to process.
+        cache_dir (str): Temporary directory to download the file to.
+    
+    Returns:
+        predictions, actuals, oldprices, riskfree, sectors: Lists of results aggregated across batches.
+    """
+    # Ensure the temporary cache directory exists.
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    repo_id = "nbettencourt/sc454k-preprocessed-dfs"
+    # Download the file into our temporary cache directory.
+    file_path = hf_hub_download(
+        repo_id=repo_id, 
+        filename=run_dataset_filename, 
+        repo_type="dataset", 
+        cache_dir=cache_dir
+    )
+    
+    # Open the parquet file with PyArrow without loading it all into RAM.
+    parquet_file = pq.ParquetFile(file_path)
+    
+    predictions = []
+    actuals = []
+    oldprices = []
+    riskfree = []
+    sectors = []
+    
+    processed = 0  # Count total rows processed so far.
+    
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        # Convert the current record batch into a Pandas DataFrame.
+        df_chunk = batch.to_pandas()
+        # Apply filtering as in get_data.
+        df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
+        df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0]
+        
+        num_rows = len(df_chunk)
+        # If we haven't yet reached our global_offset, skip the appropriate number of rows.
+        if processed < global_offset:
+            if processed + num_rows <= global_offset:
+                processed += num_rows
+                continue
+            else:
+                start_idx = global_offset - processed
+        else:
+            start_idx = 0
+        
+        # Determine end index, ensuring we do not exceed global_max.
+        end_idx = num_rows
+        if processed + end_idx > global_max:
+            end_idx = global_max - processed
+        
+        # Process rows in the slice [start_idx:end_idx]
+        for idx in range(start_idx, end_idx):
+            sample = df_chunk.iloc[idx]
+            try:
+                best_context = ebm_select_contexts(
+                    df=df_chunk,
+                    idx=idx,
+                    model=model,
+                    ebm=ebm,
+                    tokenizer=tokenizer,
+                    ebm_samples=args.ebm_num_samples
+                )
+            except Exception as e:
+                print(f"Error processing row {processed+idx}: {e}")
+                continue
+            final_input = best_context
+            encoding = tokenizer(
+                final_input,
+                truncation=True,
+                padding="max_length",
+                max_length=config.BLOCK_SIZE,
+                return_tensors="pt"
+            ).to(device)
+            input_ids = encoding["input_ids"]
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                pred, _ = model(input_ids=input_ids)
+            predictions.append(pred.item())
+            actuals.append(sample['weighted_avg_720_hrs'])
+            oldprices.append(sample['weighted_avg_0_hrs'])
+            riskfree.append(sample['Risk_Free_Rate'])
+            sectors.append(sample.get('Sector', "Unknown"))
+            print(f"Processed row {processed + idx}: predicted price {pred.item()}")
+        
+        processed += num_rows
+        del df_chunk
+        gc.collect()
+        if processed >= global_max:
+            break
+
+    # Cleanup: delete the downloaded file and clear the temporary cache directory.
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    
+    return predictions, actuals, oldprices, riskfree, sectors
 
 def load_model_weights(model, weights_path, device):
     if os.path.exists(weights_path):
