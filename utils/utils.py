@@ -940,180 +940,89 @@ def compute_l2_loss(model):
             l2_loss += torch.norm(param, 2) ** 2
     return l2_loss
 
-def evaluate_model(model, dataloader, device):
+def evaluate_model(predictions, actuals, oldprices, riskfree, sectors):
     """
-    Evaluate the model on a validation/test set and compute metrics, including:
-      - MSE, R²
-      - Trend Accuracy
-      - Sharpe Ratio
-      - Sortino Ratio
-      - Average Return
-      - Win Rate
-      - Profit Factor
-
+    Evaluates predictions given lists of predictions, actuals, old prices, risk-free rates, and sectors.
+    
     Returns:
-        mse (float): Mean Squared Error (overall).
-        r2 (float): R² Score (overall).
-        sector_metrics (dict): sector -> { ... metrics ... } computed on merged data.
-        overall_trend_acc (float): Overall trend accuracy.
-        sharpe_ratio (float): Overall Sharpe Ratio.
-        sortino_ratio (float): Overall Sortino Ratio.
-        average_return (float): Average return per trade.
-        win_rate (float): Win rate (percentage).
-        profit_factor (float): Profit factor.
+        mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, 
+        average_return, win_rate, profit_factor
     """
-    import torch.distributed as dist
-    from sklearn.metrics import mean_squared_error, r2_score
-    from tqdm import tqdm
-    model.eval()
-
-    # Initialize overall accumulators.
-    local_overall = {
-        "predictions": [],
-        "actuals": [],
-        "oldprices": [],
-        "riskfree": []
-    }
-    sectors_list = []
-    local_sector_data = {}
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            old_prices = batch['old_price'].to(device)
-            sectors = batch['sector']  # assume sectors come as a list
-            risk_free_rate = batch['risk_free_rate'].to(device)
-
-            with torch.amp.autocast(device_type='cuda'):
-                outputs, _ = model(input_ids=input_ids)
-
-            outputs_np = outputs.detach().cpu().numpy().flatten()
-            labels_np = labels.detach().cpu().numpy()
-            old_prices_np = old_prices.detach().cpu().numpy()
-            rf_np = risk_free_rate.detach().cpu().numpy()
-
-            local_overall["predictions"].extend(outputs_np.tolist())
-            local_overall["actuals"].extend(labels_np.tolist())
-            local_overall["oldprices"].extend(old_prices_np.tolist())
-            local_overall["riskfree"].extend(rf_np.tolist())
-            sectors_list.extend(sectors)
-
-            for i, sector in enumerate(sectors):
-                if sector not in local_sector_data:
-                    local_sector_data[sector] = {
-                        "predictions": [],
-                        "actuals": [],
-                        "oldprices": [],
-                        "riskfree": []
-                    }
-                local_sector_data[sector]["predictions"].append(outputs_np[i])
-                local_sector_data[sector]["actuals"].append(labels_np[i])
-                local_sector_data[sector]["oldprices"].append(old_prices_np[i])
-                local_sector_data[sector]["riskfree"].append(rf_np[i])
-
-    # Merge overall data from all GPUs if using DDP.
-    if dist.is_initialized():
-        world_size = dist.get_world_size()
-        gathered_overall = [None for _ in range(world_size)]
-        dist.all_gather_object(gathered_overall, local_overall)
-        merged_overall = {"predictions": [], "actuals": [], "oldprices": [], "riskfree": []}
-        for d in gathered_overall:
-            merged_overall["predictions"].extend(d["predictions"])
-            merged_overall["actuals"].extend(d["actuals"])
-            merged_overall["oldprices"].extend(d["oldprices"])
-            merged_overall["riskfree"].extend(d["riskfree"])
-    else:
-        merged_overall = local_overall
-
-    # Compute overall metrics.
-    predictions = np.array(merged_overall["predictions"])
-    actuals = np.array(merged_overall["actuals"])
-    oldprice_arr = np.array(merged_overall["oldprices"])
-    rf_arr = np.array(merged_overall["riskfree"])
-
+    predictions = np.array(predictions)
+    actuals = np.array(actuals)
+    oldprices = np.array(oldprices)
+    riskfree = np.array(riskfree)
+    
     mse = mean_squared_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
-
-    true_trends = np.sign(actuals - oldprice_arr)
-    pred_trends = np.sign(predictions - oldprice_arr)
+    
+    true_trends = np.sign(actuals - oldprices)
+    pred_trends = np.sign(predictions - oldprices)
     overall_trend_acc = np.mean(true_trends == pred_trends) if predictions.size > 0 else 0.0
-
-    buy_signals = (predictions > oldprice_arr).astype(float)
-    strategy_returns = (actuals - oldprice_arr) / (oldprice_arr + 1e-12) * buy_signals
-    excess_returns = strategy_returns - rf_arr
-
+    
+    buy_signals = (predictions > oldprices).astype(float)
+    strategy_returns = (actuals - oldprices) / (oldprices + 1e-12) * buy_signals
+    excess_returns = strategy_returns - riskfree
+    
     sr_mean = np.mean(excess_returns)
     sr_std = np.std(excess_returns, ddof=1)
     sharpe_ratio = sr_mean / sr_std if sr_std > 1e-12 else 0.0
-
+    
     neg_mask = (excess_returns < 0)
     if np.any(neg_mask):
         downside_std = np.std(excess_returns[neg_mask], ddof=1)
         sortino_ratio = sr_mean / downside_std if downside_std > 1e-12 else float('inf')
     else:
         sortino_ratio = float('inf')
-
+    
     average_return = np.mean(strategy_returns) if strategy_returns.size > 0 else 0.0
     wins = strategy_returns > 0
     win_rate = np.mean(wins) * 100 if wins.size > 0 else 0.0
     gross_profits = strategy_returns[strategy_returns > 0].sum()
     gross_losses = -strategy_returns[strategy_returns < 0].sum()
     profit_factor = (gross_profits / gross_losses) if gross_losses > 1e-12 else float('inf')
-
-    # Merge per-sector data across GPUs.
-    if dist.is_initialized():
-        world_size = dist.get_world_size()
-        gathered_sector_data = [None for _ in range(world_size)]
-        dist.all_gather_object(gathered_sector_data, local_sector_data)
-        merged_sector_data = {}
-        for sector_data in gathered_sector_data:
-            for sector, data in sector_data.items():
-                if sector not in merged_sector_data:
-                    merged_sector_data[sector] = {"predictions": [], "actuals": [], "oldprices": [], "riskfree": []}
-                merged_sector_data[sector]["predictions"].extend(data["predictions"])
-                merged_sector_data[sector]["actuals"].extend(data["actuals"])
-                merged_sector_data[sector]["oldprices"].extend(data["oldprices"])
-                merged_sector_data[sector]["riskfree"].extend(data["riskfree"])
-    else:
-        merged_sector_data = local_sector_data
-
+    
+    # Compute per-sector metrics
     sector_metrics = {}
-    for sector, vals in merged_sector_data.items():
-        spreds = np.array(vals["predictions"], dtype=np.float64)
-        sacts = np.array(vals["actuals"], dtype=np.float64)
-        soldp = np.array(vals["oldprices"], dtype=np.float64)
-        sriskf = np.array(vals["riskfree"], dtype=np.float64)
-
+    unique_sectors = np.unique(sectors)
+    for sec in unique_sectors:
+        indices = [i for i, s in enumerate(sectors) if s == sec]
+        if not indices:
+            continue
+        spreds = predictions[indices]
+        sacts = actuals[indices]
+        soldp = oldprices[indices]
+        sriskf = riskfree[indices]
+        
         sec_mse = mean_squared_error(sacts, spreds)
         sec_r2 = r2_score(sacts, spreds)
         sec_true_trends = np.sign(sacts - soldp)
         sec_pred_trends = np.sign(spreds - soldp)
         sec_trend_acc = np.mean(sec_true_trends == sec_pred_trends) if spreds.size > 0 else 0.0
-
+        
         sec_signals = (spreds > soldp).astype(float)
         sec_strategy_returns = (sacts - soldp) / (soldp + 1e-12) * sec_signals
         sec_excess_returns = sec_strategy_returns - sriskf
-
+        
         sec_ex_mean = np.mean(sec_excess_returns)
         sec_ex_std = np.std(sec_excess_returns, ddof=1)
         sec_sharpe = sec_ex_mean / sec_ex_std if sec_ex_std > 1e-12 else 0.0
-
+        
         neg_mask_s = (sec_excess_returns < 0)
         if np.any(neg_mask_s):
             sec_downside_std = np.std(sec_excess_returns[neg_mask_s], ddof=1)
             sec_sortino = sec_ex_mean / sec_downside_std if sec_downside_std > 1e-12 else float('inf')
         else:
             sec_sortino = float('inf')
-
+        
         sec_avg_return = np.mean(sec_strategy_returns) if sec_strategy_returns.size > 0 else 0.0
         sec_wins = sec_strategy_returns > 0
         sec_win_rate = np.mean(sec_wins) * 100 if sec_wins.size > 0 else 0.0
         sec_gross_profits = sec_strategy_returns[sec_strategy_returns > 0].sum()
         sec_gross_losses = -sec_strategy_returns[sec_strategy_returns < 0].sum()
         sec_profit_factor = (sec_gross_profits / sec_gross_losses) if sec_gross_losses > 1e-12 else float('inf')
-
-        sector_metrics[sector] = {
+        
+        sector_metrics[sec] = {
             "mse": sec_mse,
             "r2": sec_r2,
             "trend_acc": sec_trend_acc,
@@ -1123,20 +1032,9 @@ def evaluate_model(model, dataloader, device):
             "win_rate": sec_win_rate,
             "profit_factor": sec_profit_factor
         }
-
-    model.train()
-    return (
-        mse,             # Mean Squared Error
-        r2,              # R² Score
-        sector_metrics,  # Per-sector metrics
-        overall_trend_acc,  # Overall trend accuracy
-        sharpe_ratio,    # Sharpe Ratio
-        sortino_ratio,   # Sortino Ratio
-        average_return,  # Average Return
-        win_rate,        # Win Rate
-        profit_factor    # Profit Factor
-    )
-
+    
+    return mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor
+    
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
     """
     Load model and optimizer states from a checkpoint.
