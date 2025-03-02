@@ -298,7 +298,7 @@ def main():
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
     
-        # Download models from S3 if necessary.
+        # Download models from S3 if needed.
         download_models_from_s3(bucket=args.bucket)
     
         consolidated_model_path = consolidate_checkpoint_to_pth(
@@ -321,27 +321,26 @@ def main():
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
             ebm.to(device)
+            ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
     
-            # Define global_max for run mode based on percent_data.
-            # For example, if the full run datasets contain 20% of total rows (0.2 * 453932),
-            # and you want only a fraction of that:
+            # Compute global_max based on args.percent_data.
+            # For example, if the full run datasets correspond to 20% of 453932 rows:
             if args.percent_data < 100:
                 global_max = int(0.2 * 453932 * (args.percent_data / 100))
             else:
-                global_max = int(0.2 * 453932)
-    
+                global_max = int(1e12)
             cumulative_offset = 0
+    
             all_predictions = []
             all_actuals = []
             all_oldprices = []
             all_riskfree = []
             all_sectors = []
     
-            # Loop over run dataset files 1 to 18.
+            # Loop through run_dataset_1.parquet to run_dataset_18.parquet.
             for i in range(1, 19):
-                # If we've already processed enough rows, break.
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
@@ -368,13 +367,14 @@ def main():
                 all_sectors.extend(sects)
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
     
-            # Evaluate results using a helper that accepts lists.
+            # Evaluate overall metrics from accumulated lists.
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
-            average_return, win_rate, profit_factor = evaluate_model_from_lists(
+            average_return, win_rate, profit_factor = evaluate_model(
                 predictions=all_predictions,
                 actuals=all_actuals,
                 oldprices=all_oldprices,
-                riskfree=all_riskfree
+                riskfree=all_riskfree,
+                sectors=all_sectors
             )
     
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
