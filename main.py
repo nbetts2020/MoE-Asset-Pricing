@@ -354,7 +354,7 @@ def main():
                     ebm=ebm,
                     args=args,
                     device=device,
-                    batch_size=500,
+                    batch_size=25,
                     current_offset=cumulative_offset,
                     global_max=global_max,
                     cache_dir="/tmp/hf_cache_datasets_run"
