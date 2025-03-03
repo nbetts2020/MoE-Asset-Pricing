@@ -177,12 +177,12 @@ def main():
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
-
+    
         # Prepare hybrid optimizer: returns (adam_optimizer, muon_optimizer)
         adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
-
+    
         # Initialize DeepSpeed with the AdamW branch.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
@@ -191,24 +191,32 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logging.info(f"Global rank (train): {global_rank}")
-
+    
         if args.use_ebm:
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
         else:
             ebm = None
             ebm_optimizer = None
-
-        # Instead of passing an external dataloader, pass None.
-        # The train_model function will handle loading chunks from the Hugging Face repository.
+    
+        # Load the entire training dataset using get_data in train mode.
+        df = get_data(None, None, None, None, args=args)  # modified get_data ignores chunking for train mode
+        dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
+        train_loader = DataLoader(
+            dataset,
+            batch_size=config.BATCH_SIZE,
+            shuffle=True,
+            collate_fn=custom_collate_fn,
+            pin_memory=True
+        )
+        
+        # Now pass the full DataLoader to train_model
         train_model(
             model=engine,
             optimizers=(adam_optimizer, muon_optimizer),
             epochs=config.EPOCHS,
             device=device,
-            dataloader=None,
+            dataloader=train_loader,
             args=args,
             si=initialize_si(engine, args) if args.use_si else None,
             ewc=[ElasticWeightConsolidation(engine, None, device, args)] if args.use_ewc else None,
@@ -219,7 +227,7 @@ def main():
             use_deepspeed=True
         )
         logging.info("Training completed.")
-
+    
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         tag = "final"
