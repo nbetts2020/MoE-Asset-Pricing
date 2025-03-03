@@ -62,54 +62,51 @@ def kaiming_init_weights(m):
     
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
-    Loads a chunk of data from Hugging Face and deletes the local file afterward.
-
-    For training (mode=="train"), it loads a file named:
-       "train_dataset_{window_index}{epoch_letter}.parquet"
-    For run (mode=="run"), it loads a file named:
-       "run_dataset_{window_index}.parquet"
-
-    Uses global_offset/global_max to limit the number of rows returned.
-    Files are downloaded to a custom cache directory and then deleted to free disk space.
+    For run mode, loads a chunk from the original preprocessed dataset.
+    For train mode, loads the entire new SC454k-formatted dataset,
+    filters out rows with nan or non-positive weighted_avg_720_hrs,
+    and subsamples based on args.percent_data.
     """
-    # Ensure cache directory exists
     os.makedirs(cache_dir, exist_ok=True)
-    
+
     if args.mode == "train":
-        epoch_letter = chr(ord('a') + epoch - 1)
-        filename = f"train_dataset_{window_index}{epoch_letter}.parquet"
+        repo_id = "nbettencourt/SC454k-formatted"
+        filename = "SC454k-formatted.parquet"
     elif args.mode == "run":
+        repo_id = "nbettencourt/sc454k-preprocessed-dfs"
+        epoch_letter = chr(ord('a') + epoch - 1)
         filename = f"run_dataset_{window_index}.parquet"
     else:
-        raise ValueError(f"Unknown mode: {mode}")
+        raise ValueError(f"Unknown mode: {args.mode}")
 
-    repo_id = "nbettencourt/sc454k-preprocessed-dfs"
-    # Download file into the specified temporary cache directory
     file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=cache_dir)
+    df = pd.read_parquet(file_path)
 
-    # Load data
-    df = pd.read_parquet(file_path).dropna(subset=['weighted_avg_720_hrs'])
-    df = df[df['weighted_avg_720_hrs'] > 0]
+    if args.mode == "run":
+        # Run mode filtering and chunking remains as before.
+        df = df.dropna(subset=['weighted_avg_720_hrs'])
+        df = df[df['weighted_avg_720_hrs'] > 0]
+        if global_offset >= global_max:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            if os.path.exists(cache_dir):
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            return pd.DataFrame()
+        chunk_rows = len(df)
+        if global_offset + chunk_rows > global_max:
+            needed = global_max - global_offset
+            df = df.iloc[:needed]
+    else:
+        # For train mode, filter out rows with NaN or non-positive weighted_avg_720_hrs.
+        df = df.dropna(subset=['weighted_avg_720_hrs'])
+        df = df[df['weighted_avg_720_hrs'] > 0]
+        # Subsample based on percent_data.
+        num_rows = int(len(df) * (args.percent_data / 100))
+        df = df.iloc[:num_rows]
 
-    # If we've already hit the global_max, return empty DataFrame
-    if global_offset >= global_max:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        # Clear cache directory
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        return pd.DataFrame()
-
-    chunk_rows = len(df)
-    # Truncate if adding this chunk exceeds the global_max
-    if global_offset + chunk_rows > global_max:
-        needed = global_max - global_offset
-        df = df.iloc[:needed]
-
-    # Delete the file to free up space
+    # Cleanup downloaded file and cache.
     if os.path.exists(file_path):
         os.remove(file_path)
-    # Clear the temporary cache directory after deletion
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir, ignore_errors=True)
 
