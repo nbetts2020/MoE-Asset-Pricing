@@ -199,18 +199,19 @@ def main():
             ebm = None
             ebm_optimizer = None
     
-        # Load the entire training dataset using get_data in train mode.
-        df = get_data(None, None, None, None, args=args)  # modified get_data ignores chunking for train mode
-        dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
-        train_loader = DataLoader(
-            dataset,
+        # Build a DataLoader using prepare_dataloader for training (train mode ignores chunking parameters)
+        train_loader = prepare_dataloader(
+            epoch=1,                # dummy value; for train mode, get_data ignores chunking
+            window_index=1,         # dummy value; same reason
+            tokenizer=tokenizer,
             batch_size=config.BATCH_SIZE,
             shuffle=True,
-            collate_fn=custom_collate_fn,
-            pin_memory=True
+            global_offset=0,
+            global_max=1e12,
+            args=args
         )
-        
-        # Now pass the full DataLoader to train_model
+    
+        # Pass the DataLoader to train_model
         train_model(
             model=engine,
             optimizers=(adam_optimizer, muon_optimizer),
@@ -238,6 +239,7 @@ def main():
         if args.use_ebm and ebm is not None:
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
             logging.info("EBM model saved.")
+
             
     elif args.mode == "update":
         print_debug_info("UPDATE MODE START")
