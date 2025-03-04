@@ -71,21 +71,22 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
 
     if args.mode == "train":
         repo_id = "nbettencourt/SC454k-formatted"
-        filename = "SC454k-formatted.parquet"
+        ds = load_dataset(repo_id, split="train")
+        df = ds.to_pandas()
     elif args.mode == "run":
         repo_id = "nbettencourt/sc454k-preprocessed-dfs"
         epoch_letter = chr(ord('a') + epoch - 1)
         filename = f"run_dataset_{window_index}.parquet"
+
+        file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=cache_dir)
+        df = pd.read_parquet(file_path)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
-
-    file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=cache_dir)
-    df = pd.read_parquet(file_path)
-
+        
+    df = df.dropna(subset=['weighted_avg_720_hrs'])
+    df = df[df['weighted_avg_720_hrs'] > 0]
+    
     if args.mode == "run":
-        # Run mode filtering and chunking remains as before.
-        df = df.dropna(subset=['weighted_avg_720_hrs'])
-        df = df[df['weighted_avg_720_hrs'] > 0]
         if global_offset >= global_max:
             if os.path.exists(file_path):
                 os.remove(file_path)
