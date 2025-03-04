@@ -51,7 +51,7 @@ def train_model(
         logging.info(f"=== Starting epoch {epoch}/{epochs} ===")
 
         disable = (rank != 0)
-        for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}")):
+        for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}", disable=disable)):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
