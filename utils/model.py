@@ -152,7 +152,7 @@ class Block(nn.Module):
         return x, entropy_loss
 
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name='gpt2'):
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name='decapoda-research/llama-7b-hf'):
         super(SparseMoELanguageModel, self).__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         vocab_size = self.tokenizer.vocab_size
