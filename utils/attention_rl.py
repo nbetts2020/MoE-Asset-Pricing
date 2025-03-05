@@ -92,7 +92,7 @@ class HierarchicalAttentionRL(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.tokenizer.model_max_length = max_length  # local max per section
         self.vocab_size = self.tokenizer.vocab_size
-        # Learnable embedding layer for token IDs.
+        # Learnable embedding layer for token IDs; used only if model is not provided.
         self.embedding = nn.Embedding(self.vocab_size, embed_dim)
         self.embed_dim = embed_dim
         self.max_length = max_length
@@ -105,13 +105,15 @@ class HierarchicalAttentionRL(nn.Module):
         # We pool by averaging the downsampled tokens.
         self.reg_head = nn.Linear(embed_dim, 1)
     
-    def forward(self, formatted_text: str):
+    def forward(self, formatted_text: str, model: nn.Module = None):
         """
         Args:
             formatted_text: A single concatenated article (string).
+            model: (Optional) The main transformer model with a get_embeddings() method.
+                   If provided, its embeddings will be used for each token.
         Returns:
             compressed: Fixed-size representation from learned downsampling (1, num_queries, embed_dim)
-            pred: Regression prediction (scalar tensor)
+            pred: Regression output (scalar tensor) – used during RL training.
             log_prob: Log probability from the downsampler (scalar tensor)
         """
         device = next(self.parameters()).device
@@ -132,16 +134,17 @@ class HierarchicalAttentionRL(nn.Module):
                 return_tensors="pt"
             )
             input_ids = tokens["input_ids"].to(device)  # (1, max_length)
-            embeds = self.embedding(input_ids)  # (1, max_length, embed_dim)
+            if model is not None and hasattr(model, "get_embeddings"):
+                embeds = model.get_embeddings(input_ids)
+            else:
+                embeds = self.embedding(input_ids)
             section_embeds.append(embeds)
         
         # 3. Concatenate token embeddings along the sequence dimension.
-        # Each section_embeds[i] is (1, max_length, embed_dim); cat along dim=1.
         full_sequence = torch.cat(section_embeds, dim=1)  # (1, num_sections * max_length, embed_dim)
         
         # 4. Optional: Truncate if sequence length exceeds truncate_limit.
         if self.truncate_limit is not None and full_sequence.size(1) > self.truncate_limit:
-            # For example, take the last truncate_limit tokens.
             full_sequence = full_sequence[:, -self.truncate_limit:, :]
         
         # 5. Global Attention with Learned Downsampler:
@@ -180,7 +183,7 @@ def rl_collate_fn(batch):
 # ------------------------------
 # RL Training Function
 # ------------------------------
-def rl_train_hAttention(args):
+def rl_train_hAttention(args, model: nn.Module):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load RL data from chunked files (sample desired rows)
@@ -205,7 +208,7 @@ def rl_train_hAttention(args):
         embed_dim=config.N_EMBED,
         max_length=config.BLOCK_SIZE,
         num_queries=4096,
-        truncate_limit=None  # Set to a value (e.g., 64000) to enable truncation
+        truncate_limit=None  # Set to a value (e.g., 64000) to enable truncation if desired.
     ).to(device)
 
     optimizer = torch.optim.Adam(hAttention.parameters(), lr=args.rl_learning_rate)
@@ -215,7 +218,6 @@ def rl_train_hAttention(args):
         epoch_reward = 0.0
         num_batches = 0
         for batch in rl_loader:
-            # Process each sample in the batch individually.
             batch_loss = 0.0
             batch_log_probs = []
             preds = []
@@ -223,11 +225,11 @@ def rl_train_hAttention(args):
             for sample in batch:
                 text = sample["text"]
                 target = torch.tensor(sample["target"], dtype=torch.float32, device=device)
-                _, pred, log_prob = hAttention(text)
+                # Pass text along with the main model to obtain embeddings.
+                _, pred, log_prob = hAttention(text, model=model)
                 preds.append(pred)
                 targets.append(target)
                 batch_log_probs.append(log_prob)
-            # Stack predictions and targets
             preds_tensor = torch.stack(preds)
             targets_tensor = torch.stack(targets)
             mse_loss = F.mse_loss(preds_tensor, targets_tensor)
@@ -248,7 +250,6 @@ def rl_train_hAttention(args):
         avg_reward = epoch_reward / num_batches if num_batches > 0 else 0.0
         logging.info(f"RL Epoch {epoch}: Avg Loss = {avg_loss:.4f}, Avg Reward = {avg_reward:.4f}")
 
-    # Save the trained module
-    save_path = os.path.join(args.save_dir, "hAttention_rl.pth")
-    torch.save(hAttention.state_dict(), save_path)
-    logging.info(f"Hierarchical Attention RL module saved to {save_path}")
+    # Save the trained RL module and upload to S3.
+    from utils.utils import save_rl_attention
+    save_rl_attention(hAttention, epoch=config.EPOCHS, save_dir=args.save_dir, args=args)
