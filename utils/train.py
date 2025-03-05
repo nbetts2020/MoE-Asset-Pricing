@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
-from tqdm import tqdm
 
 from utils.utils import compute_l2_loss
 from utils.config import config
@@ -37,7 +36,6 @@ def train_model(
       - Optional EBM placeholders
       - Deepspeed or standard PyTorch training
     """
-
     adam_optimizer, muon_optimizer = optimizers
     rank = 0
     if torch.distributed.is_initialized():
@@ -49,13 +47,15 @@ def train_model(
     for epoch in range(1, epochs + 1):
         model.train()
         logging.info(f"=== Starting epoch {epoch}/{epochs} ===")
+        total_batches = len(dataloader)
 
-        disable = (rank != 0)
-        for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}", disable=disable)):
+        for step, batch in enumerate(dataloader):
+            print(f"Processing batch {step + 1}/{total_batches}")
+            
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass
+            # Forward pass with mixed precision
             with torch.cuda.amp.autocast(enabled=True):
                 outputs, _ = model(input_ids=input_ids)
                 loss = F.mse_loss(outputs.squeeze(-1), labels.float())
@@ -84,7 +84,7 @@ def train_model(
                 if args.use_si and si:
                     loss += si.penalty(model)
 
-            # Zero grads for both optimizers
+            # Zero gradients for both optimizers
             adam_optimizer.zero_grad()
             muon_optimizer.zero_grad()
 
@@ -101,7 +101,7 @@ def train_model(
             if args.use_si and si:
                 si.update_weights(model)
 
-            # Add the current batch to replay buffer (defaulting errors to 0.0)
+            # Add the current batch to replay buffer
             if args.use_replay_buffer and replay_buffer:
                 replay_buffer.add_batch(batch)
 
