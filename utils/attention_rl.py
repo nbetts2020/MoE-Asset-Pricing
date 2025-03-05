@@ -135,7 +135,7 @@ class HierarchicalAttentionRL(nn.Module):
             )
             input_ids = tokens["input_ids"].to(device)  # (1, max_length)
             if model is not None and hasattr(model, "get_embeddings"):
-                embeds = model.get_embeddings(input_ids)
+                embeds = model.get_embeddings(input_ids, pool=False)
             else:
                 embeds = self.embedding(input_ids)
             section_embeds.append(embeds)
