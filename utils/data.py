@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------------
 # GLOBAL TOKENIZER SETUP
 # -------------------------------------------------------------------------
-TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "gpt2")
+TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "decapoda-research/llama-7b-hf")
 GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
