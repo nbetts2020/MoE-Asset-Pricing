@@ -56,9 +56,108 @@ from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabili
 
 logger = logging.getLogger(__name__)
 
+CHUNK_SIZES = {
+    1: 50000,
+    2: 25000,
+    3: 25000,
+    4: 25000,
+    5: 25000,
+    6: 25000,
+    7: 25000,
+    8: 25000,
+    9: 25000,
+    10: 25000,
+    11: 25000,
+    12: 25000,
+    13: 13146
+}
+TOTAL_CHUNK_ROWS = sum(CHUNK_SIZES.values())  # 50000 + 25k*11 + 13146 = 338146
+
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
+
+def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int = 13, shuffle: bool = True):
+    """
+    Loads row data for RL from chunked Parquet files:
+      train_dataset_{chunk_index}a.parquet
+    
+    If rl_rows = -1, loads ALL rows from all chunks.
+    Otherwise, samples proportionally across chunks to total ~rl_rows rows.
+
+    Returns a single DataFrame with the concatenated (and optionally shuffled) data.
+    """
+
+    final_dfs = []
+    accumulated = 0
+
+    for chunk_idx in range(chunk_start, chunk_end + 1):
+        if chunk_idx not in CHUNK_SIZES:
+            logging.warning(f"Chunk {chunk_idx} not found in CHUNK_SIZES map. Skipping.")
+            continue
+
+        chunk_size = CHUNK_SIZES[chunk_idx]
+
+        # Load the chunk fully via get_data. 
+        # We'll always pass epoch=1 and window_index=chunk_idx, ignoring global_offset, etc.
+        df_chunk = get_data(
+            epoch=1,
+            window_index=chunk_idx,
+            global_offset=0,
+            global_max=int(1e12),  # effectively no limit
+            args=args
+        )
+        if df_chunk.empty:
+            logging.info(f"Chunk {chunk_idx} returned empty DataFrame.")
+            continue
+
+        if rl_rows == -1:
+            # Means user wants all data from all chunks
+            final_dfs.append(df_chunk)
+        else:
+            # Proportional sample: chunk_needed = (chunk_size / TOTAL_CHUNK_ROWS) * rl_rows
+            chunk_needed = int(round((chunk_size / TOTAL_CHUNK_ROWS) * rl_rows))
+            if chunk_needed <= 0:
+                # If rounding leads to 0, skip
+                continue
+
+            # If chunk has fewer rows than chunk_needed, just take the entire chunk
+            if chunk_needed >= len(df_chunk):
+                final_dfs.append(df_chunk)
+            else:
+                sampled_df = df_chunk.sample(n=chunk_needed, random_state=random.randint(0, 999999))
+                final_dfs.append(sampled_df)
+
+        accumulated += len(final_dfs[-1])
+
+        # Cleanup
+        del df_chunk
+        gc.collect()
+
+        # If we've already reached or exceeded rl_rows, we can break
+        if rl_rows != -1 and accumulated >= rl_rows:
+            break
+
+    if not final_dfs:
+        logging.warning("No data was loaded or sampled from the chunks.")
+        return pd.DataFrame()
+
+    # Merge all samples
+    final_df = pd.concat(final_dfs, ignore_index=True)
+
+    # If we slightly overshot the target, sample one last time
+    if rl_rows != -1 and len(final_df) > rl_rows:
+        final_df = final_df.sample(n=rl_rows, random_state=random.randint(0, 999999)).reset_index(drop=True)
+
+    # Shuffle final if desired
+    if shuffle and len(final_df) > 1:
+        final_df = final_df.sample(frac=1.0, random_state=random.randint(0, 999999)).reset_index(drop=True)
+
+    logging.info(
+        f"[load_rl_data] Final RL DataFrame has {len(final_df)} rows "
+        f"(desired={rl_rows if rl_rows != -1 else 'ALL'})."
+    )
+    return final_df
     
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
