@@ -196,6 +196,12 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
         if global_offset + chunk_rows > global_max:
             needed = global_max - global_offset
             df = df.iloc[:needed]
+            
+        # Cleanup downloaded file and cache.
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
     else:
         # For train mode, filter out rows with NaN or non-positive weighted_avg_720_hrs.
         df = df.dropna(subset=['weighted_avg_720_hrs'])
@@ -203,12 +209,6 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
         # Subsample based on percent_data.
         num_rows = int(len(df) * (args.percent_data / 100))
         df = df.iloc[:num_rows]
-
-    # Cleanup downloaded file and cache.
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir, ignore_errors=True)
 
     return df
 
