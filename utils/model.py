@@ -200,13 +200,14 @@ class SparseMoELanguageModel(nn.Module):
 
         return output, loss
 
-    def get_embeddings(self, input_ids):
+    def get_embeddings(self, input_ids, pool=True):
         B, T = input_ids.shape
         tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
         pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
         x = tok_emb + pos_emb  # (B, T, n_embed)
         x = self.ln_f(x)
-        x = x.mean(dim=1)  # (B, n_embed)
+        if pool:
+            x = x.mean(dim=1)  # (B, n_embed)
         return x
 
     # Model is regressive, so a streaming output doesn't make sense - keeping it for potential future use
