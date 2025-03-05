@@ -341,8 +341,9 @@ def load_model_weights(model, weights_path, device):
 
 def download_models_from_s3(bucket):
     """
-    Downloads the 'model' and 'models' directories from the specified S3 bucket.
-
+    Downloads the 'model' and 'models' directories from the specified S3 bucket,
+    and additionally downloads the RL attention module file.
+    
     Args:
         bucket (str): Name of the S3 bucket.
     """
@@ -373,6 +374,47 @@ def download_models_from_s3(bucket):
     except subprocess.CalledProcessError as e:
         logging.error(f"Error syncing 'models' directory: {e.stderr}")
         raise
+
+    try:
+        logging.info(f"Starting download of RL Attention file from s3://{bucket}/models/hAttention_rl.pth")
+        result = subprocess.run(
+            ["aws", "s3", "cp", f"s3://{bucket}/models/hAttention_rl.pth", "models/hAttention_rl.pth"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        logging.info(f"RL Attention file downloaded successfully.\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error downloading RL Attention file: {e.stderr}")
+        raise
+
+def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
+    """
+    Saves the RL hierarchical attention module's state dictionary to a file and,
+    if a bucket is specified in args, uploads it to S3.
+    
+    Args:
+        rl_module (nn.Module): The RL attention module to save.
+        epoch (int): Current epoch (for logging/versioning, if desired).
+        save_dir (str): Local directory to save the model.
+        args (argparse.Namespace, optional): Command-line arguments; if args.bucket is provided, the file is uploaded.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "hAttention_rl.pth")
+    torch.save(rl_module.state_dict(), save_path)
+    print(f"RL Attention module saved to {save_path}")
+    logging.info(f"RL Attention module saved to {save_path} at epoch {epoch}")
+    
+    if args is not None and hasattr(args, "bucket") and args.bucket:
+        try:
+            import subprocess
+            s3_path = f"s3://{args.bucket}/models/hAttention_rl.pth"
+            cmd = ["aws", "s3", "cp", save_path, s3_path]
+            subprocess.run(cmd, check=True)
+            logging.info(f"RL Attention module uploaded to {s3_path}")
+        except Exception as e:
+            logging.error(f"Error uploading RL Attention module to S3: {e}")
 
 def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
     """
