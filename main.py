@@ -10,7 +10,7 @@ from multiprocessing import cpu_count
 from sklearn.metrics import mean_squared_error, r2_score
 
 import deepspeed  # DeepSpeed integration
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaTokenizerFast
 
 from utils.model import SparseMoELanguageModel
 from utils.ebm import EnergyBasedModel
@@ -69,7 +69,7 @@ def main():
                         help="Mode: 'train', 'run', 'update', 'test_forgetting', or 'rl'")
     parser.add_argument("input_text", type=str, nargs="?", default=None,
                         help="Input text if mode='run' (unless --test).")
-    parser.add_argument("--tokenizer_name", type=str, default="decapoda-research/llama-7b-hf", help="Pretrained tokenizer name")
+    parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-hf", help="Pretrained tokenizer name")
     parser.add_argument("--model", type=str, default=None, help="Hugging Face repo ID to load the model from")
     parser.add_argument("--save_model_name", type=str, default=None, help="Name of saved model")
     parser.add_argument("--test", action="store_true", help="Evaluate on the test set in run mode")
@@ -168,7 +168,7 @@ def main():
     if not (0 < args.percent_data <= 100):
         raise ValueError("--percent_data must be between 0 and 100.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+    tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name, model_max_length=4096)
     tokenizer.pad_token = tokenizer.eos_token
 
     os.makedirs(args.save_dir, exist_ok=True)
