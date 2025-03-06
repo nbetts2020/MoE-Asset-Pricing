@@ -5,7 +5,7 @@ import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaTokenizerFast
 from torch.utils.data import Dataset, DataLoader
 import logging
 import random
@@ -89,7 +89,7 @@ class HierarchicalAttentionRL(nn.Module):
                             it will be truncated (e.g., to the last truncate_limit tokens).
         """
         super(HierarchicalAttentionRL, self).__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=4096)
         self.tokenizer.model_max_length = max_length  # local max per section
         self.vocab_size = self.tokenizer.vocab_size
         # Learnable embedding layer for token IDs; used only if model is not provided.
