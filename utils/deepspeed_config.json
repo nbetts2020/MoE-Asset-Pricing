@@ -12,7 +12,10 @@
     "contiguous_memory_optimization": true,
     "cpu_checkpointing": false
   },
-  "fp16": {
+  "gradient_checkpointing": {
+    "enabled": true
+  },
+  "bf16": {
     "enabled": true
   }
 }
