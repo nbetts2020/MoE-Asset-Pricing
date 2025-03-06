@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from utils.config import config
 from utils.data import *
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaTokenizerFast
 from torch.utils.checkpoint import checkpoint
 from flash_attn.flash_attn_interface import flash_attn_func
 from flash_attn.flash_attn_interface import flash_attn_unpadded_func
@@ -154,7 +154,7 @@ class Block(nn.Module):
 class SparseMoELanguageModel(nn.Module):
     def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name='decapoda-research/llama-7b-hf'):
         super(SparseMoELanguageModel, self).__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=4096)
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
