@@ -152,7 +152,7 @@ class Block(nn.Module):
         return x, entropy_loss
 
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name='meta-llama/llama-7b-hf'):
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name="hf-internal-testing/llama-tokenizer"):
         super(SparseMoELanguageModel, self).__init__()
         self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=4096)
         vocab_size = self.tokenizer.vocab_size
