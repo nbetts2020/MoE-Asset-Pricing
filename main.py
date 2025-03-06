@@ -69,7 +69,7 @@ def main():
                         help="Mode: 'train', 'run', 'update', 'test_forgetting', or 'rl'")
     parser.add_argument("input_text", type=str, nargs="?", default=None,
                         help="Input text if mode='run' (unless --test).")
-    parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-hf", help="Pretrained tokenizer name")
+    parser.add_argument("--tokenizer_name", type=str, default="hf-internal-testing/llama-tokenizer", help="Pretrained tokenizer name")
     parser.add_argument("--model", type=str, default=None, help="Hugging Face repo ID to load the model from")
     parser.add_argument("--save_model_name", type=str, default=None, help="Name of saved model")
     parser.add_argument("--test", action="store_true", help="Evaluate on the test set in run mode")
