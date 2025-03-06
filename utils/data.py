@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------------
 # GLOBAL TOKENIZER SETUP
 # -------------------------------------------------------------------------
-TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "decapoda-research/llama-7b-hf")
+TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "meta-llama/llama-7b-hf")
 GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=4096)
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
