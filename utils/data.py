@@ -3,7 +3,7 @@ import torch
 import pandas as pd
 import logging
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaTokenizerFast
 from utils.config import config
 
 # Disable tokenizer parallelism to avoid warnings after fork.
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # GLOBAL TOKENIZER SETUP
 # -------------------------------------------------------------------------
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "decapoda-research/llama-7b-hf")
-GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=4096)
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
 
