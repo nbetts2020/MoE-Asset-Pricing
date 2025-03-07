@@ -171,6 +171,11 @@ def main():
     tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name, model_max_length=4096)
     tokenizer.pad_token = tokenizer.eos_token
 
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+    current_rank = torch.distributed.get_rank()
+    else:
+        current_rank = 0
+
     os.makedirs(args.save_dir, exist_ok=True)
     print_debug_info("BEFORE MODE SWITCH")
 
@@ -316,16 +321,15 @@ def main():
         # Download models from S3 (this now downloads both model directories and the RL file)
         download_models_from_s3(bucket=args.bucket)
     
-        # Only rank 0 cleans up the directory and runs DeepSpeed's conversion
-        if torch.distributed.get_rank() == 0:
-            consolidated_model_path = consolidate_checkpoint_to_pth(
+        # Only rank 0 performs consolidation.
+        if current_rank == 0:
+            consolidated_model_path = consolidate_checkpoint_to_fp32_state_dict(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
             )
-    
-        # Make all other ranks wait until rank 0 is done
-        if torch.distributed.is_initialized():
+        # All ranks wait for rank 0 to finish.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         
         model, _ = initialize_model(args, device, init_from_scratch=True)
@@ -487,16 +491,15 @@ def main():
         # Download models from S3 if needed.
         download_models_from_s3(bucket=args.bucket)
     
-        # Only rank 0 cleans up the directory and runs DeepSpeed's conversion
-        if torch.distributed.get_rank() == 0:
-            consolidated_model_path = consolidate_checkpoint_to_pth(
+        # Only rank 0 performs consolidation.
+        if current_rank == 0:
+            consolidated_model_path = consolidate_checkpoint_to_fp32_state_dict(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
             )
-    
-        # Make all other ranks wait until rank 0 is done
-        if torch.distributed.is_initialized():
+        # All ranks wait for rank 0 to finish.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
     
         # Load the main transformer model.
