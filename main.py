@@ -58,6 +58,23 @@ def print_debug_info(stage):
     print("====================================")
 
 
+def gather_lists_across_ranks(local_list):
+    """
+    Gathers a Python list from all ranks onto rank 0.
+    Returns a combined list on rank 0; on other ranks, returns an empty list.
+    """
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    object_list = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(object_list, local_list)
+    if torch.distributed.get_rank() == 0:
+        combined = []
+        for sublist in object_list:
+            combined.extend(sublist)
+        return combined
+    else:
+        return []
+
+
 def main():
     pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
     logging.info("pandarallel initialized.")
@@ -124,7 +141,7 @@ def main():
 
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
-        config.EPOCHS = 15  # e.g. 15 epochs (each epoch processes its set of chunks)
+        config.EPOCHS = 15
         config.N_EMBED = 32
         config.N_HEAD = 4
         config.N_LAYER = 12
@@ -187,12 +204,10 @@ def main():
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
-        # Prepare hybrid optimizer: returns (adam_optimizer, muon_optimizer)
         adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
-        # Initialize DeepSpeed with the AdamW branch.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=adam_optimizer,
@@ -208,10 +223,9 @@ def main():
             ebm = None
             ebm_optimizer = None
 
-        # Build a DataLoader using prepare_dataloader for training (train mode ignores chunking parameters)
         train_loader = prepare_dataloader(
-            epoch=1,                # dummy value; for train mode, get_data ignores chunking
-            window_index=1,         # dummy value; same reason
+            epoch=1,
+            window_index=1,
             tokenizer=tokenizer,
             batch_size=config.BATCH_SIZE,
             shuffle=True,
@@ -220,7 +234,6 @@ def main():
             args=args
         )
 
-        # Pass the DataLoader to train_model
         train_model(
             model=engine,
             optimizers=(adam_optimizer, muon_optimizer),
@@ -248,7 +261,6 @@ def main():
         if args.use_ebm and ebm is not None:
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
             logging.info("EBM model saved.")
-
 
     elif args.mode == "update":
         print_debug_info("UPDATE MODE START")
@@ -285,7 +297,6 @@ def main():
             )
             logging.info("Model wrapped with DistributedDataParallel.")
 
-        # For update mode, we still load data via the existing loader.
         update_dataloader, data_bundle = prepare_dataloader(args)
         logging.info(f"Update DataLoader length: {len(update_dataloader)}")
 
@@ -314,39 +325,29 @@ def main():
 
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
-        # If not in test mode, require --stock, --date, --text, and --bucket.
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
 
-        # Only rank 0 downloads and consolidates the model
         if current_rank == 0:
-            # Download models from S3
             if args.bucket:
                 download_models_from_s3(bucket=args.bucket)
-            
-            # Consolidate the checkpoint
             consolidated_model_path = consolidate_checkpoint_to_pth(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
             )
-            
-            # Share the path with other ranks (optional, if the path is consistent across ranks)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                object_list = [consolidated_model_path]
-                torch.distributed.broadcast_object_list(object_list, src=0)
-                consolidated_model_path = object_list[0]
+                obj_list = [consolidated_model_path]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                consolidated_model_path = obj_list[0]
         else:
-            # Other ranks wait for rank 0 to finish and receive the path
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                object_list = [""]  # Placeholder
-                torch.distributed.broadcast_object_list(object_list, src=0)
-                consolidated_model_path = object_list[0]
+                obj_list = [""]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                consolidated_model_path = obj_list[0]
             else:
-                # If not using distributed, assume the path
-                consolidated_model_path = os.path.join(args.save_dir, f"consolidated_final.pth")
-        
-        # Wait for rank 0 to finish
+                consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -356,27 +357,28 @@ def main():
         model.eval()
         logging.info("Main transformer model loaded from consolidated checkpoint.")
 
-        if not args.test:
-            # Non-test run: use RL hierarchical attention to compress the input article.
-            from attention_rl import HierarchicalAttentionRL
-            rl_module = HierarchicalAttentionRL(
-                tokenizer_name=args.tokenizer_name,
-                embed_dim=config.N_EMBED,
-                max_length=config.BLOCK_SIZE,    # maximum token length per section
-                num_queries=config.BLOCK_SIZE,     # use config.BLOCK_SIZE as the number of queries for downsampling
-                truncate_limit=None                # Optionally, set a truncation limit (e.g., 64000)
-            ).to(device)
-            rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
-            rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
-            rl_module.eval()
-            logging.info("Hierarchical Attention RL module loaded from checkpoint.")
+        from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
 
-            # Process the input article text using the RL module.
-            # This compresses the variable-length article into a fixed-size representation.
-            _, prediction, _ = rl_module(args.text)
+        # Load RL module for compressing text for both test and non-test modes.
+        rl_module = HierarchicalAttentionRL(
+            tokenizer_name=args.tokenizer_name,
+            embed_dim=config.N_EMBED,
+            max_length=config.BLOCK_SIZE,
+            num_queries=config.BLOCK_SIZE,
+            truncate_limit=None
+        ).to(device)
+        rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
+        rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
+        rl_module.eval()
+        logging.info("Hierarchical Attention RL module loaded from checkpoint.")
+
+        if not args.test:
+            # Non-test run: compress the input text using the RL module and output prediction.
+            with torch.no_grad():
+                _, prediction, _ = rl_module(args.text, model=model)
             print(f"Predicted Price: {prediction.item()}")
         else:
-            # Test mode: run evaluation on the run dataset and print sector metrics.
+            # Test mode: evaluate on run dataset.
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
 
@@ -394,11 +396,11 @@ def main():
                 global_max = int(1e12)
             cumulative_offset = 0
 
-            all_predictions = []
-            all_actuals = []
-            all_oldprices = []
-            all_riskfree = []
-            all_sectors = []
+            local_predictions = []
+            local_actuals = []
+            local_oldprices = []
+            local_riskfree = []
+            local_sectors = []
 
             for i in range(1, 19):
                 if cumulative_offset >= global_max:
@@ -406,12 +408,14 @@ def main():
                     break
 
                 run_filename = f"run_dataset_{i}.parquet"
-                logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
+                logging.info(f"(Rank {current_rank}) Processing {run_filename} (cumulative offset: {cumulative_offset})...")
+                # Pass the rl_module into process_run_dataset so that each sample's raw text is compressed to 4k tokens.
                 preds, acts, olds, rf, sects, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
                     ebm=ebm,
+                    rl_module=rl_module,
                     args=args,
                     device=device,
                     batch_size=5,
@@ -420,60 +424,75 @@ def main():
                     cache_dir="/tmp/hf_cache_datasets_run"
                 )
                 cumulative_offset += processed_in_file
-                all_predictions.extend(preds)
-                all_actuals.extend(acts)
-                all_oldprices.extend(olds)
-                all_riskfree.extend(rf)
-                all_sectors.extend(sects)
-                logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
+                local_predictions.extend(preds)
+                local_actuals.extend(acts)
+                local_oldprices.extend(olds)
+                local_riskfree.extend(rf)
+                local_sectors.extend(sects)
+                logging.info(f"(Rank {current_rank}) After {run_filename}, cumulative offset is now {cumulative_offset}.")
 
-            mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
-            average_return, win_rate, profit_factor = evaluate_model(
-                predictions=all_predictions,
-                actuals=all_actuals,
-                oldprices=all_oldprices,
-                riskfree=all_riskfree,
-                sectors=all_sectors
-            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                global_predictions = gather_lists_across_ranks(local_predictions)
+                global_actuals = gather_lists_across_ranks(local_actuals)
+                global_oldprices = gather_lists_across_ranks(local_oldprices)
+                global_riskfree = gather_lists_across_ranks(local_riskfree)
+                global_sectors = gather_lists_across_ranks(local_sectors)
+            else:
+                global_predictions = local_predictions
+                global_actuals = local_actuals
+                global_oldprices = local_oldprices
+                global_riskfree = local_riskfree
+                global_sectors = local_sectors
 
-            print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-            print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
-            print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-            print(f"Sortino Ratio: {sortino_ratio:.4f}")
-            print(f"Average Return: {average_return:.4f}")
-            print(f"Win Rate: {win_rate:.2f}%")
-            print(f"Profit Factor: {profit_factor:.4f}")
-
-            logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-            logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
-            logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-            logging.info(f"Sortino Ratio: {sortino_ratio:.4f}")
-            logging.info(f"Average Return: {average_return:.4f}")
-            logging.info(f"Win Rate: {win_rate:.2f}%")
-            logging.info(f"Profit Factor: {profit_factor:.4f}")
-            for sector, metrics in sector_metrics.items():
-                print(
-                    f"Sector: {sector} - "
-                    f"MSE: {metrics.get('mse', 0.0):.4f}, "
-                    f"R²: {metrics.get('r2', 0.0):.4f}, "
-                    f"Trend Accuracy: {metrics.get('trend_acc', 0.0):.4f}, "
-                    f"Sharpe Ratio: {metrics.get('sharpe', 0.0):.4f}, "
-                    f"Sortino Ratio: {metrics.get('sortino', 0.0):.4f}, "
-                    f"Average Return: {metrics.get('average_return', 0.0):.4f}, "
-                    f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
-                    f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
+            if (not torch.distributed.is_available() or not torch.distributed.is_initialized() or
+                torch.distributed.get_rank() == 0):
+                mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
+                average_return, win_rate, profit_factor = evaluate_model(
+                    predictions=global_predictions,
+                    actuals=global_actuals,
+                    oldprices=global_oldprices,
+                    riskfree=global_riskfree,
+                    sectors=global_sectors
                 )
-                logging.info(
-                    f"Sector: {sector} - "
-                    f"MSE: {metrics.get('mse', 0.0):.4f}, "
-                    f"R²: {metrics.get('r2', 0.0):.4f}, "
-                    f"Trend Accuracy: {metrics.get('trend_acc', 0.0):.4f}, "
-                    f"Sharpe Ratio: {metrics.get('sharpe', 0.0):.4f}, "
-                    f"Sortino Ratio: {metrics.get('sortino', 0.0):.4f}, "
-                    f"Average Return: {metrics.get('average_return', 0.0):.4f}, "
-                    f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
-                    f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
-                )
+
+                print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+                print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
+                print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+                print(f"Sortino Ratio: {sortino_ratio:.4f}")
+                print(f"Average Return: {average_return:.4f}")
+                print(f"Win Rate: {win_rate:.2f}%")
+                print(f"Profit Factor: {profit_factor:.4f}")
+
+                logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+                logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
+                logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+                logging.info(f"Sortino Ratio: {sortino_ratio:.4f}")
+                logging.info(f"Average Return: {average_return:.4f}")
+                logging.info(f"Win Rate: {win_rate:.2f}%")
+                logging.info(f"Profit Factor: {profit_factor:.4f}")
+                for sector, metrics in sector_metrics.items():
+                    print(
+                        f"Sector: {sector} - "
+                        f"MSE: {metrics.get('mse', 0.0):.4f}, "
+                        f"R²: {metrics.get('r2', 0.0):.4f}, "
+                        f"Trend Accuracy: {metrics.get('trend_acc', 0.0):.4f}, "
+                        f"Sharpe Ratio: {metrics.get('sharpe', 0.0):.4f}, "
+                        f"Sortino Ratio: {metrics.get('sortino', 0.0):.4f}, "
+                        f"Average Return: {metrics.get('average_return', 0.0):.4f}, "
+                        f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
+                        f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
+                    )
+                    logging.info(
+                        f"Sector: {sector} - "
+                        f"MSE: {metrics.get('mse', 0.0):.4f}, "
+                        f"R²: {metrics.get('r2', 0.0):.4f}, "
+                        f"Trend Accuracy: {metrics.get('trend_acc', 0.0):.4f}, "
+                        f"Sharpe Ratio: {metrics.get('sharpe', 0.0):.4f}, "
+                        f"Sortino Ratio: {metrics.get('sortino', 0.0):.4f}, "
+                        f"Average Return: {metrics.get('average_return', 0.0):.4f}, "
+                        f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
+                        f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
+                    )
 
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
@@ -505,48 +524,34 @@ def main():
             json.dump(test_results, f, indent=4)
     elif args.mode == "rl":
         print_debug_info("RL MODE START")
-
-        # Only rank 0 downloads and consolidates the model
         if current_rank == 0:
-            # Download models from S3
             if args.bucket:
                 download_models_from_s3(bucket=args.bucket)
-            
-            # Consolidate the checkpoint
             consolidated_model_path = consolidate_checkpoint_to_pth(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
             )
-            
-            # Share the path with other ranks (optional, if the path is consistent across ranks)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                object_list = [consolidated_model_path]
-                torch.distributed.broadcast_object_list(object_list, src=0)
-                consolidated_model_path = object_list[0]
+                obj_list = [consolidated_model_path]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                consolidated_model_path = obj_list[0]
         else:
-            # Other ranks wait for rank 0 to finish and receive the path
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                object_list = [""]  # Placeholder
-                torch.distributed.broadcast_object_list(object_list, src=0)
-                consolidated_model_path = object_list[0]
+                obj_list = [""]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                consolidated_model_path = obj_list[0]
             else:
-                # If not using distributed, assume the path
-                consolidated_model_path = os.path.join(args.save_dir, f"consolidated_final.pth")
-        
-    # Wait for rank 0 to finish
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+                consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-        # Load the main transformer model.
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from consolidated checkpoint.")
 
-        # Pass the main model to the RL training function.
-        # The RL function (rl_train_hAttention) will now use main_model to grab consistent embeddings.
         from utils.attention_rl import rl_train_hAttention
         rl_train_hAttention(args, model=model)
     else:
