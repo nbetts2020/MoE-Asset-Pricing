@@ -118,7 +118,7 @@ def main():
     parser.add_argument("--rl_batch_size", type=int, default=8, help="RL training batch size")
     parser.add_argument("--rl_epochs", type=int, default=5, help="Number of RL training epochs")
     parser.add_argument("--rl_learning_rate", type=float, default=1e-4, help="RL learning rate")
-    
+
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
 
@@ -172,7 +172,7 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-    current_rank = torch.distributed.get_rank()
+        current_rank = torch.distributed.get_rank()
     else:
         current_rank = 0
 
@@ -186,12 +186,12 @@ def main():
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
-    
+
         # Prepare hybrid optimizer: returns (adam_optimizer, muon_optimizer)
         adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
-    
+
         # Initialize DeepSpeed with the AdamW branch.
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
@@ -200,14 +200,14 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-    
+
         if args.use_ebm:
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
         else:
             ebm = None
             ebm_optimizer = None
-    
+
         # Build a DataLoader using prepare_dataloader for training (train mode ignores chunking parameters)
         train_loader = prepare_dataloader(
             epoch=1,                # dummy value; for train mode, get_data ignores chunking
@@ -219,7 +219,7 @@ def main():
             global_max=1e12,
             args=args
         )
-    
+
         # Pass the DataLoader to train_model
         train_model(
             model=engine,
@@ -237,7 +237,7 @@ def main():
             use_deepspeed=True
         )
         logging.info("Training completed.")
-    
+
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         tag = "final"
@@ -249,7 +249,7 @@ def main():
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
             logging.info("EBM model saved.")
 
-            
+
     elif args.mode == "update":
         print_debug_info("UPDATE MODE START")
         if not args.bucket:
@@ -317,27 +317,45 @@ def main():
         # If not in test mode, require --stock, --date, --text, and --bucket.
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-    
-        # Download models from S3 (this now downloads both model directories and the RL file)
-        download_models_from_s3(bucket=args.bucket)
-    
-        # Only rank 0 performs consolidation.
+
+        # Only rank 0 downloads and consolidates the model
         if current_rank == 0:
-            consolidated_model_path = consolidate_checkpoint_to_fp32_state_dict(
+            # Download models from S3
+            if args.bucket:
+                download_models_from_s3(bucket=args.bucket)
+            
+            # Consolidate the checkpoint
+            consolidated_model_path = consolidate_checkpoint_to_pth(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
             )
-        # All ranks wait for rank 0 to finish.
+            
+            # Share the path with other ranks (optional, if the path is consistent across ranks)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                object_list = [consolidated_model_path]
+                torch.distributed.broadcast_object_list(object_list, src=0)
+                consolidated_model_path = object_list[0]
+        else:
+            # Other ranks wait for rank 0 to finish and receive the path
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                object_list = [""]  # Placeholder
+                torch.distributed.broadcast_object_list(object_list, src=0)
+                consolidated_model_path = object_list[0]
+            else:
+                # If not using distributed, assume the path
+                consolidated_model_path = os.path.join(args.save_dir, f"consolidated_final.pth")
+        
+        # Wait for rank 0 to finish
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-        
+
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from consolidated checkpoint.")
-    
+
         if not args.test:
             # Non-test run: use RL hierarchical attention to compress the input article.
             from attention_rl import HierarchicalAttentionRL
@@ -352,7 +370,7 @@ def main():
             rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
             rl_module.eval()
             logging.info("Hierarchical Attention RL module loaded from checkpoint.")
-    
+
             # Process the input article text using the RL module.
             # This compresses the variable-length article into a fixed-size representation.
             _, prediction, _ = rl_module(args.text)
@@ -361,7 +379,7 @@ def main():
             # Test mode: run evaluation on the run dataset and print sector metrics.
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
-    
+
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
@@ -369,24 +387,24 @@ def main():
             ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-    
+
             if args.percent_data < 100:
                 global_max = int(0.2 * 453932 * (args.percent_data / 100))
             else:
                 global_max = int(1e12)
             cumulative_offset = 0
-    
+
             all_predictions = []
             all_actuals = []
             all_oldprices = []
             all_riskfree = []
             all_sectors = []
-    
+
             for i in range(1, 19):
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
-    
+
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
                 preds, acts, olds, rf, sects, processed_in_file = process_run_dataset(
@@ -408,7 +426,7 @@ def main():
                 all_riskfree.extend(rf)
                 all_sectors.extend(sects)
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
-    
+
             mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
             average_return, win_rate, profit_factor = evaluate_model(
                 predictions=all_predictions,
@@ -417,7 +435,7 @@ def main():
                 riskfree=all_riskfree,
                 sectors=all_sectors
             )
-    
+
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -425,7 +443,7 @@ def main():
             print(f"Average Return: {average_return:.4f}")
             print(f"Win Rate: {win_rate:.2f}%")
             print(f"Profit Factor: {profit_factor:.4f}")
-    
+
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
             logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -487,28 +505,46 @@ def main():
             json.dump(test_results, f, indent=4)
     elif args.mode == "rl":
         print_debug_info("RL MODE START")
-        
-        # Download models from S3 if needed.
-        download_models_from_s3(bucket=args.bucket)
-    
-        # Only rank 0 performs consolidation.
+
+        # Only rank 0 downloads and consolidates the model
         if current_rank == 0:
-            consolidated_model_path = consolidate_checkpoint_to_fp32_state_dict(
+            # Download models from S3
+            if args.bucket:
+                download_models_from_s3(bucket=args.bucket)
+            
+            # Consolidate the checkpoint
+            consolidated_model_path = consolidate_checkpoint_to_pth(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
             )
-        # All ranks wait for rank 0 to finish.
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
-    
+            
+            # Share the path with other ranks (optional, if the path is consistent across ranks)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                object_list = [consolidated_model_path]
+                torch.distributed.broadcast_object_list(object_list, src=0)
+                consolidated_model_path = object_list[0]
+        else:
+            # Other ranks wait for rank 0 to finish and receive the path
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                object_list = [""]  # Placeholder
+                torch.distributed.broadcast_object_list(object_list, src=0)
+                consolidated_model_path = object_list[0]
+            else:
+                # If not using distributed, assume the path
+                consolidated_model_path = os.path.join(args.save_dir, f"consolidated_final.pth")
+        
+    # Wait for rank 0 to finish
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
         # Load the main transformer model.
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from consolidated checkpoint.")
-    
+
         # Pass the main model to the RL training function.
         # The RL function (rl_train_hAttention) will now use main_model to grab consistent embeddings.
         from utils.attention_rl import rl_train_hAttention
