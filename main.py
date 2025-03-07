@@ -316,12 +316,18 @@ def main():
         # Download models from S3 (this now downloads both model directories and the RL file)
         download_models_from_s3(bucket=args.bucket)
     
-        # Load the main transformer model.
-        consolidated_model_path = consolidate_checkpoint_to_pth(
-            checkpoint_dir=args.save_dir,
-            tag="final",
-            output_path=args.save_dir
-        )
+        # Only rank 0 cleans up the directory and runs DeepSpeed's conversion
+        if torch.distributed.get_rank() == 0:
+            consolidated_model_path = consolidate_checkpoint_to_pth(
+                checkpoint_dir=args.save_dir,
+                tag="final",
+                output_path=args.save_dir
+            )
+    
+        # Make all other ranks wait until rank 0 is done
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
@@ -481,11 +487,17 @@ def main():
         # Download models from S3 if needed.
         download_models_from_s3(bucket=args.bucket)
     
-        consolidated_model_path = consolidate_checkpoint_to_pth(
-            checkpoint_dir=args.save_dir,
-            tag="final",
-            output_path=args.save_dir
-        )
+        # Only rank 0 cleans up the directory and runs DeepSpeed's conversion
+        if torch.distributed.get_rank() == 0:
+            consolidated_model_path = consolidate_checkpoint_to_pth(
+                checkpoint_dir=args.save_dir,
+                tag="final",
+                output_path=args.save_dir
+            )
+    
+        # Make all other ranks wait until rank 0 is done
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
     
         # Load the main transformer model.
         model, _ = initialize_model(args, device, init_from_scratch=True)
