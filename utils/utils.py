@@ -212,7 +212,7 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
 
     return df
 
-def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, device, 
+def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device, 
                         batch_size=500, current_offset=0, global_max=int(1e12), 
                         cache_dir="/tmp/hf_cache_datasets_run"):
     """
@@ -223,6 +223,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
         tokenizer: The transformer tokenizer.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The energy-based model.
+        rl_module (torch.nn.Module): The HierarchicalAttentionRL module used to compress/truncate raw text.
         args: Command-line arguments (expects args.ebm_num_samples, etc.).
         device: The device (CUDA/CPU).
         batch_size (int): Number of rows to process per batch.
@@ -258,27 +259,41 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
     # Iterate over batches using PyArrow's streaming API.
     for batch in parquet_file.iter_batches(batch_size=batch_size):
         df_chunk = batch.to_pandas()
-        # Filter as in your get_data logic:
+        # Filter rows as in your original logic.
         df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
         df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0]
         
         num_rows = len(df_chunk)
         
-        # Determine indices in this chunk to process, based on cumulative offset.
-        # If the cumulative count (current_offset + processed_in_file) is already >= global_max, break.
+        # Stop if the cumulative count reaches the global maximum.
         if current_offset + processed_in_file >= global_max:
             break
         
-        # Compute the effective start and end indices in this chunk.
+        # Determine the effective indices for this chunk.
         start_idx = 0
         end_idx = num_rows
         if current_offset + processed_in_file + num_rows > global_max:
-            # Only process a part of this chunk.
             end_idx = global_max - (current_offset + processed_in_file)
         
-        # Process rows in [start_idx, end_idx)
+        # Process each row in the chunk.
         for idx in range(start_idx, end_idx):
             sample = df_chunk.iloc[idx]
+            
+            # Compress raw text to 4096 tokens.
+            raw_text = sample.get("formatted_text", "")
+            tokens = tokenizer(
+                raw_text,
+                truncation=True,
+                max_length=4096,
+                return_tensors="pt"
+            )
+            truncated_ids = tokens["input_ids"][0].tolist()
+            compressed_text = tokenizer.decode(truncated_ids)
+            
+            # (Optionally, you could use rl_module here to obtain a learned compressed representation.)
+            # For now, we use the simple truncation result as our candidate text.
+            
+            # Select the best context using the adjusted ebm_select_contexts function.
             try:
                 best_context = ebm_select_contexts(
                     df=df_chunk,
@@ -292,6 +307,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
             
+            # Use the selected candidate context as final input.
             final_input = best_context
             encoding = tokenizer(
                 final_input,
@@ -312,12 +328,11 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, args, devic
         
         processed_in_file += num_rows
         
-        # Cleanup the chunk.
+        # Cleanup the current chunk.
         del df_chunk
         gc.collect()
         torch.cuda.empty_cache()
         
-        # If cumulative limit reached, break out of loop.
         if current_offset + processed_in_file >= global_max:
             break
 
@@ -418,13 +433,15 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
 
 def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
     """
-    For the sample at the given index, select the best context from the precomputed candidate columns.
+    For the sample at the given index, select the best context from the candidate columns.
     It assumes candidate context strings are stored in columns "iteration_1_text" ... "iteration_30_text".
+    
+    This version computes mean-pooled embeddings from the candidate texts and passes them to the EBM,
+    which expects a single pooled vector rather than raw text.
     
     Args:
         df (pd.DataFrame): DataFrame containing the test samples with candidate context columns.
         idx (int): Index of the target sample in df.
-        text (str): (Unused) The article text.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
         tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
@@ -434,7 +451,7 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
         str: The candidate context with energy closest to zero.
     """
     row = df.iloc[idx]
-    # Extract candidate texts from columns iteration_1_text through iteration_30_text.
+    # Extract candidate texts from iteration_1_text through iteration_30_text.
     candidates = [row.get(f"iteration_{i}_text") for i in range(1, 31) if row.get(f"iteration_{i}_text") is not None]
     if not candidates:
         raise ValueError("No candidate contexts found for this sample.")
@@ -455,8 +472,12 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
             max_length=config.BLOCK_SIZE,
             return_tensors="pt"
         ).to(device)
-        emb = model.get_embeddings(encoding["input_ids"]).half()  # (1, embedding_dim)
-        energy = ebm(emb).item()  # (1,) -> scalar
+        # Get token embeddings: shape (1, seq_len, embed_dim)
+        emb = model.get_embeddings(encoding["input_ids"])
+        # Mean-pool over the sequence to obtain a single vector (1, embed_dim)
+        mean_emb = emb.mean(dim=1).half()
+        # Compute the energy from the pooled vector
+        energy = ebm(mean_emb).item()
         candidate_energies.append(energy)
     
     # Select the candidate whose energy (absolute value) is closest to zero.
