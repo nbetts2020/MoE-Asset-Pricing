@@ -77,94 +77,14 @@ def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
         init.kaiming_normal_(m.weight)
 
-def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int = 13, shuffle: bool = True):
-    """
-    Loads row data for RL from chunked Parquet files:
-      train_dataset_{chunk_index}a.parquet
-    
-    If rl_rows = -1, loads ALL rows from all chunks.
-    Otherwise, samples proportionally across chunks to total ~rl_rows rows.
-
-    Returns a single DataFrame with the concatenated (and optionally shuffled) data.
-    """
-
-    final_dfs = []
-    accumulated = 0
-
-    for chunk_idx in range(chunk_start, chunk_end + 1):
-        if chunk_idx not in CHUNK_SIZES:
-            logging.warning(f"Chunk {chunk_idx} not found in CHUNK_SIZES map. Skipping.")
-            continue
-
-        chunk_size = CHUNK_SIZES[chunk_idx]
-
-        # Load the chunk fully via get_data. 
-        # We'll always pass epoch=1 and window_index=chunk_idx, ignoring global_offset, etc.
-        df_chunk = get_data(
-            epoch=1,
-            window_index=chunk_idx,
-            global_offset=0,
-            global_max=int(1e12),  # effectively no limit
-            args=args
-        )
-        if df_chunk.empty:
-            logging.info(f"Chunk {chunk_idx} returned empty DataFrame.")
-            continue
-
-        if rl_rows == -1:
-            # Means user wants all data from all chunks
-            final_dfs.append(df_chunk)
-        else:
-            # Proportional sample: chunk_needed = (chunk_size / TOTAL_CHUNK_ROWS) * rl_rows
-            chunk_needed = int(round((chunk_size / TOTAL_CHUNK_ROWS) * rl_rows))
-            if chunk_needed <= 0:
-                # If rounding leads to 0, skip
-                continue
-
-            # If chunk has fewer rows than chunk_needed, just take the entire chunk
-            if chunk_needed >= len(df_chunk):
-                final_dfs.append(df_chunk)
-            else:
-                sampled_df = df_chunk.sample(n=chunk_needed, random_state=random.randint(0, 999999))
-                final_dfs.append(sampled_df)
-
-        accumulated += len(final_dfs[-1])
-
-        # Cleanup
-        del df_chunk
-        gc.collect()
-
-        # If we've already reached or exceeded rl_rows, we can break
-        if rl_rows != -1 and accumulated >= rl_rows:
-            break
-
-    if not final_dfs:
-        logging.warning("No data was loaded or sampled from the chunks.")
-        return pd.DataFrame()
-
-    # Merge all samples
-    final_df = pd.concat(final_dfs, ignore_index=True)
-
-    # If we slightly overshot the target, sample one last time
-    if rl_rows != -1 and len(final_df) > rl_rows:
-        final_df = final_df.sample(n=rl_rows, random_state=random.randint(0, 999999)).reset_index(drop=True)
-
-    # Shuffle final if desired
-    if shuffle and len(final_df) > 1:
-        final_df = final_df.sample(frac=1.0, random_state=random.randint(0, 999999)).reset_index(drop=True)
-
-    logging.info(
-        f"[load_rl_data] Final RL DataFrame has {len(final_df)} rows "
-        f"(desired={rl_rows if rl_rows != -1 else 'ALL'})."
-    )
-    return final_df
-    
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
     For run mode, loads a chunk from the original preprocessed dataset.
     For train mode, loads the entire new SC454k-formatted dataset,
     filters out rows with nan or non-positive weighted_avg_720_hrs,
     and subsamples based on args.percent_data.
+
+    For rl mode, loads a chunk from train_dataset_{window_index}a.parquet.
     """
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -176,16 +96,24 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
         repo_id = "nbettencourt/sc454k-preprocessed-dfs"
         epoch_letter = chr(ord('a') + epoch - 1)
         filename = f"run_dataset_{window_index}.parquet"
-
+        file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=cache_dir)
+        df = pd.read_parquet(file_path)
+    elif args.mode == "rl":
+        # For RL mode, load chunks from train_dataset_{window_index}a.parquet.
+        repo_id = "nbettencourt/sc454k-preprocessed-dfs"
+        epoch_letter = "a"  # Always use 'a' for RL mode.
+        filename = f"train_dataset_{window_index}{epoch_letter}.parquet"
         file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=cache_dir)
         df = pd.read_parquet(file_path)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
-        
+
+    # Common filtering: drop rows with missing or non-positive weighted_avg_720_hrs.
     df = df.dropna(subset=['weighted_avg_720_hrs'])
     df = df[df['weighted_avg_720_hrs'] > 0]
-    
-    if args.mode == "run":
+
+    # For run and rl modes, apply chunk-level limits.
+    if args.mode in ["run", "rl"]:
         if global_offset >= global_max:
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -196,22 +124,84 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
         if global_offset + chunk_rows > global_max:
             needed = global_max - global_offset
             df = df.iloc[:needed]
-            
         # Cleanup downloaded file and cache.
         if os.path.exists(file_path):
             os.remove(file_path)
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir, ignore_errors=True)
     else:
-        # For train mode, filter out rows with NaN or non-positive weighted_avg_720_hrs.
-        df = df.dropna(subset=['weighted_avg_720_hrs'])
-        df = df[df['weighted_avg_720_hrs'] > 0]
-        # Subsample based on percent_data.
+        # For train mode, subsample based on percent_data.
         num_rows = int(len(df) * (args.percent_data / 100))
         df = df.iloc[:num_rows]
 
     return df
 
+
+def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int = 13, shuffle: bool = True):
+    """
+    Loads row data for RL from chunked Parquet files:
+      train_dataset_{chunk_index}a.parquet
+
+    If rl_rows = -1, loads ALL rows from all chunks.
+    Otherwise, samples proportionally across chunks to total ~rl_rows rows.
+
+    Returns a single DataFrame with the concatenated (and optionally shuffled) data.
+    """
+    final_dfs = []
+    accumulated = 0
+
+    # Use chunks 1 to 13.
+    for chunk_idx in range(chunk_start, chunk_end + 1):
+        if chunk_idx not in CHUNK_SIZES:
+            logging.warning(f"Chunk {chunk_idx} not found in CHUNK_SIZES map. Skipping.")
+            continue
+
+        chunk_size = CHUNK_SIZES[chunk_idx]
+        # For RL mode, we load using get_data, which now supports args.mode=="rl".
+        df_chunk = get_data(
+            epoch=1,
+            window_index=chunk_idx,
+            global_offset=0,
+            global_max=int(1e12),  # no limit here
+            args=args
+        )
+        if df_chunk.empty:
+            logging.info(f"Chunk {chunk_idx} returned empty DataFrame.")
+            continue
+
+        if rl_rows == -1:
+            final_dfs.append(df_chunk)
+        else:
+            # Proportional sample: calculate how many rows to sample from this chunk.
+            chunk_needed = int(round((chunk_size / TOTAL_CHUNK_ROWS) * rl_rows))
+            if chunk_needed <= 0:
+                continue
+
+            if chunk_needed >= len(df_chunk):
+                final_dfs.append(df_chunk)
+            else:
+                sampled_df = df_chunk.sample(n=chunk_needed, random_state=random.randint(0, 999999))
+                final_dfs.append(sampled_df)
+
+        accumulated += len(final_dfs[-1])
+        del df_chunk
+        gc.collect()
+
+        if rl_rows != -1 and accumulated >= rl_rows:
+            break
+
+    if not final_dfs:
+        logging.warning("No data was loaded or sampled from the chunks.")
+        return pd.DataFrame()
+
+    final_df = pd.concat(final_dfs, ignore_index=True)
+    if rl_rows != -1 and len(final_df) > rl_rows:
+        final_df = final_df.sample(n=rl_rows, random_state=random.randint(0, 999999)).reset_index(drop=True)
+    if shuffle and len(final_df) > 1:
+        final_df = final_df.sample(frac=1.0, random_state=random.randint(0, 999999)).reset_index(drop=True)
+    logging.info(f"[load_rl_data] Final RL DataFrame has {len(final_df)} rows (desired={rl_rows if rl_rows != -1 else 'ALL'}).")
+    return final_df
+    
 def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device, 
                         batch_size=500, current_offset=0, global_max=int(1e12), 
                         cache_dir="/tmp/hf_cache_datasets_run"):
@@ -358,7 +348,7 @@ def download_models_from_s3(bucket):
     """
     Downloads the 'model' and 'models' directories from the specified S3 bucket,
     and additionally downloads the RL attention module file.
-    
+
     Args:
         bucket (str): Name of the S3 bucket.
     """
@@ -401,8 +391,12 @@ def download_models_from_s3(bucket):
         )
         logging.info(f"RL Attention file downloaded successfully.\n{result.stdout}")
     except subprocess.CalledProcessError as e:
-        logging.error(f"Error downloading RL Attention file: {e.stderr}")
-        raise
+        # If file is not found (404), log a warning and continue.
+        if "404" in e.stderr:
+            logging.warning(f"RL Attention file not found in bucket {bucket}. Continuing without it.")
+        else:
+            logging.error(f"Error downloading RL Attention file: {e.stderr}")
+            raise
 
 def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
     """
