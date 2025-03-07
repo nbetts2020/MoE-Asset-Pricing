@@ -12,7 +12,7 @@ class Config:
     NUM_EXPERTS = 8      # Number of experts in the MoE layer
     TOP_K = 2            # Number of experts to use per token
     LEARNING_RATE = 2e-5
-    EPOCHS = 20 
+    EPOCHS = 5 
     BATCH_SIZE = 8       # Effective batch size is 32 with 4 grad accumulation steps
     
     LR_DECAY = 0.95      # Decay rate per layer
