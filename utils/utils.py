@@ -1267,38 +1267,75 @@ def initialize_replay_buffer(args):
             logging.info("No existing Memory Replay Buffer found. Starting fresh.")
     return replay_buffer
 
-def consolidate_checkpoint_to_pth(checkpoint_dir: str, tag: str, output_path: str) -> str:
+def consolidate_checkpoint_to_pth(checkpoint_dir: str, tag: str, output_path: str, use_subdir: bool = False) -> str:
+    import os
+    import glob
     import shutil
     import tempfile
+    import logging
+    import torch
     from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
 
+    # If optimizer states are stored in a subdirectory (e.g., checkpoint_dir/tag), update the path accordingly
+    base_dir = os.path.join(checkpoint_dir, tag) if use_subdir else checkpoint_dir
     final_path = os.path.join(output_path, f"consolidated_{tag}.pth")
-    if os.path.exists(final_path):
-        if os.path.isdir(final_path):
-            shutil.rmtree(final_path)
-        else:
-            os.remove(final_path)
 
+    if os.path.exists(final_path):
+        logging.info(f"Found existing consolidated checkpoint at {final_path}")
+        return final_path
+
+    # Clean up any existing optim_states files to avoid the "found 4 files" error
+    optim_files = glob.glob(os.path.join(base_dir, "*_optim_states.pt"))
+    logging.info(f"Found {len(optim_files)} optimizer state files in {base_dir}")
+
+    # Back up original files
+    backup_dir = tempfile.mkdtemp(prefix="ds_backup_")
+    for file in optim_files:
+        shutil.copy(file, backup_dir)
+    logging.info(f"Backed up original optimizer files to {backup_dir}")
+
+    # Remove all existing optimizer state files
+    for file in optim_files:
+        os.remove(file)
+    logging.info("Removed existing optimizer state files")
+
+    # Create exactly two empty optimizer state files
+    for i in range(2):
+        dummy_path = os.path.join(base_dir, f"dummy_{i}_optim_states.pt")
+        torch.save({}, dummy_path)
+    logging.info("Created two dummy optimizer state files")
+
+    # Perform the conversion using the entire checkpoint_dir (not base_dir) for DeepSpeed conversion
     temp_dir = tempfile.mkdtemp(prefix="ds_conversion_")
     logging.info(f"Converting checkpoint from base_dir='{checkpoint_dir}', tag='{tag}'")
-    convert_zero_checkpoint_to_fp32_state_dict(
-        checkpoint_dir,
-        temp_dir,
-        tag=tag
-    )
 
-    converted_bin = os.path.join(temp_dir, "pytorch_model.bin")
-    if not os.path.isfile(converted_bin):
+    try:
+        convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, temp_dir, tag=tag)
+
+        # The converted file should be named 'pytorch_model.bin'
+        converted_bin = os.path.join(temp_dir, "pytorch_model.bin")
+        if not os.path.isfile(converted_bin):
+            raise RuntimeError(f"Conversion failed; {converted_bin} not found.")
+
+        shutil.move(converted_bin, final_path)
+        logging.info(f"Successfully created consolidated checkpoint at {final_path}")
+    except Exception as e:
+        logging.error(f"Error during checkpoint conversion: {str(e)}")
+        # Restore original files
+        for file in glob.glob(os.path.join(base_dir, "*_optim_states.pt")):
+            os.remove(file)
+        for file in glob.glob(os.path.join(backup_dir, "*")):
+            shutil.copy(file, base_dir)
+        logging.info("Restored original optimizer files")
+        raise
+    finally:
+        # Clean up
         shutil.rmtree(temp_dir)
-        raise RuntimeError(f"Conversion failed; {converted_bin} not found.")
-
-    shutil.move(converted_bin, final_path)
-    shutil.rmtree(temp_dir)
+        shutil.rmtree(backup_dir)
 
     if not os.path.isfile(final_path):
-        raise RuntimeError(f"Failed to create consolidated checkpoint file at {final_path}")
+        raise RuntimeError(f"Failed to create consolidated checkpoint at {final_path}")
 
-    logging.info(f"Successfully created consolidated checkpoint at {final_path}")
     return final_path
 
 def upload_checkpoint_to_s3(local_dir: str, bucket: str, remote_dir: str = "model"):
