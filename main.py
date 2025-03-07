@@ -496,7 +496,7 @@ def main():
     
         # Pass the main model to the RL training function.
         # The RL function (rl_train_hAttention) will now use main_model to grab consistent embeddings.
-        from attention_rl import rl_train_hAttention
+        from utils.attention_rl import rl_train_hAttention
         rl_train_hAttention(args, model=model)
     else:
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', 'test_forgetting', or 'rl'.")
