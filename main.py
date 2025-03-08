@@ -135,6 +135,8 @@ def main():
     parser.add_argument("--rl_batch_size", type=int, default=8, help="RL training batch size")
     parser.add_argument("--rl_epochs", type=int, default=5, help="Number of RL training epochs")
     parser.add_argument("--rl_learning_rate", type=float, default=1e-4, help="RL learning rate")
+    parser.add_argument("--use_rl_module", action="store_true", 
+                    help="Use RL module for text compression instead of simple truncation.")
 
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
@@ -325,9 +327,10 @@ def main():
 
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
+        # If not in test mode, require --stock, --date, --text, and --bucket.
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-
+    
         if current_rank == 0:
             if args.bucket:
                 download_models_from_s3(bucket=args.bucket)
@@ -347,41 +350,59 @@ def main():
                 consolidated_model_path = obj_list[0]
             else:
                 consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-
+    
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-
+    
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from consolidated checkpoint.")
-
+    
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-
-        # Load RL module for compressing text for both test and non-test modes.
-        rl_module = HierarchicalAttentionRL(
-            tokenizer_name=args.tokenizer_name,
-            embed_dim=config.N_EMBED,
-            max_length=config.BLOCK_SIZE,
-            num_queries=config.BLOCK_SIZE,
-            truncate_limit=None
-        ).to(device)
-        rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
-        rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
-        rl_module.eval()
-        logging.info("Hierarchical Attention RL module loaded from checkpoint.")
-
-        if not args.test:
-            # Non-test run: compress the input text using the RL module and output prediction.
-            with torch.no_grad():
-                _, prediction, _ = rl_module(args.text, model=model)
-            print(f"Predicted Price: {prediction.item()}")
+    
+        # Conditionally load the RL module, only if --use_rl_module is set
+        rl_module = None
+        if args.use_rl_module:
+            rl_module = HierarchicalAttentionRL(
+                tokenizer_name=args.tokenizer_name,
+                embed_dim=config.N_EMBED,
+                max_length=config.BLOCK_SIZE,
+                num_queries=config.BLOCK_SIZE,
+                truncate_limit=None
+            ).to(device)
+            rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
+            rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
+            rl_module.eval()
+            logging.info("Hierarchical Attention RL module loaded from checkpoint.")
         else:
-            # Test mode: evaluate on run dataset.
+            logging.info("RL module NOT used (simple truncation).")
+    
+        if not args.test:
+            # Non-test run
+            if args.use_rl_module:
+                # Compress the input text using the RL module and output prediction
+                with torch.no_grad():
+                    _, prediction, _ = rl_module(args.text, model=model)
+                print(f"Predicted Price: {prediction.item()}")
+            else:
+                # If not using RL, just do naive truncation
+                # For example, feed the truncated text directly to the model
+                tokens = tokenizer(
+                    args.text,
+                    truncation=True,
+                    max_length=config.BLOCK_SIZE,
+                    return_tensors="pt"
+                ).to(device)
+                with torch.no_grad():
+                    pred, _ = model(input_ids=tokens["input_ids"])
+                print(f"Predicted Price: {pred.item()}")
+        else:
+            # Test mode: evaluate on run dataset
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
-
+    
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
@@ -389,33 +410,32 @@ def main():
             ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-
+    
             if args.percent_data < 100:
                 global_max = int(0.2 * 453932 * (args.percent_data / 100))
             else:
                 global_max = int(1e12)
+    
             cumulative_offset = 0
-
             local_predictions = []
             local_actuals = []
             local_oldprices = []
             local_riskfree = []
             local_sectors = []
-
+    
             for i in range(1, 19):
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
-
+    
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"(Rank {current_rank}) Processing {run_filename} (cumulative offset: {cumulative_offset})...")
-                # Pass the rl_module into process_run_dataset so that each sample's raw text is compressed to 4k tokens.
                 preds, acts, olds, rf, sects, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
                     ebm=ebm,
-                    rl_module=rl_module,
+                    rl_module=rl_module,  # pass None or RL module
                     args=args,
                     device=device,
                     batch_size=5,
@@ -430,7 +450,8 @@ def main():
                 local_riskfree.extend(rf)
                 local_sectors.extend(sects)
                 logging.info(f"(Rank {current_rank}) After {run_filename}, cumulative offset is now {cumulative_offset}.")
-
+    
+            # If distributed, gather predictions/actuals/etc on rank 0
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 global_predictions = gather_lists_across_ranks(local_predictions)
                 global_actuals = gather_lists_across_ranks(local_actuals)
@@ -443,7 +464,8 @@ def main():
                 global_oldprices = local_oldprices
                 global_riskfree = local_riskfree
                 global_sectors = local_sectors
-
+    
+            # Only rank 0 computes metrics
             if (not torch.distributed.is_available() or not torch.distributed.is_initialized() or
                 torch.distributed.get_rank() == 0):
                 mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
@@ -454,7 +476,7 @@ def main():
                     riskfree=global_riskfree,
                     sectors=global_sectors
                 )
-
+    
                 print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
                 print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
                 print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -462,7 +484,7 @@ def main():
                 print(f"Average Return: {average_return:.4f}")
                 print(f"Win Rate: {win_rate:.2f}%")
                 print(f"Profit Factor: {profit_factor:.4f}")
-
+    
                 logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
                 logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
                 logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
@@ -470,6 +492,7 @@ def main():
                 logging.info(f"Average Return: {average_return:.4f}")
                 logging.info(f"Win Rate: {win_rate:.2f}%")
                 logging.info(f"Profit Factor: {profit_factor:.4f}")
+    
                 for sector, metrics in sector_metrics.items():
                     print(
                         f"Sector: {sector} - "
