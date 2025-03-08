@@ -457,8 +457,7 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
                 max_length=config.BLOCK_SIZE,
                 return_tensors="pt"
             ).to(device)
-            emb = model.get_embeddings(encoding["input_ids"])
-            mean_emb = emb.mean(dim=1).half()
+            mean_emb = model.get_embeddings(encoding["input_ids"]).half()
         energy = ebm(mean_emb).item()
         candidate_energies.append(energy)
 
