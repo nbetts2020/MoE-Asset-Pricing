@@ -186,70 +186,78 @@ def rl_collate_fn(batch):
 def rl_train_hAttention(args, model: nn.Module):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load RL data from chunked files (sample desired rows)
-    rl_df = load_rl_data(args, rl_rows=args.rl_rows)
-    if rl_df.empty:
-        logging.error("RL dataset is empty. Exiting.")
-        return
-
-    # Create RL dataset and DataLoader
-    rl_dataset = RLTextDataset(rl_df, text_field="formatted_text")
-    rl_loader = DataLoader(
-        rl_dataset,
-        batch_size=args.rl_batch_size,
-        shuffle=True,
-        collate_fn=rl_collate_fn,
-        num_workers=0
-    )
-
+    # Instead of a single DataFrame, iterate over chunks.
+    chunk_iterator = load_rl_data(args, rl_rows=args.rl_rows)
+    
     # Initialize our Hierarchical Attention RL module.
     hAttention = HierarchicalAttentionRL(
         tokenizer_name=args.tokenizer_name,
         embed_dim=config.N_EMBED,
         max_length=config.BLOCK_SIZE,
         num_queries=4096,
-        truncate_limit=None  # Set to a value (e.g., 64000) to enable truncation if desired.
+        truncate_limit=None  # e.g., 64000 if desired.
     ).to(device)
 
     optimizer = torch.optim.Adam(hAttention.parameters(), lr=args.rl_learning_rate)
     hAttention.train()
+
     for epoch in range(1, args.rl_epochs + 1):
+        logging.info(f"RL Epoch {epoch} starting.")
         epoch_loss = 0.0
         epoch_reward = 0.0
         num_batches = 0
-        for batch in rl_loader:
-            batch_loss = 0.0
-            batch_log_probs = []
-            preds = []
-            targets = []
-            for sample in batch:
-                text = sample["text"]
-                target = torch.tensor(sample["target"], dtype=torch.float32, device=device)
-                # Pass text along with the main model to obtain embeddings.
-                _, pred, log_prob = hAttention(text, model=model)
-                preds.append(pred)
-                targets.append(target)
-                batch_log_probs.append(log_prob)
-            preds_tensor = torch.stack(preds)
-            targets_tensor = torch.stack(targets)
-            mse_loss = F.mse_loss(preds_tensor, targets_tensor)
-            reward = -mse_loss.detach()  # lower MSE gives higher reward
-            avg_log_prob = torch.stack(batch_log_probs).mean()
-            rl_loss = -avg_log_prob * reward
-            loss = mse_loss + rl_loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # Iterate over chunks one at a time.
+        for df_chunk in chunk_iterator:
+            # Create RL dataset and DataLoader from this chunk.
+            rl_dataset = RLTextDataset(df_chunk, text_field="formatted_text")
+            rl_loader = DataLoader(
+                rl_dataset,
+                batch_size=args.rl_batch_size,
+                shuffle=True,
+                collate_fn=rl_collate_fn,
+                num_workers=0
+            )
 
-            epoch_loss += loss.item()
-            epoch_reward += reward.item()
-            num_batches += 1
+            for batch in rl_loader:
+                batch_loss = 0.0
+                batch_log_probs = []
+                preds = []
+                targets = []
+                for sample in batch:
+                    text = sample["text"]
+                    target = torch.tensor(sample["target"], dtype=torch.float32, device=device)
+                    _, pred, log_prob = hAttention(text, model=model)
+                    preds.append(pred)
+                    targets.append(target)
+                    batch_log_probs.append(log_prob)
+                preds_tensor = torch.stack(preds)
+                targets_tensor = torch.stack(targets)
+                mse_loss = F.mse_loss(preds_tensor, targets_tensor)
+                reward = -mse_loss.detach()  # lower MSE gives higher reward
+                avg_log_prob = torch.stack(batch_log_probs).mean()
+                rl_loss = -avg_log_prob * reward
+                loss = mse_loss + rl_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                epoch_reward += reward.item()
+                num_batches += 1
+
+            # Clean up after each chunk.
+            del rl_dataset, rl_loader, df_chunk
+            gc.collect()
 
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
         avg_reward = epoch_reward / num_batches if num_batches > 0 else 0.0
         logging.info(f"RL Epoch {epoch}: Avg Loss = {avg_loss:.4f}, Avg Reward = {avg_reward:.4f}")
 
-    # Save the trained RL module and upload to S3.
+        # Reset the chunk iterator for the next epoch.
+        chunk_iterator = load_rl_data(args, rl_rows=args.rl_rows)
+    
     from utils.utils import save_rl_attention
     save_rl_attention(hAttention, epoch=config.EPOCHS, save_dir=args.save_dir, args=args)
+    logging.info("RL training complete. RL module saved.")
