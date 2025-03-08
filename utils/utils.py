@@ -138,25 +138,20 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
 
 def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int = 13, shuffle: bool = True):
     """
-    Loads row data for RL from chunked Parquet files:
-      train_dataset_{chunk_index}a.parquet
-
-    If rl_rows = -1, loads ALL rows from all chunks.
-    Otherwise, samples proportionally across chunks to total ~rl_rows rows.
-
-    Returns a single DataFrame with the concatenated (and optionally shuffled) data.
+    Generator that loads RL data chunk-by-chunk from Parquet files 
+    (train_dataset_{chunk_index}a.parquet). It yields a DataFrame for each chunk.
+    
+    If rl_rows = -1, yields all rows from each chunk.
+    Otherwise, it samples proportionally from each chunk so that the total
+    approximates ~rl_rows rows.
     """
-    final_dfs = []
     accumulated = 0
-
-    # Use chunks 1 to 13.
     for chunk_idx in range(chunk_start, chunk_end + 1):
         if chunk_idx not in CHUNK_SIZES:
             logging.warning(f"Chunk {chunk_idx} not found in CHUNK_SIZES map. Skipping.")
             continue
 
         chunk_size = CHUNK_SIZES[chunk_idx]
-        # For RL mode, we load using get_data, which now supports args.mode=="rl".
         df_chunk = get_data(
             epoch=1,
             window_index=chunk_idx,
@@ -169,37 +164,26 @@ def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int =
             continue
 
         if rl_rows == -1:
-            final_dfs.append(df_chunk)
+            chunk_df = df_chunk
         else:
             # Proportional sample: calculate how many rows to sample from this chunk.
             chunk_needed = int(round((chunk_size / TOTAL_CHUNK_ROWS) * rl_rows))
             if chunk_needed <= 0:
                 continue
-
-            if chunk_needed >= len(df_chunk):
-                final_dfs.append(df_chunk)
+            if chunk_needed < len(df_chunk):
+                chunk_df = df_chunk.sample(n=chunk_needed, random_state=random.randint(0, 999999))
             else:
-                sampled_df = df_chunk.sample(n=chunk_needed, random_state=random.randint(0, 999999))
-                final_dfs.append(sampled_df)
+                chunk_df = df_chunk
 
-        accumulated += len(final_dfs[-1])
-        del df_chunk
+        accumulated += len(chunk_df)
+        yield chunk_df
+
+        # Clean up to free memory.
+        del df_chunk, chunk_df
         gc.collect()
 
         if rl_rows != -1 and accumulated >= rl_rows:
             break
-
-    if not final_dfs:
-        logging.warning("No data was loaded or sampled from the chunks.")
-        return pd.DataFrame()
-
-    final_df = pd.concat(final_dfs, ignore_index=True)
-    if rl_rows != -1 and len(final_df) > rl_rows:
-        final_df = final_df.sample(n=rl_rows, random_state=random.randint(0, 999999)).reset_index(drop=True)
-    if shuffle and len(final_df) > 1:
-        final_df = final_df.sample(frac=1.0, random_state=random.randint(0, 999999)).reset_index(drop=True)
-    logging.info(f"[load_rl_data] Final RL DataFrame has {len(final_df)} rows (desired={rl_rows if rl_rows != -1 else 'ALL'}).")
-    return final_df
 
 def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device, 
                         batch_size=500, current_offset=0, global_max=int(1e12), 
