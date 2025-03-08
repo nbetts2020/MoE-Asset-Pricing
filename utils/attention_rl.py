@@ -185,19 +185,13 @@ def rl_collate_fn(batch):
 # ------------------------------
 def rl_train_hAttention(args, model: nn.Module):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Instead of a single DataFrame, iterate over chunks.
-    chunk_iterator = load_rl_data(args, rl_rows=args.rl_rows)
-    
-    # Initialize our Hierarchical Attention RL module.
     hAttention = HierarchicalAttentionRL(
         tokenizer_name=args.tokenizer_name,
         embed_dim=config.N_EMBED,
         max_length=config.BLOCK_SIZE,
         num_queries=4096,
-        truncate_limit=None  # e.g., 64000 if desired.
+        truncate_limit=None
     ).to(device)
-
     optimizer = torch.optim.Adam(hAttention.parameters(), lr=args.rl_learning_rate)
     hAttention.train()
 
@@ -207,9 +201,9 @@ def rl_train_hAttention(args, model: nn.Module):
         epoch_reward = 0.0
         num_batches = 0
 
-        # Iterate over chunks one at a time.
+        # Create a new generator for each epoch.
+        chunk_iterator = load_rl_data(args, rl_rows=args.rl_rows)
         for df_chunk in chunk_iterator:
-            # Create RL dataset and DataLoader from this chunk.
             rl_dataset = RLTextDataset(df_chunk, text_field="formatted_text")
             rl_loader = DataLoader(
                 rl_dataset,
@@ -218,9 +212,7 @@ def rl_train_hAttention(args, model: nn.Module):
                 collate_fn=rl_collate_fn,
                 num_workers=0
             )
-
             for batch in rl_loader:
-                batch_loss = 0.0
                 batch_log_probs = []
                 preds = []
                 targets = []
@@ -231,7 +223,7 @@ def rl_train_hAttention(args, model: nn.Module):
                     preds.append(pred)
                     targets.append(target)
                     batch_log_probs.append(log_prob)
-                preds_tensor = torch.stack(preds)
+                preds_tensor = torch.stack(preds).squeeze(-1)
                 targets_tensor = torch.stack(targets)
                 mse_loss = F.mse_loss(preds_tensor, targets_tensor)
                 reward = -mse_loss.detach()  # lower MSE gives higher reward
@@ -247,7 +239,7 @@ def rl_train_hAttention(args, model: nn.Module):
                 epoch_reward += reward.item()
                 num_batches += 1
 
-            # Clean up after each chunk.
+            # Clean up after processing the chunk.
             del rl_dataset, rl_loader, df_chunk
             gc.collect()
 
@@ -255,9 +247,6 @@ def rl_train_hAttention(args, model: nn.Module):
         avg_reward = epoch_reward / num_batches if num_batches > 0 else 0.0
         logging.info(f"RL Epoch {epoch}: Avg Loss = {avg_loss:.4f}, Avg Reward = {avg_reward:.4f}")
 
-        # Reset the chunk iterator for the next epoch.
-        chunk_iterator = load_rl_data(args, rl_rows=args.rl_rows)
-    
     from utils.utils import save_rl_attention
     save_rl_attention(hAttention, epoch=config.EPOCHS, save_dir=args.save_dir, args=args)
     logging.info("RL training complete. RL module saved.")
