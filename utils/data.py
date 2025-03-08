@@ -50,38 +50,6 @@ class PrecomputedDataset(Dataset):
         label = self.df.iloc[idx].get("weighted_avg_720_hrs", 0.0)  # Defaulting to 0.0 if missing
         return {"input_ids": input_ids, "label": torch.tensor(label, dtype=torch.float)}
 
-class RunDataset(Dataset):
-    """
-    Dataset for run data stored in a parquet file.
-    Each sample concatenates text from iteration_1_text to iteration_30_text,
-    and returns associated target values.
-    """
-    def __init__(self, file_path, tokenizer, block_size):
-        self.tokenizer = tokenizer
-        self.block_size = block_size
-        # Load the parquet file into a DataFrame.
-        self.df = pd.read_parquet(file_path)
-        # Filter out rows with invalid target values.
-        self.df = self.df.dropna(subset=['weighted_avg_720_hrs'])
-        self.df = self.df[self.df['weighted_avg_720_hrs'] > 0].reset_index(drop=True)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        sample = self.df.iloc[idx]
-        # Concatenate iteration texts from 1 to 30.
-        texts = [str(sample.get(f"iteration_{i}_text", "")) for i in range(1, 31)]
-        concatenated_text = " ".join(texts).strip()
-        
-        return {
-            "raw_text": concatenated_text,
-            "weighted_avg_720_hrs": sample.get("weighted_avg_720_hrs", 0.0),
-            "weighted_avg_0_hrs": sample.get("weighted_avg_0_hrs", 0.0),
-            "Risk_Free_Rate": sample.get("Risk_Free_Rate", 0.0),
-            "Sector": sample.get("Sector", "Unknown")
-        }
-
 # -------------------------------------------------------------------------
 # CUSTOM COLLATE FUNCTION
 # -------------------------------------------------------------------------
