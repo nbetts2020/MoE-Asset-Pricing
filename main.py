@@ -333,7 +333,7 @@ def main():
         if current_rank == 0:
             if args.bucket:
                 download_models_from_s3(bucket=args.bucket)
-            consolidated_model_path = consolidate_checkpoint_to_pth(
+            consolidated_model_path = consolidate_checkpoint_to_fp32_state_dict(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
@@ -361,26 +361,47 @@ def main():
     
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
     
-        # Load the RL module (used for both test and non-test runs).
-        rl_module = HierarchicalAttentionRL(
-            tokenizer_name=args.tokenizer_name,
-            embed_dim=config.N_EMBED,
-            max_length=config.BLOCK_SIZE,
-            num_queries=config.BLOCK_SIZE,
-            truncate_limit=None
-        ).to(device)
-        rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
-        rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
-        rl_module.eval()
-        logging.info("Hierarchical Attention RL module loaded from checkpoint.")
+        # Toggle RL module based on the --use_rl_module flag.
+        rl_module = None
+        if args.use_rl_module:
+            rl_module = HierarchicalAttentionRL(
+                tokenizer_name=args.tokenizer_name,
+                embed_dim=config.N_EMBED,
+                max_length=config.BLOCK_SIZE,
+                num_queries=config.BLOCK_SIZE,
+                truncate_limit=None
+            ).to(device)
+            rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
+            rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
+            rl_module.eval()
+            logging.info("Hierarchical Attention RL module loaded from checkpoint.")
+        else:
+            logging.info("RL module not used; falling back to simple truncation.")
     
         if not args.test:
-            # Non-test run: Use RL module directly on the provided input text.
-            with torch.no_grad():
-                _, prediction, _ = rl_module(args.text, model=model)
-            print(f"Predicted Price: {prediction.item()}")
+            # Non-test run: Use RL module directly on the provided input text if enabled.
+            if args.use_rl_module:
+                with torch.no_grad():
+                    # RL module processes the input text and returns a full embedding set.
+                    downsampled, _, _ = rl_module(args.text, model=model)
+                    # Mean-pool the embedding matrix to obtain a single vector.
+                    compressed_embedding = downsampled.mean(dim=1)
+                with torch.no_grad():
+                    pred = model.reg_head(compressed_embedding).squeeze(0)
+                print(f"Predicted Price: {pred.item()}")
+            else:
+                # Fallback: simple truncation.
+                tokens = tokenizer(
+                    args.text,
+                    truncation=True,
+                    max_length=config.BLOCK_SIZE,
+                    return_tensors="pt"
+                ).to(device)
+                with torch.no_grad():
+                    pred, _ = model(input_ids=tokens["input_ids"])
+                print(f"Predicted Price: {pred.item()}")
         else:
-            # Test mode: Evaluate on run dataset using EBM + RL module
+            # Test mode: evaluate on run dataset using EBM (and RL module for compression if enabled).
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
     
@@ -412,13 +433,12 @@ def main():
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"(Rank {current_rank}) Processing {run_filename} (cumulative offset: {cumulative_offset})...")
     
-                # Pass rl_module into process_run_dataset (though snippet is using naive truncation).
                 preds, acts, olds, rf, sects, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
                     ebm=ebm,
-                    rl_module=rl_module,
+                    rl_module=rl_module,  # Pass RL module (or None if not used)
                     args=args,
                     device=device,
                     batch_size=5,
@@ -434,7 +454,6 @@ def main():
                 local_sectors.extend(sects)
                 logging.info(f"(Rank {current_rank}) After {run_filename}, cumulative offset is now {cumulative_offset}.")
     
-            # If distributed, gather results on rank 0
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 global_predictions = gather_lists_across_ranks(local_predictions)
                 global_actuals = gather_lists_across_ranks(local_actuals)
@@ -448,7 +467,6 @@ def main():
                 global_riskfree = local_riskfree
                 global_sectors = local_sectors
     
-            # Final metrics on rank 0
             if (not torch.distributed.is_available() or not torch.distributed.is_initialized() or
                 torch.distributed.get_rank() == 0):
                 mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
