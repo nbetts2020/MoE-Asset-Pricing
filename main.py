@@ -333,7 +333,7 @@ def main():
         if current_rank == 0:
             if args.bucket:
                 download_models_from_s3(bucket=args.bucket)
-            consolidated_model_path = consolidate_checkpoint_to_fp32_state_dict(
+            consolidated_model_path = consolidate_checkpoint_to_pth(
                 checkpoint_dir=args.save_dir,
                 tag="final",
                 output_path=args.save_dir
