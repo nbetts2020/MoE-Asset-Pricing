@@ -200,14 +200,6 @@ def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int =
         final_df = final_df.sample(frac=1.0, random_state=random.randint(0, 999999)).reset_index(drop=True)
     logging.info(f"[load_rl_data] Final RL DataFrame has {len(final_df)} rows (desired={rl_rows if rl_rows != -1 else 'ALL'}).")
     return final_df
-    
-import os
-import gc
-import shutil
-import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download
-import numpy as np
-from utils.config import config
 
 def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device, 
                         batch_size=500, current_offset=0, global_max=int(1e12), 
@@ -216,7 +208,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
     Streams a run dataset file in small batches and processes rows until global_max is reached.
     
     Args:
-        run_dataset_filename (str): Name of the dataset file.
+        run_dataset_filename (str): Name of the run dataset file.
         tokenizer: The transformer tokenizer.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
@@ -224,9 +216,9 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
         args: Command-line arguments.
         device: The device (CUDA/CPU).
         batch_size (int): Number of rows per batch.
-        current_offset (int): Rows processed so far.
+        current_offset (int): Number of rows already processed.
         global_max (int): Total rows to process.
-        cache_dir (str): Temporary cache directory.
+        cache_dir (str): Temporary directory for downloads.
     
     Returns:
         predictions, actuals, oldprices, riskfree, sectors, processed_in_file
@@ -266,20 +258,18 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
             sample = df_chunk.iloc[idx]
             raw_text = sample.get("formatted_text", "")
             
-            # Toggle between RL compression and simple truncation.
             if rl_module is not None:
                 with torch.no_grad():
-                    # RL module outputs a full embedding set: (1, seq_len, embed_dim)
+                    # RL module returns a full embedding set: (1, seq_len, embed_dim)
                     downsampled, _, _ = rl_module(raw_text, model=model)
-                # Mean-pool to obtain a single vector.
-                compressed_embedding = downsampled.mean(dim=1)  # shape: (1, embed_dim)
+                # Mean-pool the embedding matrix to obtain a single vector.
+                compressed_embedding = downsampled.mean(dim=1)
             else:
                 tokens = tokenizer(raw_text, truncation=True, max_length=4096, return_tensors="pt")
                 truncated_ids = tokens["input_ids"][0].tolist()
-                compressed_embedding = None  # no embeddings available in fallback
+                compressed_embedding = None
                 compressed_text = tokenizer.decode(truncated_ids)
             
-            # Select the best candidate context.
             try:
                 best_context = ebm_select_contexts(
                     df=df_chunk,
@@ -288,13 +278,12 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                     ebm=ebm,
                     tokenizer=tokenizer,
                     ebm_samples=args.ebm_num_samples,
-                    rl_module=rl_module  # Pass rl_module so it is used in candidate selection.
+                    rl_module=rl_module  # Pass RL module so candidate texts can be processed via RL if desired.
                 )
             except Exception as e:
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
             
-            # Final prediction step.
             if compressed_embedding is not None:
                 with torch.no_grad():
                     pred = model.reg_head(compressed_embedding).squeeze(0)
@@ -425,14 +414,14 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
 
 def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=None):
     """
-    For the sample at the given index, select the best context from candidate columns 
+    For the sample at the given index, select the best candidate context from candidate columns 
     (iteration_1_text ... iteration_30_text). For each candidate:
     
     - If rl_module is provided, run it on the candidate text to obtain a compressed embedding matrix,
       then mean-pool the output.
     - Otherwise, tokenize the candidate text and compute embeddings via model.get_embeddings.
     
-    Returns the candidate text whose (mean-pooled) embedding has energy closest to zero.
+    Returns the candidate text whose mean-pooled embedding has energy closest to zero.
     """
     import random
     import numpy as np
@@ -458,7 +447,6 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
     for candidate in sampled_candidates:
         if rl_module is not None:
             with torch.no_grad():
-                # Run the RL module on the candidate text.
                 downsampled, _, _ = rl_module(candidate, model=model)
             mean_emb = downsampled.mean(dim=1).half()
         else:
