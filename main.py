@@ -230,7 +230,7 @@ def main():
             window_index=1,
             tokenizer=tokenizer,
             batch_size=config.BATCH_SIZE,
-            shuffle=True,
+            shuffle=False,
             global_offset=0,
             global_max=1e12,
             args=args
