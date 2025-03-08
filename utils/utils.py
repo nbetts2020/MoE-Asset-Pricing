@@ -136,7 +136,6 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
 
     return df
 
-
 def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int = 13, shuffle: bool = True):
     """
     Loads row data for RL from chunked Parquet files:
@@ -213,11 +212,11 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
         tokenizer: The transformer tokenizer.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The energy-based model.
-        rl_module (torch.nn.Module): The HierarchicalAttentionRL module used to compress/truncate raw text.
-        args: Command-line arguments (expects args.ebm_num_samples, etc.).
+        rl_module (torch.nn.Module or None): The HierarchicalAttentionRL module used for text compression.
+        args: Command-line arguments.
         device: The device (CUDA/CPU).
         batch_size (int): Number of rows to process per batch.
-        current_offset (int): Number of rows already processed (from previous datasets).
+        current_offset (int): Number of rows already processed.
         global_max (int): Total number of rows to process across all files.
         cache_dir (str): Temporary directory for downloads.
     
@@ -225,17 +224,14 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
         predictions, actuals, oldprices, riskfree, sectors: Lists of results for this file.
         processed_in_file (int): Number of rows processed from this file.
     """
-    # Ensure cache directory exists
     os.makedirs(cache_dir, exist_ok=True)
     
-    repo_id = "nbettencourt/sc454k-preprocessed-dfs"
     file_path = hf_hub_download(
-        repo_id=repo_id, 
+        repo_id="nbettencourt/sc454k-preprocessed-dfs", 
         filename=run_dataset_filename, 
         repo_type="dataset", 
         cache_dir=cache_dir
     )
-    
     parquet_file = pq.ParquetFile(file_path)
     
     predictions = []
@@ -243,47 +239,41 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
     oldprices = []
     riskfree = []
     sectors = []
-    
-    processed_in_file = 0  # Count of rows processed in this file
+    processed_in_file = 0
 
-    # Iterate over batches using PyArrow's streaming API.
     for batch in parquet_file.iter_batches(batch_size=batch_size):
         df_chunk = batch.to_pandas()
-        # Filter rows as in your original logic.
         df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
         df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0]
         
         num_rows = len(df_chunk)
-        
-        # Stop if the cumulative count reaches the global maximum.
         if current_offset + processed_in_file >= global_max:
             break
         
-        # Determine the effective indices for this chunk.
         start_idx = 0
         end_idx = num_rows
         if current_offset + processed_in_file + num_rows > global_max:
             end_idx = global_max - (current_offset + processed_in_file)
         
-        # Process each row in the chunk.
         for idx in range(start_idx, end_idx):
             sample = df_chunk.iloc[idx]
-            
-            # Compress raw text to 4096 tokens.
             raw_text = sample.get("formatted_text", "")
-            tokens = tokenizer(
-                raw_text,
-                truncation=True,
-                max_length=4096,
-                return_tensors="pt"
-            )
-            truncated_ids = tokens["input_ids"][0].tolist()
-            compressed_text = tokenizer.decode(truncated_ids)
             
-            # (Optionally, you could use rl_module here to obtain a learned compressed representation.)
-            # For now, we use the simple truncation result as our candidate text.
+            # Use RL module to compress text if provided; otherwise, use naive truncation.
+            if rl_module is not None:
+                with torch.no_grad():
+                    # The RL module returns a full embedding set: (1, seq_len, embed_dim)
+                    downsampled, _, _ = rl_module(raw_text, model=model)
+                # Mean-pool the embeddings to obtain a single vector.
+                compressed_embedding = downsampled.mean(dim=1)  # shape: (1, embed_dim)
+            else:
+                tokens = tokenizer(raw_text, truncation=True, max_length=4096, return_tensors="pt")
+                truncated_ids = tokens["input_ids"][0].tolist()
+                # In fallback mode, we do not have embeddings.
+                compressed_embedding = None
+                compressed_text = tokenizer.decode(truncated_ids)
             
-            # Select the best context using the adjusted ebm_select_contexts function.
+            # Select best candidate context from precomputed candidate columns.
             try:
                 best_context = ebm_select_contexts(
                     df=df_chunk,
@@ -297,18 +287,23 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
             
-            # Use the selected candidate context as final input.
-            final_input = best_context
-            encoding = tokenizer(
-                final_input,
-                truncation=True,
-                padding="max_length",
-                max_length=config.BLOCK_SIZE,
-                return_tensors="pt"
-            ).to(device)
-            input_ids = encoding["input_ids"]
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                pred, _ = model(input_ids=input_ids)
+            # If we have an RL-compressed embedding, use it directly for prediction.
+            if compressed_embedding is not None:
+                with torch.no_grad():
+                    pred = model.reg_head(compressed_embedding).squeeze(0)
+            else:
+                # Otherwise, tokenize the best context text and predict normally.
+                encoding = tokenizer(
+                    best_context,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=config.BLOCK_SIZE,
+                    return_tensors="pt"
+                ).to(device)
+                input_ids = encoding["input_ids"]
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    pred, _ = model(input_ids=input_ids)
+            
             predictions.append(pred.item())
             actuals.append(sample['weighted_avg_720_hrs'])
             oldprices.append(sample['weighted_avg_0_hrs'])
@@ -317,8 +312,6 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
             print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred.item()}")
         
         processed_in_file += num_rows
-        
-        # Cleanup the current chunk.
         del df_chunk
         gc.collect()
         torch.cuda.empty_cache()
@@ -326,7 +319,6 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
         if current_offset + processed_in_file >= global_max:
             break
 
-    # Cleanup the downloaded file and cache directory.
     if os.path.exists(file_path):
         os.remove(file_path)
     if os.path.exists(cache_dir):
@@ -425,32 +417,43 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
         except Exception as e:
             logging.error(f"Error uploading RL Attention module to S3: {e}")
 
-def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
+def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=None):
     """
-    For the sample at the given index, select the best context from the candidate columns.
-    It assumes candidate context strings are stored in columns "iteration_1_text" ... "iteration_30_text".
+    For the sample at the given index, select the best context from candidate columns 
+    (iteration_1_text ... iteration_30_text). For each candidate:
     
-    This version computes mean-pooled embeddings from the candidate texts and passes them to the EBM,
-    which expects a single pooled vector rather than raw text.
+    - If rl_module is provided, run it on the candidate text to obtain a compressed embedding matrix,
+      then mean-pool the output.
+    - Otherwise, tokenize the candidate text and compute embeddings via model.get_embeddings.
+    
+    The mean-pooled embedding is then passed to the EBM to compute an energy, and the candidate 
+    with the energy closest to zero is returned.
     
     Args:
-        df (pd.DataFrame): DataFrame containing the test samples with candidate context columns.
+        df (pd.DataFrame): DataFrame containing candidate context columns.
         idx (int): Index of the target sample in df.
         model (torch.nn.Module): The main transformer model.
         ebm (torch.nn.Module): The Energy-Based Model.
         tokenizer (transformers.PreTrainedTokenizer): The tokenizer.
         ebm_samples (int): Number of candidate contexts to sample (max 30).
+        rl_module (torch.nn.Module, optional): If provided, used to compress candidate text.
         
     Returns:
-        str: The candidate context with energy closest to zero.
+        str: The candidate text whose (mean-pooled) embedding has energy closest to zero.
     """
+    import random
+    import numpy as np
+    from utils.config import config
+
     row = df.iloc[idx]
-    # Extract candidate texts from iteration_1_text through iteration_30_text.
-    candidates = [row.get(f"iteration_{i}_text") for i in range(1, 31) if row.get(f"iteration_{i}_text") is not None]
+    candidates = [
+        row.get(f"iteration_{i}_text")
+        for i in range(1, 31)
+        if row.get(f"iteration_{i}_text") is not None
+    ]
     if not candidates:
         raise ValueError("No candidate contexts found for this sample.")
-    
-    # Sample candidates if there are more than ebm_samples available.
+
     if len(candidates) > ebm_samples:
         sampled_candidates = random.sample(candidates, ebm_samples)
     else:
@@ -458,27 +461,31 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples):
 
     candidate_energies = []
     device = next(model.parameters()).device
+
     for candidate in sampled_candidates:
-        encoding = tokenizer(
-            candidate,
-            truncation=True,
-            padding="max_length",
-            max_length=config.BLOCK_SIZE,
-            return_tensors="pt"
-        ).to(device)
-        # Get token embeddings: shape (1, seq_len, embed_dim)
-        emb = model.get_embeddings(encoding["input_ids"])
-        # Mean-pool over the sequence to obtain a single vector (1, embed_dim)
-        mean_emb = emb.mean(dim=1).half()
-        # Compute the energy from the pooled vector
+        if rl_module is not None:
+            with torch.no_grad():
+                # Run the RL module on the candidate text.
+                # It returns a full embedding set: shape (1, seq_len, embed_dim)
+                downsampled, _, _ = rl_module(candidate, model=model)
+            # Mean-pool the embedding matrix to obtain a single vector.
+            mean_emb = downsampled.mean(dim=1).half()
+        else:
+            encoding = tokenizer(
+                candidate,
+                truncation=True,
+                padding="max_length",
+                max_length=config.BLOCK_SIZE,
+                return_tensors="pt"
+            ).to(device)
+            emb = model.get_embeddings(encoding["input_ids"])
+            mean_emb = emb.mean(dim=1).half()
         energy = ebm(mean_emb).item()
         candidate_energies.append(energy)
-    
-    # Select the candidate whose energy (absolute value) is closest to zero.
+
     best_idx = np.argmin([abs(e) for e in candidate_energies])
-    best_context = sampled_candidates[best_idx]
-    return best_context
-    
+    return sampled_candidates[best_idx]
+
 def get_model_from_hf(model_repo_id, device):
     """
     Downloads the model configuration and weights from Hugging Face Hub and loads them into the SparseMoELanguageModel.
