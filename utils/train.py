@@ -36,8 +36,8 @@ def train_model(
       - Memory Replay Buffer (replay_buffer)
       - Optional EBM placeholders
       - DeepSpeed or standard PyTorch training
-    Returns:
-      The trained DeepSpeed engine.
+
+    Final checkpoint saving, S3 upload, and EBM saving occur at the end.
     """
     adam_optimizer, muon_optimizer = optimizers
     rank = 0
@@ -58,7 +58,6 @@ def train_model(
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass with mixed precision
             with torch.cuda.amp.autocast(enabled=True):
                 outputs, _ = model(input_ids=input_ids)
                 loss = F.mse_loss(outputs.squeeze(-1), labels.float())
@@ -111,10 +110,19 @@ def train_model(
 
         gc.collect()
 
+    torch.cuda.synchronize()
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    logging.info("All epochs completed.")
+    # Final checkpoint saving and upload only performed by rank 0.
+    if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
+        tag = "final"
+        model.save_checkpoint(args.save_dir, tag=tag)
+        logging.info(f"DeepSpeed ZeRO checkpoint saved to {args.save_dir}, tag={tag}")
+        if args.bucket:
+            upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
+        if args.use_ebm and ebm is not None:
+            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
+            logging.info("EBM model saved.")
 
-    # Return the engine for final saving/inspection
-    return model
+    logging.info("All epochs completed.")
