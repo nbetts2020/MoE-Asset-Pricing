@@ -4,8 +4,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
+import subprocess
 
-from utils.utils import compute_l2_loss
+from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, save_ebm_model
 from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
@@ -34,7 +35,9 @@ def train_model(
       - Elastic Weight Consolidation (ewc)
       - Memory Replay Buffer (replay_buffer)
       - Optional EBM placeholders
-      - Deepspeed or standard PyTorch training
+      - DeepSpeed or standard PyTorch training
+    Returns:
+      The trained DeepSpeed engine.
     """
     adam_optimizer, muon_optimizer = optimizers
     rank = 0
@@ -51,7 +54,7 @@ def train_model(
 
         for step, batch in enumerate(dataloader):
             print(f"Processing batch {step + 1}/{total_batches}")
-            
+
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
@@ -60,11 +63,9 @@ def train_model(
                 outputs, _ = model(input_ids=input_ids)
                 loss = F.mse_loss(outputs.squeeze(-1), labels.float())
 
-                # Optional: L2 Regularization
                 if args.use_l2:
                     loss += args.lambda_l2 * compute_l2_loss(model)
 
-                # Optional: Replay Buffer Training
                 if replay_buffer and len(replay_buffer.buffer) > 0:
                     replay_loss = replay_buffer.replay_and_calculate_loss(
                         model=model,
@@ -75,20 +76,16 @@ def train_model(
                     )
                     loss += replay_loss
 
-                # Optional: EWC Regularization
                 if args.use_ewc and ewc:
                     for ewc_instance in ewc:
                         loss += args.lambda_ewc * ewc_instance.penalty(model)
 
-                # Optional: SI Regularization
                 if args.use_si and si:
                     loss += si.penalty(model)
 
-            # Zero gradients for both optimizers
             adam_optimizer.zero_grad()
             muon_optimizer.zero_grad()
 
-            # Backprop and optimizer step
             if use_deepspeed and hasattr(model, "backward"):
                 model.backward(loss)
                 model.step()
@@ -97,37 +94,27 @@ def train_model(
                 adam_optimizer.step()
                 muon_optimizer.step()
 
-            # SI online update
             if args.use_si and si:
                 si.update_weights(model)
 
-            # Add the current batch to replay buffer
             if args.use_replay_buffer and replay_buffer:
                 replay_buffer.add_batch(batch)
 
-        # End of epoch tasks
         logging.info(f"=== Finished epoch {epoch} ===")
 
-        # EWC consolidation
         if args.use_ewc and ewc:
             for ewc_instance in ewc:
                 ewc_instance.consolidate(model)
 
-        # SI finalize
         if args.use_si and si:
             si.update_omega(model)
-            
+
         gc.collect()
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    tag = "final"
-    engine.save_checkpoint(args.save_dir, tag=tag)
-    logging.info(f"DeepSpeed ZeRO checkpoint saved to {args.save_dir}, tag={tag}")
-    if args.bucket:
-        upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-    if args.use_ebm and ebm is not None:
-        save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-        logging.info("EBM model saved.")
 
     logging.info("All epochs completed.")
+
+    # Return the engine for final saving/inspection
+    return model
