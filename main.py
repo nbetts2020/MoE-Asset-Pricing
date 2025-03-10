@@ -210,7 +210,7 @@ def main():
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
     
-        # Initialize DeepSpeed engine
+        # Initialize DeepSpeed engine (engine is your DeepSpeed object)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=adam_optimizer,
@@ -237,8 +237,8 @@ def main():
             args=args
         )
     
-        # Train the model; train_model now returns the engine after training.
-        engine = train_model(
+        # Call train_model; final checkpoint saving, barriers, and uploads occur inside train_model.
+        train_model(
             model=engine,
             optimizers=(adam_optimizer, muon_optimizer),
             epochs=config.EPOCHS,
@@ -254,22 +254,6 @@ def main():
             use_deepspeed=True
         )
         logging.info("Training completed.")
-    
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-    
-        # Only rank 0 saves the final checkpoint and uploads (if needed)
-        if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
-            tag = "final"
-            engine.save_checkpoint(args.save_dir, tag=tag)
-            logging.info(f"DeepSpeed ZeRO checkpoint saved to {args.save_dir}, tag={tag}")
-            if args.bucket:
-                upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-            if args.use_ebm and ebm is not None:
-                save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-                logging.info("EBM model saved.")
-    
-        logging.info("All epochs completed.")
 
     elif args.mode == "update":
         print_debug_info("UPDATE MODE START")
