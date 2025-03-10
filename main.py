@@ -253,17 +253,6 @@ def main():
         )
         logging.info("Training completed.")
 
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        tag = "final"
-        engine.save_checkpoint(args.save_dir, tag=tag)
-        logging.info(f"DeepSpeed ZeRO checkpoint saved to {args.save_dir}, tag={tag}")
-        if args.bucket:
-            upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-        if args.use_ebm and ebm is not None:
-            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-            logging.info("EBM model saved.")
-
     elif args.mode == "update":
         print_debug_info("UPDATE MODE START")
         if not args.bucket:
