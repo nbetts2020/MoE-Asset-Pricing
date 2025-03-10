@@ -711,7 +711,8 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
         sampler=sampler,
         num_workers=0,
         collate_fn=custom_collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        drop_last=True
     )
     return dataloader
                            
