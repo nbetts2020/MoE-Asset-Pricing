@@ -1,5 +1,6 @@
 import os
 import gc
+import time  # for sleep
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
@@ -46,6 +47,7 @@ def train_model(
 
     logging.info(f"Beginning training for {epochs} epoch(s).")
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
+    logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -114,10 +116,14 @@ def train_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    # Final checkpoint saving and upload only performed by rank 0.
+    tag = "final"
+    model.save_checkpoint(args.save_dir, tag=tag)  # All ranks save their shards
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()  # Wait for all ranks to finish saving
     if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
-        tag = "final"
-        model.save_checkpoint(args.save_dir, tag=tag)
+        # In train_model, just before saving the checkpoint
+        logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
+        logging.info(f"Embedding dimension (n_embed): {model.token_embedding_table.weight.size(1)}")
         logging.info(f"DeepSpeed ZeRO checkpoint saved to {args.save_dir}, tag={tag}")
         if args.bucket:
             upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
