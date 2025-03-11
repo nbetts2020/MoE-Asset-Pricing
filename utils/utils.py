@@ -500,7 +500,7 @@ def get_model_from_hf(model_repo_id, device):
     model_config_json = {k: config[k] for k in expected_args if k in config}
     logging.info(f"Filtered model configuration: {model_config_json}")
 
-    # Initialize the model with the configuration
+    # ize the model with the configuration
     try:
         model = SparseMoELanguageModel(**model_config_json)
         logging.info("Initialized SparseMoELanguageModel with configuration.")
@@ -754,7 +754,7 @@ def prepare_tasks(tokenizer, args, k=3):
 
 def initialize_model(args, device, init_from_scratch=False):
     """
-    Initialize the SparseMoELanguageModel either from scratch or by loading from Hugging Face or local weights.
+    Initialize the SparseMoELanguageModel either from scratch or by loading from saved DeepSpeed checkpoint.
 
     Args:
         args (argparse.Namespace): Command-line arguments.
@@ -765,10 +765,13 @@ def initialize_model(args, device, init_from_scratch=False):
         model (SparseMoELanguageModel): The initialized model.
         initialized_from_scratch (bool): Flag indicating if the model was initialized from scratch.
     """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    logging.info(f"Rank {rank}: Initializing model")
+
     if init_from_scratch:
         logging.info("Initializing model from scratch using configurations from utils/config.py.")
         model_config = {
-            'n_embed': config.N_EMBED,
+            'n_embed': args.n_embed if hasattr(args, 'n_embed') else config.N_EMBED,
             'n_head': config.N_HEAD,
             'n_layer': config.N_LAYER,
             'block_size': config.BLOCK_SIZE,
@@ -780,48 +783,51 @@ def initialize_model(args, device, init_from_scratch=False):
         model = SparseMoELanguageModel(**model_config)
         model = model.to(device)
         initialized_from_scratch = True
-        return model, initialized_from_scratch
     else:
-        model = None
-        initialized_from_scratch = False
-        if hasattr(args, 'model') and args.model:
-            # Attempt to load from Hugging Face
-            try:
-                logging.info(f"Attempting to load model from Hugging Face repository '{args.model}'.")
-                model = get_model_from_hf(args.model, device)
-                logging.info("Successfully loaded model from Hugging Face.")
-                return model, initialized_from_scratch
-            except Exception as e:
-                logging.warning(f"Failed to load model from Hugging Face: {e}")
-                logging.info("Attempting to load model from local 'model/model_weights.pth'.")
+        # Load and consolidate DeepSpeed checkpoint
+        checkpoint_dir = os.path.join(args.save_dir, "final")
+        consolidated_path = os.path.join(args.save_dir, f"consolidated_final_rank_{rank}.pth")
+
+        if not os.path.exists(checkpoint_dir):
+            logging.error(f"Checkpoint directory {checkpoint_dir} not found")
+            raise FileNotFoundError(f"Checkpoint directory {checkpoint_dir} not found")
+
+        # Consolidate ZeRO checkpoint to full model state (only model weights, no optimizer)
+        if (not torch.distributed.is_initialized()) or (rank == 0):
+            logging.info(f"Rank {rank}: Consolidating checkpoint from {checkpoint_dir}")
+            state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
+            torch.save(state_dict, consolidated_path)
+        
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()  # Wait for rank 0 to consolidate
+
+        # All ranks load the consolidated state dict
+        if rank != 0:
+            while not os.path.exists(consolidated_path.replace(f"rank_{rank}", "rank_0")):
+                time.sleep(1)  # Wait for rank 0 to write the file
+            state_dict = torch.load(consolidated_path.replace(f"rank_{rank}", "rank_0"), map_location=device)
+            torch.save(state_dict, consolidated_path)  # Save locally for this rank
         else:
-            logging.info("No Hugging Face model specified. Attempting to load model from local 'model/model_weights.pth'.")
+            state_dict = torch.load(consolidated_path, map_location=device)
 
-        # Attempt to load from local weights
-        try:
-            local_config_path = os.path.join(args.save_dir, 'config.json')
-            if not os.path.exists(local_config_path):
-                raise FileNotFoundError(f"Local config file '{local_config_path}' not found.")
-            with open(local_config_path, 'r') as f:
-                local_config = json.load(f)
-            logging.info(f"Loaded local model configuration from '{local_config_path}'.")
+        # Initialize model with config matching training
+        model_config = {
+            'n_embed': args.n_embed if hasattr(args, 'n_embed') else config.N_EMBED,
+            'n_head': config.N_HEAD,
+            'n_layer': config.N_LAYER,
+            'block_size': config.BLOCK_SIZE,
+            'dropout': config.DROPOUT,
+            'num_experts': config.NUM_EXPERTS,
+            'top_k': config.TOP_K,
+            'tokenizer_name': args.tokenizer_name
+        }
+        model = SparseMoELanguageModel(**model_config)
+        model.load_state_dict(state_dict, strict=False)
+        model = model.to(device)
+        logging.info(f"Rank {rank}: Loaded model from consolidated checkpoint {consolidated_path}")
+        initialized_from_scratch = False
 
-            expected_args = inspect.getfullargspec(SparseMoELanguageModel.__init__).args
-            if 'self' in expected_args:
-                expected_args.remove('self')
-            model_config = {k: config[k] for k in expected_args if k in config}
-            logging.info(f"Filtered model configuration: {model_config}")
-
-            model = SparseMoELanguageModel(**model_config)
-            model = model.to(device)
-            model_weights_path = os.path.join(args.save_dir, 'model_weights.pth')
-            model = load_model_weights(model, model_weights_path, device)
-            logging.info(f"Successfully loaded model from local '{model_weights_path}'.")
-            return model, initialized_from_scratch
-        except Exception as e:
-            logging.error(f"Failed to load model from local '{local_config_path}': {e}")
-            logging.error("Could not load model from Hugging Face or local path.")
-            raise RuntimeError("Could not load model from Hugging Face or local path.")
+    return model, initialized_from_scratch
 
 def prepare_optimizer(model, args):
     """
