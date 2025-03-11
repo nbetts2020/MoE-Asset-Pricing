@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
 import subprocess
+from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
 from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, save_ebm_model
 from utils.config import config
@@ -133,6 +134,13 @@ def train_model(
     # Ensure all ranks wait until saving is complete
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+    # Consolidate DeepSpeed checkpoint into a single .pth file on rank 0
+    if use_deepspeed and rank == 0:
+        consolidated_path = os.path.join(args.save_dir, "consolidated_final.pth")
+        state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
+        torch.save(state_dict, consolidated_path)
+        logging.info(f"Consolidated checkpoint saved to {consolidated_path}")
 
     # Rank 0 handles S3 upload and EBM saving
     if (not torch.distributed.is_initialized()) or (rank == 0):
