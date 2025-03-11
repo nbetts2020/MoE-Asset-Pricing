@@ -1,6 +1,6 @@
 import os
 import gc
-import time  # for sleep
+import time
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
@@ -37,15 +37,17 @@ def train_model(
       - Memory Replay Buffer (replay_buffer)
       - Optional EBM placeholders
       - DeepSpeed or standard PyTorch training
-
-    Final checkpoint saving, S3 upload, and EBM saving occur at the end.
+    Handles grad=None for sparse MoE models with DeepSpeed.
     """
-    adam_optimizer, muon_optimizer = optimizers
-    rank = 0
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
+    if use_deepspeed:
+        engine = model  # DeepSpeed engine passed from main.py
+        engine_optimizer = optimizers[0]  # Single optimizer from DeepSpeed
+    else:
+        adam_optimizer, muon_optimizer = optimizers
 
-    logging.info(f"Beginning training for {epochs} epoch(s).")
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    logging.info(f"Beginning training for {epochs} epoch(s) on rank {rank}.")
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
     logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
 
@@ -60,7 +62,7 @@ def train_model(
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            with torch.cuda.amp.autocast(enabled=True):
+            with torch.amp.autocast('cuda', enabled=True):  # Updated for PyTorch 2.x
                 outputs, _ = model(input_ids=input_ids)
                 loss = F.mse_loss(outputs.squeeze(-1), labels.float())
 
@@ -84,13 +86,16 @@ def train_model(
                 if args.use_si and si:
                     loss += si.penalty(model)
 
-            adam_optimizer.zero_grad()
-            muon_optimizer.zero_grad()
-
-            if use_deepspeed and hasattr(model, "backward"):
-                model.backward(loss)
-                model.step()
+            if use_deepspeed:
+                engine.zero_grad()
+                engine.backward(loss)
+                for name, param in engine.module.named_parameters():
+                    if param.requires_grad and param.grad is None:
+                        param.grad = torch.zeros_like(param, device=device)
+                engine.step()
             else:
+                adam_optimizer.zero_grad()
+                muon_optimizer.zero_grad()
                 loss.backward()
                 adam_optimizer.step()
                 muon_optimizer.step()
@@ -116,19 +121,24 @@ def train_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    # Save Checkpoint with explicit rank-specific handling
     tag = "final"
-    model.save_checkpoint(args.save_dir, tag=tag)  # All ranks save their shards
+    checkpoint_dir = os.path.join(args.save_dir, tag)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    try:
+        model.save_checkpoint(args.save_dir, tag=tag, client_state={})
+    except Exception as e:
+        raise RuntimeError(f"Rank {rank} failed to save checkpoint: {str(e)}")
+
+    # Ensure all ranks wait until saving is complete
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()  # Wait for all ranks to finish saving
-    if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
-        # In train_model, just before saving the checkpoint
-        logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
-        logging.info(f"Embedding dimension (n_embed): {model.token_embedding_table.weight.size(1)}")
-        logging.info(f"DeepSpeed ZeRO checkpoint saved to {args.save_dir}, tag={tag}")
+        torch.distributed.barrier()
+
+    # Rank 0 handles S3 upload and EBM saving
+    if (not torch.distributed.is_initialized()) or (rank == 0):
         if args.bucket:
             upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
         if args.use_ebm and ebm is not None:
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-            logging.info("EBM model saved.")
 
     logging.info("All epochs completed.")
