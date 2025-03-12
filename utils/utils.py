@@ -217,16 +217,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
 
         for idx in range(start_idx, end_idx):
             sample = df_chunk.iloc[idx]
-            raw_text = sample.get("formatted_text", "")
             sector = sample.get('Sector', "Unknown")
-
-            if rl_module is not None:
-                with torch.no_grad():
-                    downsampled, _, _ = rl_module(raw_text, model=model)
-                    compressed_embedding = downsampled.mean(dim=1)
-            else:
-                tokens = tokenizer(raw_text, truncation=True, max_length=4096, return_tensors="pt")
-                compressed_embedding = None
 
             try:
                 best_context = ebm_select_contexts(
@@ -238,14 +229,6 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                     ebm_samples=args.ebm_num_samples,
                     rl_module=rl_module
                 )
-            except Exception as e:
-                print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
-                continue
-
-            if compressed_embedding is not None:
-                with torch.no_grad():
-                    pred = model.reg_head(compressed_embedding).squeeze(0)
-            else:
                 encoding = tokenizer(
                     best_context,
                     truncation=True,
@@ -254,10 +237,14 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                     return_tensors="pt"
                 ).to(device)
                 input_ids = encoding["input_ids"]
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    pred, _ = model(input_ids=input_ids)
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast():
+                        pred, _ = model(input_ids=input_ids)
+                pred_value = pred.item()
+            except Exception as e:
+                print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
+                continue
 
-            pred_value = pred.item()
             actual = sample['weighted_avg_720_hrs']
             oldprice = sample['weighted_avg_0_hrs']
             rf = sample['Risk_Free_Rate']
@@ -376,16 +363,6 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
             logging.error(f"Error uploading RL Attention module to S3: {e}")
 
 def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=None):
-    """
-    For the sample at the given index, select the best candidate context from candidate columns
-    (iteration_1_text ... iteration_30_text). For each candidate:
-
-    - If rl_module is provided, run it on the candidate text to obtain a compressed embedding matrix,
-      then mean-pool the output.
-    - Otherwise, tokenize the candidate text and compute embeddings via model.get_embeddings.
-
-    Returns the candidate text whose mean-pooled embedding has energy closest to zero.
-    """
     import random
     import numpy as np
     from utils.config import config
@@ -407,22 +384,23 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
     candidate_energies = []
     device = next(model.parameters()).device
 
-    for candidate in sampled_candidates:
-        if rl_module is not None:
-            with torch.no_grad():
-                downsampled, _, _ = rl_module(candidate, model=model)
-            mean_emb = downsampled.mean(dim=1).half()
-        else:
-            encoding = tokenizer(
-                candidate,
-                truncation=True,
-                padding="max_length",
-                max_length=config.BLOCK_SIZE,
-                return_tensors="pt"
-            ).to(device)
-            mean_emb = model.get_embeddings(encoding["input_ids"]).half()
-        energy = ebm(mean_emb).item()
-        candidate_energies.append(energy)
+    with torch.no_grad():
+        with torch.amp.autocast('cuda'):  # Updated autocast syntax
+            for candidate in sampled_candidates:
+                if rl_module is not None:
+                    downsampled = rl_module(candidate, model=model)
+                    mean_emb = downsampled.mean(dim=1)  # (1, embed_dim)
+                else:
+                    encoding = tokenizer(
+                        candidate,
+                        truncation=True,
+                        padding="max_length",
+                        max_length=config.BLOCK_SIZE,
+                        return_tensors="pt"
+                    ).to(device)
+                    mean_emb = model.get_embeddings(encoding["input_ids"], pool=True)  # Pool here for EBM
+                energy = ebm(mean_emb).item()
+                candidate_energies.append(energy)
 
     best_idx = np.argmin([abs(e) for e in candidate_energies])
     return sampled_candidates[best_idx]
