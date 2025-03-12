@@ -385,10 +385,10 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
     device = next(model.parameters()).device
 
     with torch.no_grad():
-        with torch.amp.autocast('cuda'):  # Updated autocast syntax
+        with torch.amp.autocast('cuda'):
             for candidate in sampled_candidates:
                 if rl_module is not None:
-                    downsampled = rl_module(candidate, model=model)
+                    downsampled, _, _ = rl_module(candidate, model=model)  # Unpack tuple, take downsampled
                     mean_emb = downsampled.mean(dim=1)  # (1, embed_dim)
                 else:
                     encoding = tokenizer(
@@ -398,7 +398,7 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
                         max_length=config.BLOCK_SIZE,
                         return_tensors="pt"
                     ).to(device)
-                    mean_emb = model.get_embeddings(encoding["input_ids"], pool=True)  # Pool here for EBM
+                    mean_emb = model.get_embeddings(encoding["input_ids"], pool=True)
                 energy = ebm(mean_emb).item()
                 candidate_energies.append(energy)
 
