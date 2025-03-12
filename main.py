@@ -353,18 +353,22 @@ def main():
                 truncate_limit=None
             ).to(device)
             rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
-            rl_module.load_state_dict(torch.load(rl_checkpoint_path, map_location=device))
+            if os.path.exists(rl_checkpoint_path):
+                checkpoint = torch.load(rl_checkpoint_path, map_location=device)
+                rl_module.load_state_dict(checkpoint, strict=False)  # Handle potential extra keys like "embedding.weight"
+                logging.info("Hierarchical Attention RL module loaded from checkpoint with ignored keys.")
+            else:
+                logging.warning(f"RL checkpoint not found at {rl_checkpoint_path}; proceeding with untrained RL module.")
             rl_module.eval()
-            logging.info("Hierarchical Attention RL module loaded from checkpoint.")
         else:
             logging.info("RL module not used; falling back to simple truncation.")
 
         if not args.test:
+            # Non-test mode: predict for a single input text
             if args.use_rl_module:
                 with torch.no_grad():
-                    downsampled, _, _ = rl_module(args.text, model=model)
+                    downsampled = rl_module(args.text, model=model)  # Pass model to get embeddings
                     compressed_embedding = downsampled.mean(dim=1)
-                with torch.no_grad():
                     pred = model.reg_head(compressed_embedding).squeeze(0)
                 print(f"Predicted Price: {pred.item()}")
             else:
@@ -378,6 +382,7 @@ def main():
                     pred, _ = model(input_ids=tokens["input_ids"])
                 print(f"Predicted Price: {pred.item()}")
         else:
+            # Test mode: process all 18 run_dataset files
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
 
@@ -390,14 +395,14 @@ def main():
             logging.info("EBM model loaded from S3.")
 
             if args.percent_data < 100:
-                global_max = int(0.2 * 453932 * (args.percent_data / 100))
+                global_max = int(0.2 * 453932 * (args.percent_data / 100))  # Adjust based on total rows if needed
             else:
                 global_max = int(1e12)
             cumulative_offset = 0
             all_metrics = OnlineMetrics()
             all_sector_metrics = {}
 
-            for i in range(1, 19):
+            for i in range(1, 19):  # 18 files: run_dataset_1.parquet to run_dataset_18.parquet
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
