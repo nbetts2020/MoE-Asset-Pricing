@@ -321,36 +321,27 @@ def main():
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
         
-        # Define the consolidated checkpoint path
         consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-    
-        # Download from S3 on rank 0 if bucket is specified
+        
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
             if not os.path.exists(consolidated_model_path):
                 logging.error(f"Consolidated checkpoint not found at {consolidated_model_path} after S3 download")
                 raise FileNotFoundError(f"Expected consolidated checkpoint at {consolidated_model_path}")
-    
-        # Synchronize across ranks
+        
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-    
-        # Check if the consolidated checkpoint exists
+        
         if not os.path.exists(consolidated_model_path):
             logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
             raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
-    
-        # Initialize model from scratch and load the consolidated state dict
+        
         model, _ = initialize_model(args, device, init_from_scratch=False)
-        state_dict = torch.load(consolidated_model_path, map_location=device)
-        model.load_state_dict(state_dict, strict=False)
-        model.to(device)
         model.eval()
         logging.info(f"Rank {current_rank}: Main transformer model loaded from consolidated checkpoint {consolidated_model_path}")
-    
+        
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-    
-        # Toggle RL module based on the --use_rl_module flag.
+        
         rl_module = None
         if args.use_rl_module:
             rl_module = HierarchicalAttentionRL(
@@ -366,20 +357,16 @@ def main():
             logging.info("Hierarchical Attention RL module loaded from checkpoint.")
         else:
             logging.info("RL module not used; falling back to simple truncation.")
-    
+        
         if not args.test:
-            # Non-test run: Use RL module directly on the provided input text if enabled.
             if args.use_rl_module:
                 with torch.no_grad():
-                    # RL module processes the input text and returns a full embedding set.
                     downsampled, _, _ = rl_module(args.text, model=model)
-                    # Mean-pool the embedding matrix to obtain a single vector.
                     compressed_embedding = downsampled.mean(dim=1)
                 with torch.no_grad():
                     pred = model.reg_head(compressed_embedding).squeeze(0)
                 print(f"Predicted Price: {pred.item()}")
             else:
-                # Fallback: simple truncation.
                 tokens = tokenizer(
                     args.text,
                     truncation=True,
@@ -390,10 +377,9 @@ def main():
                     pred, _ = model(input_ids=tokens["input_ids"])
                 print(f"Predicted Price: {pred.item()}")
         else:
-            # Test mode: evaluate on run dataset using EBM (and RL module for compression if enabled).
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
-    
+        
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
@@ -401,33 +387,28 @@ def main():
             ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-    
+        
             if args.percent_data < 100:
                 global_max = int(0.2 * 453932 * (args.percent_data / 100))
             else:
                 global_max = int(1e12)
             cumulative_offset = 0
-    
-            local_predictions = []
-            local_actuals = []
-            local_oldprices = []
-            local_riskfree = []
-            local_sectors = []
+            all_metrics = OnlineMetrics()
     
             for i in range(1, 19):
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
-    
+        
                 run_filename = f"run_dataset_{i}.parquet"
-                logging.info(f"(Rank {current_rank}) Processing {run_filename} (cumulative offset: {cumulative_offset})...")
-    
-                preds, acts, olds, rf, sects, processed_in_file = process_run_dataset(
+                logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
+        
+                metrics, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
                     ebm=ebm,
-                    rl_module=rl_module,  # Pass RL module (or None if not used)
+                    rl_module=rl_module,
                     args=args,
                     device=device,
                     batch_size=5,
@@ -436,76 +417,90 @@ def main():
                     cache_dir="/tmp/hf_cache_datasets_run"
                 )
                 cumulative_offset += processed_in_file
-                local_predictions.extend(preds)
-                local_actuals.extend(acts)
-                local_oldprices.extend(olds)
-                local_riskfree.extend(rf)
-                local_sectors.extend(sects)
-                logging.info(f"(Rank {current_rank}) After {run_filename}, cumulative offset is now {cumulative_offset}.")
+                
+                # Merge metrics incrementally
+                all_metrics.count += metrics.count
+                all_metrics.sum_sq_error += metrics.sum_sq_error
+                all_metrics.sum_y += metrics.sum_y
+                all_metrics.sum_y_sq += metrics.sum_y_sq
+                all_metrics.trend_correct += metrics.trend_correct
+                all_metrics.excess_returns_sum += metrics.excess_returns_sum
+                all_metrics.excess_returns_sq_sum += metrics.excess_returns_sq_sum
+                all_metrics.downside_returns_sq_sum += metrics.downside_returns_sq_sum
+                all_metrics.downside_count += metrics.downside_count
+                all_metrics.strategy_returns_sum += metrics.strategy_returns_sum
+                all_metrics.wins += metrics.wins
+                all_metrics.gross_profits += metrics.gross_profits
+                all_metrics.gross_losses += metrics.gross_losses
+                for sector, sector_metrics in metrics.sector_stats.items():
+                    if sector not in all_metrics.sector_stats:
+                        all_metrics.sector_stats[sector] = OnlineMetrics()
+                    all_metrics.sector_stats[sector].count += sector_metrics.count
+                    all_metrics.sector_stats[sector].sum_sq_error += sector_metrics.sum_sq_error
+                    all_metrics.sector_stats[sector].sum_y += sector_metrics.sum_y
+                    all_metrics.sector_stats[sector].sum_y_sq += sector_metrics.sum_y_sq
+                    all_metrics.sector_stats[sector].trend_correct += sector_metrics.trend_correct
+                    all_metrics.sector_stats[sector].excess_returns_sum += sector_metrics.excess_returns_sum
+                    all_metrics.sector_stats[sector].excess_returns_sq_sum += sector_metrics.excess_returns_sq_sum
+                    all_metrics.sector_stats[sector].downside_returns_sq_sum += sector_metrics.downside_returns_sq_sum
+                    all_metrics.sector_stats[sector].downside_count += sector_metrics.downside_count
+                    all_metrics.sector_stats[sector].strategy_returns_sum += sector_metrics.strategy_returns_sum
+                    all_metrics.sector_stats[sector].wins += sector_metrics.wins
+                    all_metrics.sector_stats[sector].gross_profits += sector_metrics.gross_profits
+                    all_metrics.sector_stats[sector].gross_losses += sector_metrics.gross_losses
+                
+                logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
+        
+            # Compute final metrics
+            results, sector_metrics = all_metrics.compute()
+            mse = results["mse"]
+            r2 = results["r2"]
+            trend_acc = results["trend_acc"]
+            sharpe = results["sharpe"]
+            sortino = results["sortino"]
+            avg_return = results["avg_return"]
+            win_rate = results["win_rate"]
+            profit_factor = results["profit_factor"]
     
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                global_predictions = gather_lists_across_ranks(local_predictions)
-                global_actuals = gather_lists_across_ranks(local_actuals)
-                global_oldprices = gather_lists_across_ranks(local_oldprices)
-                global_riskfree = gather_lists_across_ranks(local_riskfree)
-                global_sectors = gather_lists_across_ranks(local_sectors)
-            else:
-                global_predictions = local_predictions
-                global_actuals = local_actuals
-                global_oldprices = local_oldprices
-                global_riskfree = local_riskfree
-                global_sectors = local_sectors
-    
-            if (not torch.distributed.is_available() or not torch.distributed.is_initialized() or
-                torch.distributed.get_rank() == 0):
-                mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, \
-                average_return, win_rate, profit_factor = evaluate_model(
-                    predictions=global_predictions,
-                    actuals=global_actuals,
-                    oldprices=global_oldprices,
-                    riskfree=global_riskfree,
-                    sectors=global_sectors
+            print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+            print(f"Overall Trend Accuracy: {trend_acc:.4f}")
+            print(f"Sharpe Ratio: {sharpe:.4f}")
+            print(f"Sortino Ratio: {sortino:.4f}")
+            print(f"Average Return: {avg_return:.4f}")
+            print(f"Win Rate: {win_rate:.2f}%")
+            print(f"Profit Factor: {profit_factor:.4f}")
+        
+            logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
+            logging.info(f"Overall Trend Accuracy: {trend_acc:.4f}")
+            logging.info(f"Sharpe Ratio: {sharpe:.4f}")
+            logging.info(f"Sortino Ratio: {sortino:.4f}")
+            logging.info(f"Average Return: {avg_return:.4f}")
+            logging.info(f"Win Rate: {win_rate:.2f}%")
+            logging.info(f"Profit Factor: {profit_factor:.4f}")
+            
+            for sector, metrics in sector_metrics.items():
+                print(
+                    f"Sector: {sector} - "
+                    f"MSE: {metrics['mse']:.4f}, "
+                    f"R²: {metrics['r2']:.4f}, "
+                    f"Trend Accuracy: {metrics['trend_acc']:.4f}, "
+                    f"Sharpe Ratio: {metrics['sharpe']:.4f}, "
+                    f"Sortino Ratio: {metrics['sortino']:.4f}, "
+                    f"Average Return: {metrics['avg_return']:.4f}, "
+                    f"Win Rate: {metrics['win_rate']:.2f}%, "
+                    f"Profit Factor: {metrics['profit_factor']:.4f}"
                 )
-    
-                print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-                print(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
-                print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-                print(f"Sortino Ratio: {sortino_ratio:.4f}")
-                print(f"Average Return: {average_return:.4f}")
-                print(f"Win Rate: {win_rate:.2f}%")
-                print(f"Profit Factor: {profit_factor:.4f}")
-    
-                logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-                logging.info(f"Overall Trend Accuracy: {overall_trend_acc:.4f}")
-                logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-                logging.info(f"Sortino Ratio: {sortino_ratio:.4f}")
-                logging.info(f"Average Return: {average_return:.4f}")
-                logging.info(f"Win Rate: {win_rate:.2f}%")
-                logging.info(f"Profit Factor: {profit_factor:.4f}")
-                for sector, metrics in sector_metrics.items():
-                    print(
-                        f"Sector: {sector} - "
-                        f"MSE: {metrics.get('mse', 0.0):.4f}, "
-                        f"R²: {metrics.get('r2', 0.0):.4f}, "
-                        f"Trend Accuracy: {metrics.get('trend_acc', 0.0):.4f}, "
-                        f"Sharpe Ratio: {metrics.get('sharpe', 0.0):.4f}, "
-                        f"Sortino Ratio: {metrics.get('sortino', 0.0):.4f}, "
-                        f"Average Return: {metrics.get('average_return', 0.0):.4f}, "
-                        f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
-                        f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
-                    )
-                    logging.info(
-                        f"Sector: {sector} - "
-                        f"MSE: {metrics.get('mse', 0.0):.4f}, "
-                        f"R²: {metrics.get('r2', 0.0):.4f}, "
-                        f"Trend Accuracy: {metrics.get('trend_acc', 0.0):.4f}, "
-                        f"Sharpe Ratio: {metrics.get('sharpe', 0.0):.4f}, "
-                        f"Sortino Ratio: {metrics.get('sortino', 0.0):.4f}, "
-                        f"Average Return: {metrics.get('average_return', 0.0):.4f}, "
-                        f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%, "
-                        f"Profit Factor: {metrics.get('profit_factor', 0.0):.4f}"
-                    )
-
+                logging.info(
+                    f"Sector: {sector} - "
+                    f"MSE: {metrics['mse']:.4f}, "
+                    f"R²: {metrics['r2']:.4f}, "
+                    f"Trend Accuracy: {metrics['trend_acc']:.4f}, "
+                    f"Sharpe Ratio: {metrics['sharpe']:.4f}, "
+                    f"Sortino Ratio: {metrics['sortino']:.4f}, "
+                    f"Average Return: {metrics['avg_return']:.4f}, "
+                    f"Win Rate: {metrics['win_rate']:.2f}%, "
+                    f"Profit Factor: {metrics['profit_factor']:.4f}"
+                )
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
