@@ -9,7 +9,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from huggingface_hub import hf_hub_download
 from transformers import LlamaTokenizerFast
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 
 from utils.config import config
 from utils.utils import save_rl_attention
@@ -44,14 +44,16 @@ def get_data_rl(chunk_idx: int) -> pd.DataFrame:
     filename = f"train_dataset_{chunk_idx}a.parquet"
     file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
     df = pd.read_parquet(file_path)
-    df = df.dropna(subset=["weighted_avg_720_hrs"])
+    df = df.dropna(subset=["weighted_avg_720_hrs", "text"])
     df = df[df["weighted_avg_720_hrs"] > 0]
+    df = df[df["text"].str.strip().astype(bool)]  # Filter empty/whitespace text
+    logging.info(f"Chunk {chunk_idx}: Loaded {len(df)} rows after filtering")
     os.remove(file_path)
     gc.collect()
     return df
 
 class RLTextDataset(Dataset):
-    def __init__(self, df, text_field="formatted_text"):
+    def __init__(self, df, text_field="text"):
         self.df = df
         self.text_field = text_field
 
@@ -68,21 +70,12 @@ def rl_collate_fn(batch):
     return batch
 
 def split_into_sections(formatted_text: str):
-    lines = formatted_text.split("\n")
-    sections = []
-    current_section = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.endswith("Information:") or stripped.startswith("Last"):
-            if current_section:
-                sections.append("\n".join(current_section).strip())
-                current_section = []
-            continue
-        if stripped:
-            current_section.append(stripped)
-    if current_section:
-        sections.append("\n".join(current_section).strip())
-    return sections
+    """Split text into sections based on double newlines, matching format_concatenated_articles."""
+    sections = formatted_text.split("\n\n")
+    # Filter out empty or header-only sections, keep only sections with content
+    valid_sections = [section.strip() for section in sections if section.strip() and not (
+        section.strip().endswith("Information:") or section.strip().startswith("Last"))]
+    return valid_sections if valid_sections else [formatted_text.strip()]  # Fallback to whole text
 
 class LearnedDownSampler(nn.Module):
     def __init__(self, num_queries: int, embed_dim: int, n_heads: int = 4, dropout: float = 0.1):
@@ -113,44 +106,41 @@ class HierarchicalAttentionRL(nn.Module):
         self.max_length = max_length
         self.truncate_limit = truncate_limit
         self.downsampler = LearnedDownSampler(num_queries=num_queries, embed_dim=embed_dim)
+        self.reg_head = nn.Linear(embed_dim, 1)  # Regression head for price prediction
 
     def forward(self, formatted_text: str, model: nn.Module):
         device = next(self.parameters()).device
         sections = split_into_sections(formatted_text)
-        if len(sections) == 0:
-            return torch.zeros(1, self.downsampler.num_queries, self.embed_dim, device=device, dtype=torch.float16)
+        if not sections:  # Shouldn’t happen with fallback, but keep as safety
+            zero_embed = torch.zeros(1, self.downsampler.num_queries, self.embed_dim,
+                                   device=device, dtype=torch.float16)
+            zero_pred = torch.zeros(1, device=device, dtype=torch.float16)
+            zero_log_prob = torch.tensor(0.0, device=device)
+            return zero_embed, zero_pred, zero_log_prob
 
         section_embeds = []
         with torch.no_grad():
-            with torch.amp.autocast('cuda'):  # Updated autocast syntax
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 for sec in sections:
                     tokens = self.tokenizer(sec, truncation=True, padding="max_length",
-                                            max_length=self.max_length, return_tensors="pt")
+                                          max_length=self.max_length, return_tensors="pt")
                     input_ids = tokens["input_ids"].to(device)
-                    # Use get_embeddings with pool=False to keep sequence dimension
                     embeds = model.get_embeddings(input_ids=input_ids, pool=False)
                     section_embeds.append(embeds)
 
-        full_sequence = torch.cat(section_embeds, dim=1)  # (B, total_T, embed_dim)
+        full_sequence = torch.cat(section_embeds, dim=1)  # (1, total_T, embed_dim)
         if self.truncate_limit is not None and full_sequence.size(1) > self.truncate_limit:
             full_sequence = full_sequence[:, -self.truncate_limit:, :]
-        downsampled, _ = self.downsampler(full_sequence)
-        return downsampled
+
+        downsampled, log_prob = self.downsampler(full_sequence)
+        compressed_embedding = downsampled.mean(dim=1)
+        pred = self.reg_head(compressed_embedding).squeeze(-1)
+        return downsampled, pred, log_prob
 
 def rl_train_hAttention(args, model: nn.Module):
-    """
-    RL training loop: iterates over chunk indices one by one,
-    loads each chunk from disk, creates a DataLoader, trains on that chunk,
-    cleans up memory after every batch, and repeats for each rl_epoch.
-    Uses mixed precision for memory savings.
-    """
-    import torch.nn.functional as F
-    from torch.utils.data import DataLoader
-    from torch.cuda.amp import autocast, GradScaler
-    from utils.utils import save_rl_attention  # Ensure this is defined elsewhere
+    """RL training loop with checks to ensure training progresses."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize the RL module and optimizer
     hAttention = HierarchicalAttentionRL(
         tokenizer_name=args.tokenizer_name,
         embed_dim=config.N_EMBED,
@@ -159,8 +149,11 @@ def rl_train_hAttention(args, model: nn.Module):
         truncate_limit=None
     ).to(device)
     optimizer = torch.optim.Adam(hAttention.parameters(), lr=args.rl_learning_rate)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')  # Updated to new syntax
     hAttention.train()
+
+    total_samples = 0
+    skipped_samples = 0
 
     for epoch in range(1, args.rl_epochs + 1):
         logging.info(f"RL Epoch {epoch} starting.")
@@ -168,7 +161,7 @@ def rl_train_hAttention(args, model: nn.Module):
         epoch_reward = 0.0
         num_batches = 0
 
-        for chunk_idx in range(1, 14):  # Process chunks 1 to 13
+        for chunk_idx in range(1, 14):
             print_gpu_memory_usage(tag=f"Before loading chunk {chunk_idx}")
             if chunk_idx not in CHUNK_SIZES:
                 continue
@@ -202,41 +195,48 @@ def rl_train_hAttention(args, model: nn.Module):
             print_gpu_memory_usage(tag=f"After DataLoader chunk {chunk_idx}")
 
             for batch_idx, batch in enumerate(rl_loader):
-                preds = []
-                targets = []
-                batch_log_probs = []
-                with autocast(dtype=torch.float16):
-                    for sample in batch:
-                        text = sample["text"]
-                        target = torch.tensor(sample["target"], dtype=torch.float32, device=device)
-                        _, pred, log_prob = hAttention(text)
-                        preds.append(pred)
-                        targets.append(target)
-                        batch_log_probs.append(log_prob)
-                    preds_tensor = torch.stack(preds).squeeze(-1)
-                    targets_tensor = torch.stack(targets)
-                    mse_loss = F.mse_loss(preds_tensor, targets_tensor)
-                    reward = -mse_loss.detach()  # lower MSE => higher reward
-                    avg_log_prob = torch.stack(batch_log_probs).mean()
-                    rl_loss = -avg_log_prob * reward
-                    loss = mse_loss + rl_loss
+                total_samples += len(batch)
+                sample = batch[0]  # batch_size=1
+                text = sample["text"]
+                target = torch.tensor([sample["target"]], dtype=torch.float32, device=device)  # Shape (1,)
 
-                scaler.scale(loss).backward()
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    downsampled, pred, log_prob = hAttention(text, model=model)
+                    if not pred.requires_grad:
+                        skipped_samples += 1
+                        logging.warning(f"Skipping batch {batch_idx + 1}/{len(rl_loader)} in chunk {chunk_idx}: "
+                                      f"no gradients. Text length: {len(text)}, Sections: {len(split_into_sections(text))}")
+                        continue
+
+                    mse_loss = F.mse_loss(pred, target)  # pred: (1,), target: (1,)
+                    reward = -mse_loss
+                    rl_loss = -log_prob * reward.detach()
+                    total_loss = mse_loss + rl_loss
+
+                scaler.scale(total_loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer.zero_grad()
 
-                epoch_loss += loss.item()
+                epoch_loss += total_loss.item()
                 epoch_reward += reward.item()
                 num_batches += 1
 
                 print(f"Processed batch {batch_idx + 1}/{len(rl_loader)} "
-                      f"(Loss: {loss.item():.4f}, Reward: {reward.item():.4f})")
-                # Clean up after each batch
-                del preds, targets, batch_log_probs, preds_tensor, targets_tensor, loss
+                      f"(Loss: {total_loss.item():.4f}, Reward: {reward.item():.4f})")
+
+                del downsampled, pred, log_prob, mse_loss, rl_loss, total_loss
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # Clean up after processing the chunk
+            if total_samples > 0:
+                skip_rate = skipped_samples / total_samples
+                logging.info(f"Chunk {chunk_idx}: Processed {num_batches} batches, "
+                           f"Skipped {skipped_samples}/{total_samples} ({skip_rate:.2%})")
+                if skip_rate > 0.9:
+                    logging.error(f"High skip rate ({skip_rate:.2%}) in chunk {chunk_idx}. "
+                                "Verify 'formatted_text' formatting.")
+
             del df_chunk, chunk_df, rl_dataset, rl_loader
             gc.collect()
             torch.cuda.empty_cache()
@@ -244,7 +244,11 @@ def rl_train_hAttention(args, model: nn.Module):
 
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
         avg_reward = epoch_reward / num_batches if num_batches > 0 else 0.0
-        logging.info(f"RL Epoch {epoch}: Avg Loss = {avg_loss:.4f}, Avg Reward = {avg_reward:.4f}")
+        logging.info(f"RL Epoch {epoch}: Avg Loss = {avg_loss:.4f}, Avg Reward = {avg_reward:.4f}, "
+                   f"Total Skipped = {skipped_samples}/{total_samples} ({skipped_samples/total_samples:.2%})")
 
-    save_rl_attention(hAttention, epoch=config.EPOCHS, save_dir=args.save_dir, args=args)
+        if num_batches == 0:
+            raise RuntimeError(f"Epoch {epoch} processed no batches. All samples skipped.")
+
+    save_rl_attention(hAttention, epoch=args.rl_epochs, save_dir=args.save_dir, args=args)
     logging.info("RL training complete. RL module saved.")
