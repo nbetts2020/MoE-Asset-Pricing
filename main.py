@@ -394,6 +394,7 @@ def main():
                 global_max = int(1e12)
             cumulative_offset = 0
             all_metrics = OnlineMetrics()
+            all_sector_metrics = {}
     
             for i in range(1, 19):
                 if cumulative_offset >= global_max:
@@ -403,7 +404,7 @@ def main():
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
         
-                metrics, processed_in_file = process_run_dataset(
+                metrics, sector_metrics, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
@@ -418,7 +419,7 @@ def main():
                 )
                 cumulative_offset += processed_in_file
                 
-                # Merge metrics incrementally
+                # Merge overall metrics
                 all_metrics.count += metrics.count
                 all_metrics.sum_sq_error += metrics.sum_sq_error
                 all_metrics.sum_y += metrics.sum_y
@@ -432,27 +433,29 @@ def main():
                 all_metrics.wins += metrics.wins
                 all_metrics.gross_profits += metrics.gross_profits
                 all_metrics.gross_losses += metrics.gross_losses
-                for sector, sector_metrics in metrics.sector_stats.items():
-                    if sector not in all_metrics.sector_stats:
-                        all_metrics.sector_stats[sector] = OnlineMetrics()
-                    all_metrics.sector_stats[sector].count += sector_metrics.count
-                    all_metrics.sector_stats[sector].sum_sq_error += sector_metrics.sum_sq_error
-                    all_metrics.sector_stats[sector].sum_y += sector_metrics.sum_y
-                    all_metrics.sector_stats[sector].sum_y_sq += sector_metrics.sum_y_sq
-                    all_metrics.sector_stats[sector].trend_correct += sector_metrics.trend_correct
-                    all_metrics.sector_stats[sector].excess_returns_sum += sector_metrics.excess_returns_sum
-                    all_metrics.sector_stats[sector].excess_returns_sq_sum += sector_metrics.excess_returns_sq_sum
-                    all_metrics.sector_stats[sector].downside_returns_sq_sum += sector_metrics.downside_returns_sq_sum
-                    all_metrics.sector_stats[sector].downside_count += sector_metrics.downside_count
-                    all_metrics.sector_stats[sector].strategy_returns_sum += sector_metrics.strategy_returns_sum
-                    all_metrics.sector_stats[sector].wins += sector_metrics.wins
-                    all_metrics.sector_stats[sector].gross_profits += sector_metrics.gross_profits
-                    all_metrics.sector_stats[sector].gross_losses += sector_metrics.gross_losses
+                
+                # Merge sector metrics
+                for sector, sm in sector_metrics.items():
+                    if sector not in all_sector_metrics:
+                        all_sector_metrics[sector] = OnlineMetrics()
+                    all_sector_metrics[sector].count += sm.count
+                    all_sector_metrics[sector].sum_sq_error += sm.sum_sq_error
+                    all_sector_metrics[sector].sum_y += sm.sum_y
+                    all_sector_metrics[sector].sum_y_sq += sm.sum_y_sq
+                    all_sector_metrics[sector].trend_correct += sm.trend_correct
+                    all_sector_metrics[sector].excess_returns_sum += sm.excess_returns_sum
+                    all_sector_metrics[sector].excess_returns_sq_sum += sm.excess_returns_sq_sum
+                    all_sector_metrics[sector].downside_returns_sq_sum += sm.downside_returns_sq_sum
+                    all_sector_metrics[sector].downside_count += sm.downside_count
+                    all_sector_metrics[sector].strategy_returns_sum += sm.strategy_returns_sum
+                    all_sector_metrics[sector].wins += sm.wins
+                    all_sector_metrics[sector].gross_profits += sm.gross_profits
+                    all_sector_metrics[sector].gross_losses += sm.gross_losses
                 
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
         
             # Compute final metrics
-            results, sector_metrics = all_metrics.compute()
+            results = all_metrics.compute()
             mse = results["mse"]
             r2 = results["r2"]
             trend_acc = results["trend_acc"]
@@ -461,6 +464,8 @@ def main():
             avg_return = results["avg_return"]
             win_rate = results["win_rate"]
             profit_factor = results["profit_factor"]
+    
+            sector_results = {sector: sm.compute() for sector, sm in all_sector_metrics.items()}
     
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {trend_acc:.4f}")
@@ -478,7 +483,7 @@ def main():
             logging.info(f"Win Rate: {win_rate:.2f}%")
             logging.info(f"Profit Factor: {profit_factor:.4f}")
             
-            for sector, metrics in sector_metrics.items():
+            for sector, metrics in sector_results.items():
                 print(
                     f"Sector: {sector} - "
                     f"MSE: {metrics['mse']:.4f}, "
@@ -501,6 +506,7 @@ def main():
                     f"Win Rate: {metrics['win_rate']:.2f}%, "
                     f"Profit Factor: {metrics['profit_factor']:.4f}"
                 )
+    
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
