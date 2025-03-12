@@ -131,22 +131,31 @@ def train_model(
     except Exception as e:
         raise RuntimeError(f"Rank {rank} failed to save checkpoint: {str(e)}")
 
-    # Ensure all ranks wait until saving is complete
+    # After checkpoint saving
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-
+    
     # Consolidate DeepSpeed checkpoint into a single .pth file on rank 0
     if use_deepspeed and rank == 0:
         consolidated_path = os.path.join(args.save_dir, "consolidated_final.pth")
-        state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
+        checkpoint_dir = os.path.join(args.save_dir, "final")
+        # Verify all expected files are present
+        optim_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('_optim_states.pt')]
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        if len(optim_files) != world_size:
+            logging.error(f"Expected {world_size} '*_optim_states.pt' files in {checkpoint_dir}, but found {len(optim_files)}: {optim_files}")
+            raise RuntimeError(f"Checkpoint consolidation failed: incomplete shard set")
+        # Consolidate using the root directory with the tag
+        state_dict = get_fp32_state_dict_from_zero_checkpoint(args.save_dir, tag="final")
         torch.save(state_dict, consolidated_path)
-        logging.info(f"Consolidated checkpoint saved to {consolidated_path}")
-
+        if os.path.exists(consolidated_path):
+            logging.info(f"Consolidated checkpoint saved to {consolidated_path}")
+        else:
+            logging.error("Failed to save consolidated checkpoint")
+    
     # Rank 0 handles S3 upload and EBM saving
     if (not torch.distributed.is_initialized()) or (rank == 0):
         if args.bucket:
             upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
         if args.use_ebm and ebm is not None:
             save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
-
-    logging.info("All epochs completed.")
