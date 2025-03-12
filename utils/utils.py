@@ -190,22 +190,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                         cache_dir="/tmp/hf_cache_datasets_run"):
     """
     Streams a run dataset file in small batches and processes rows until global_max is reached.
-    
-    Args:
-        run_dataset_filename (str): Name of the run dataset file.
-        tokenizer: The transformer tokenizer.
-        model (torch.nn.Module): The main transformer model.
-        ebm (torch.nn.Module): The Energy-Based Model.
-        rl_module (torch.nn.Module or None): If provided, used to compress raw text.
-        args: Command-line arguments.
-        device: The device (CUDA/CPU).
-        batch_size (int): Number of rows per batch.
-        current_offset (int): Number of rows already processed.
-        global_max (int): Total rows to process.
-        cache_dir (str): Temporary directory for downloads.
-    
-    Returns:
-        predictions, actuals, oldprices, riskfree, sectors, processed_in_file
+    Uses online metrics computation to avoid storing large lists.
     """
     os.makedirs(cache_dir, exist_ok=True)
     
@@ -217,11 +202,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
     )
     parquet_file = pq.ParquetFile(file_path)
     
-    predictions = []
-    actuals = []
-    oldprices = []
-    riskfree = []
-    sectors = []
+    metrics = OnlineMetrics()
     processed_in_file = 0
 
     for batch in parquet_file.iter_batches(batch_size=batch_size):
@@ -234,9 +215,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
             break
         
         start_idx = 0
-        end_idx = num_rows
-        if current_offset + processed_in_file + num_rows > global_max:
-            end_idx = global_max - (current_offset + processed_in_file)
+        end_idx = min(num_rows, global_max - (current_offset + processed_in_file))
         
         for idx in range(start_idx, end_idx):
             sample = df_chunk.iloc[idx]
@@ -244,15 +223,11 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
             
             if rl_module is not None:
                 with torch.no_grad():
-                    # RL module returns a full embedding set: (1, seq_len, embed_dim)
                     downsampled, _, _ = rl_module(raw_text, model=model)
-                # Mean-pool the embedding matrix to obtain a single vector.
-                compressed_embedding = downsampled.mean(dim=1)
+                    compressed_embedding = downsampled.mean(dim=1)
             else:
                 tokens = tokenizer(raw_text, truncation=True, max_length=4096, return_tensors="pt")
-                truncated_ids = tokens["input_ids"][0].tolist()
                 compressed_embedding = None
-                compressed_text = tokenizer.decode(truncated_ids)
             
             try:
                 best_context = ebm_select_contexts(
@@ -262,7 +237,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                     ebm=ebm,
                     tokenizer=tokenizer,
                     ebm_samples=args.ebm_num_samples,
-                    rl_module=rl_module  # Pass RL module so candidate texts can be processed via RL if desired.
+                    rl_module=rl_module
                 )
             except Exception as e:
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
@@ -283,12 +258,14 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                     pred, _ = model(input_ids=input_ids)
             
-            predictions.append(pred.item())
-            actuals.append(sample['weighted_avg_720_hrs'])
-            oldprices.append(sample['weighted_avg_0_hrs'])
-            riskfree.append(sample['Risk_Free_Rate'])
-            sectors.append(sample.get('Sector', "Unknown"))
-            print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred.item()}")
+            pred_value = pred.item()
+            actual = sample['weighted_avg_720_hrs']
+            oldprice = sample['weighted_avg_0_hrs']
+            rf = sample['Risk_Free_Rate']
+            sector = sample.get('Sector', "Unknown")
+            
+            metrics.update(pred_value, actual, oldprice, rf, sector)
+            print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred_value}")
         
         processed_in_file += num_rows
         del df_chunk
@@ -303,7 +280,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir, ignore_errors=True)
     
-    return predictions, actuals, oldprices, riskfree, sectors, processed_in_file
+    return metrics, processed_in_file
 
 def load_model_weights(model, weights_path, device):
     if os.path.exists(weights_path):
