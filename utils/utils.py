@@ -36,6 +36,7 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.sampling import sample_articles
+from utils.metrics import OnlineMetrics
 
 import logging
 import subprocess
@@ -138,9 +139,9 @@ def get_data(epoch, window_index, global_offset, global_max, args=None, cache_di
 
 def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int = 13, shuffle: bool = True):
     """
-    Generator that loads RL data chunk-by-chunk from Parquet files 
+    Generator that loads RL data chunk-by-chunk from Parquet files
     (train_dataset_{chunk_index}a.parquet). It yields a DataFrame for each chunk.
-    
+
     If rl_rows = -1, yields all rows from each chunk.
     Otherwise, it samples proportionally from each chunk so that the total
     approximates ~rl_rows rows.
@@ -185,42 +186,40 @@ def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int =
         if rl_rows != -1 and accumulated >= rl_rows:
             break
 
-def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device, 
-                        batch_size=500, current_offset=0, global_max=int(1e12), 
+def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device,
+                        batch_size=500, current_offset=0, global_max=int(1e12),
                         cache_dir="/tmp/hf_cache_datasets_run"):
-    """
-    Streams a run dataset file in small batches and processes rows until global_max is reached.
-    Uses online metrics computation to avoid storing large lists.
-    """
     os.makedirs(cache_dir, exist_ok=True)
-    
+
     file_path = hf_hub_download(
-        repo_id="nbettencourt/sc454k-preprocessed-dfs", 
-        filename=run_dataset_filename, 
-        repo_type="dataset", 
+        repo_id="nbettencourt/sc454k-preprocessed-dfs",
+        filename=run_dataset_filename,
+        repo_type="dataset",
         cache_dir=cache_dir
     )
     parquet_file = pq.ParquetFile(file_path)
-    
-    metrics = OnlineMetrics()
+
+    overall_metrics = OnlineMetrics()
+    sector_metrics = {}
     processed_in_file = 0
 
     for batch in parquet_file.iter_batches(batch_size=batch_size):
         df_chunk = batch.to_pandas()
         df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
         df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0]
-        
+
         num_rows = len(df_chunk)
         if current_offset + processed_in_file >= global_max:
             break
-        
+
         start_idx = 0
         end_idx = min(num_rows, global_max - (current_offset + processed_in_file))
-        
+
         for idx in range(start_idx, end_idx):
             sample = df_chunk.iloc[idx]
             raw_text = sample.get("formatted_text", "")
-            
+            sector = sample.get('Sector', "Unknown")
+
             if rl_module is not None:
                 with torch.no_grad():
                     downsampled, _, _ = rl_module(raw_text, model=model)
@@ -228,7 +227,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
             else:
                 tokens = tokenizer(raw_text, truncation=True, max_length=4096, return_tensors="pt")
                 compressed_embedding = None
-            
+
             try:
                 best_context = ebm_select_contexts(
                     df=df_chunk,
@@ -242,7 +241,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
             except Exception as e:
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
-            
+
             if compressed_embedding is not None:
                 with torch.no_grad():
                     pred = model.reg_head(compressed_embedding).squeeze(0)
@@ -257,21 +256,24 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                 input_ids = encoding["input_ids"]
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                     pred, _ = model(input_ids=input_ids)
-            
+
             pred_value = pred.item()
             actual = sample['weighted_avg_720_hrs']
             oldprice = sample['weighted_avg_0_hrs']
             rf = sample['Risk_Free_Rate']
-            sector = sample.get('Sector', "Unknown")
-            
-            metrics.update(pred_value, actual, oldprice, rf, sector)
+
+            overall_metrics.update(pred_value, actual, oldprice, rf)
+            if sector not in sector_metrics:
+                sector_metrics[sector] = OnlineMetrics()
+            sector_metrics[sector].update(pred_value, actual, oldprice, rf)
+
             print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred_value}")
-        
+
         processed_in_file += num_rows
         del df_chunk
         gc.collect()
         torch.cuda.empty_cache()
-        
+
         if current_offset + processed_in_file >= global_max:
             break
 
@@ -279,8 +281,8 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
         os.remove(file_path)
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir, ignore_errors=True)
-    
-    return metrics, processed_in_file
+
+    return overall_metrics, sector_metrics, processed_in_file
 
 def load_model_weights(model, weights_path, device):
     if os.path.exists(weights_path):
@@ -350,7 +352,7 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
     """
     Saves the RL hierarchical attention module's state dictionary to a file and,
     if a bucket is specified in args, uploads it to S3.
-    
+
     Args:
         rl_module (nn.Module): The RL attention module to save.
         epoch (int): Current epoch (for logging/versioning, if desired).
@@ -362,7 +364,7 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
     torch.save(rl_module.state_dict(), save_path)
     print(f"RL Attention module saved to {save_path}")
     logging.info(f"RL Attention module saved to {save_path} at epoch {epoch}")
-    
+
     if args is not None and hasattr(args, "bucket") and args.bucket:
         try:
             import subprocess
@@ -375,13 +377,13 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
 
 def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=None):
     """
-    For the sample at the given index, select the best candidate context from candidate columns 
+    For the sample at the given index, select the best candidate context from candidate columns
     (iteration_1_text ... iteration_30_text). For each candidate:
-    
+
     - If rl_module is provided, run it on the candidate text to obtain a compressed embedding matrix,
       then mean-pool the output.
     - Otherwise, tokenize the candidate text and compute embeddings via model.get_embeddings.
-    
+
     Returns the candidate text whose mean-pooled embedding has energy closest to zero.
     """
     import random
@@ -692,7 +694,7 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
         drop_last=True
     )
     return dataloader
-                           
+
 def prepare_tasks(tokenizer, args, k=3):
     """
     For catastrophic-forgetting tests, pick k random sectors and build
@@ -784,7 +786,7 @@ def initialize_model(args, device, init_from_scratch=False):
 
 def prepare_optimizer(model, args):
     """
-    Prepares a hybrid optimizer: 
+    Prepares a hybrid optimizer:
       - Uses DeepSpeed’s CPUAdam for low-dimensional parameters (embeddings, regression head, etc.)
       - Uses Muon for high-dimensional parameters from the transformer blocks.
     """
@@ -853,7 +855,7 @@ def prepare_optimizer(model, args):
 
     logging.info("Initialized hybrid optimizer: Muon for block parameters and CPUAdam for embeddings and head.")
     return adam_optimizer, muon_optimizer
-    
+
 def initialize_si(model, args):
     """
     Initializes Synaptic Intelligence (SI) if specified.
@@ -1026,45 +1028,45 @@ def compute_l2_loss(model):
 def evaluate_model(predictions, actuals, oldprices, riskfree, sectors):
     """
     Evaluates predictions given lists of predictions, actuals, old prices, risk-free rates, and sectors.
-    
+
     Returns:
-        mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, 
+        mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio,
         average_return, win_rate, profit_factor
     """
     predictions = np.array(predictions)
     actuals = np.array(actuals)
     oldprices = np.array(oldprices)
     riskfree = np.array(riskfree)
-    
+
     mse = mean_squared_error(actuals, predictions)
     r2 = r2_score(actuals, predictions)
-    
+
     true_trends = np.sign(actuals - oldprices)
     pred_trends = np.sign(predictions - oldprices)
     overall_trend_acc = np.mean(true_trends == pred_trends) if predictions.size > 0 else 0.0
-    
+
     buy_signals = (predictions > oldprices).astype(float)
     strategy_returns = (actuals - oldprices) / (oldprices + 1e-12) * buy_signals
     excess_returns = strategy_returns - riskfree
-    
+
     sr_mean = np.mean(excess_returns)
     sr_std = np.std(excess_returns, ddof=1)
     sharpe_ratio = sr_mean / sr_std if sr_std > 1e-12 else 0.0
-    
+
     neg_mask = (excess_returns < 0)
     if np.any(neg_mask):
         downside_std = np.std(excess_returns[neg_mask], ddof=1)
         sortino_ratio = sr_mean / downside_std if downside_std > 1e-12 else float('inf')
     else:
         sortino_ratio = float('inf')
-    
+
     average_return = np.mean(strategy_returns) if strategy_returns.size > 0 else 0.0
     wins = strategy_returns > 0
     win_rate = np.mean(wins) * 100 if wins.size > 0 else 0.0
     gross_profits = strategy_returns[strategy_returns > 0].sum()
     gross_losses = -strategy_returns[strategy_returns < 0].sum()
     profit_factor = (gross_profits / gross_losses) if gross_losses > 1e-12 else float('inf')
-    
+
     # Compute per-sector metrics
     sector_metrics = {}
     unique_sectors = np.unique(sectors)
@@ -1076,35 +1078,35 @@ def evaluate_model(predictions, actuals, oldprices, riskfree, sectors):
         sacts = actuals[indices]
         soldp = oldprices[indices]
         sriskf = riskfree[indices]
-        
+
         sec_mse = mean_squared_error(sacts, spreds)
         sec_r2 = r2_score(sacts, spreds)
         sec_true_trends = np.sign(sacts - soldp)
         sec_pred_trends = np.sign(spreds - soldp)
         sec_trend_acc = np.mean(sec_true_trends == sec_pred_trends) if spreds.size > 0 else 0.0
-        
+
         sec_signals = (spreds > soldp).astype(float)
         sec_strategy_returns = (sacts - soldp) / (soldp + 1e-12) * sec_signals
         sec_excess_returns = sec_strategy_returns - sriskf
-        
+
         sec_ex_mean = np.mean(sec_excess_returns)
         sec_ex_std = np.std(sec_excess_returns, ddof=1)
         sec_sharpe = sec_ex_mean / sec_ex_std if sec_ex_std > 1e-12 else 0.0
-        
+
         neg_mask_s = (sec_excess_returns < 0)
         if np.any(neg_mask_s):
             sec_downside_std = np.std(sec_excess_returns[neg_mask_s], ddof=1)
             sec_sortino = sec_ex_mean / sec_downside_std if sec_downside_std > 1e-12 else float('inf')
         else:
             sec_sortino = float('inf')
-        
+
         sec_avg_return = np.mean(sec_strategy_returns) if sec_strategy_returns.size > 0 else 0.0
         sec_wins = sec_strategy_returns > 0
         sec_win_rate = np.mean(sec_wins) * 100 if sec_wins.size > 0 else 0.0
         sec_gross_profits = sec_strategy_returns[sec_strategy_returns > 0].sum()
         sec_gross_losses = -sec_strategy_returns[sec_strategy_returns < 0].sum()
         sec_profit_factor = (sec_gross_profits / sec_gross_losses) if sec_gross_losses > 1e-12 else float('inf')
-        
+
         sector_metrics[sec] = {
             "mse": sec_mse,
             "r2": sec_r2,
@@ -1115,9 +1117,9 @@ def evaluate_model(predictions, actuals, oldprices, riskfree, sectors):
             "win_rate": sec_win_rate,
             "profit_factor": sec_profit_factor
         }
-    
+
     return mse, r2, sector_metrics, overall_trend_acc, sharpe_ratio, sortino_ratio, average_return, win_rate, profit_factor
-    
+
 def load_checkpoint(model, optimizer, ebm=None, ebm_optimizer=None, checkpoint_path=None):
     """
     Load model and optimizer states from a checkpoint.
@@ -1275,4 +1277,3 @@ def upload_checkpoint_to_s3(local_dir: str, bucket: str, remote_dir: str = "mode
     except subprocess.CalledProcessError as e:
         logging.error(f"Error syncing checkpoint directory: {e.stderr}")
         raise
-
