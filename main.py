@@ -320,35 +320,33 @@ def main():
         print_debug_info("RUN MODE START")
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
+        
+        # Define the consolidated checkpoint path
+        consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
     
-        if current_rank == 0:
-            if args.bucket:
-                download_models_from_s3(bucket=args.bucket)
-            consolidated_model_path = consolidate_checkpoint_to_pth(
-                checkpoint_dir=args.save_dir,
-                tag="final",
-                output_path=args.save_dir
-            )
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                obj_list = [consolidated_model_path]
-                torch.distributed.broadcast_object_list(obj_list, src=0)
-                consolidated_model_path = obj_list[0]
-        else:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                obj_list = [""]
-                torch.distributed.broadcast_object_list(obj_list, src=0)
-                consolidated_model_path = obj_list[0]
-            else:
-                consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
+        # Download from S3 on rank 0 if bucket is specified
+        if current_rank == 0 and args.bucket:
+            download_models_from_s3(bucket=args.bucket)
+            if not os.path.exists(consolidated_model_path):
+                logging.error(f"Consolidated checkpoint not found at {consolidated_model_path} after S3 download")
+                raise FileNotFoundError(f"Expected consolidated checkpoint at {consolidated_model_path}")
     
+        # Synchronize across ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
     
+        # Check if the consolidated checkpoint exists
+        if not os.path.exists(consolidated_model_path):
+            logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
+            raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
+    
+        # Initialize model from scratch and load the consolidated state dict
         model, _ = initialize_model(args, device, init_from_scratch=True)
-        model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
+        state_dict = torch.load(consolidated_model_path, map_location=device)
+        model.load_state_dict(state_dict, strict=False)
         model.to(device)
         model.eval()
-        logging.info("Main transformer model loaded from consolidated checkpoint.")
+        logging.info(f"Rank {current_rank}: Main transformer model loaded from consolidated checkpoint {consolidated_model_path}")
     
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
     
