@@ -768,7 +768,7 @@ def initialize_model(args, device, init_from_scratch=False):
     if init_from_scratch:
         logging.info("Initializing model from scratch using configurations from utils/config.py.")
         model_config = {
-            'n_embed': args.n_embed if hasattr(args, 'n_embed') else config.N_EMBED,
+            'n_embed': config.N_EMBED,
             'n_head': config.N_HEAD,
             'n_layer': config.N_LAYER,
             'block_size': config.BLOCK_SIZE,
@@ -785,7 +785,7 @@ def initialize_model(args, device, init_from_scratch=False):
         if os.path.exists(consolidated_path):
             logging.info(f"Loading consolidated checkpoint from {consolidated_path}")
             model_config = {
-                'n_embed': args.n_embed if hasattr(args, 'n_embed') else config.N_EMBED,
+                'n_embed': config.N_EMBED,
                 'n_head': config.N_HEAD,
                 'n_layer': config.N_LAYER,
                 'block_size': config.BLOCK_SIZE,
