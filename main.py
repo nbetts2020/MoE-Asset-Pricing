@@ -341,7 +341,7 @@ def main():
             raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
     
         # Initialize model from scratch and load the consolidated state dict
-        model, _ = initialize_model(args, device, init_from_scratch=True)
+        model, _ = initialize_model(args, device, init_from_scratch=False)
         state_dict = torch.load(consolidated_model_path, map_location=device)
         model.load_state_dict(state_dict, strict=False)
         model.to(device)
