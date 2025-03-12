@@ -16,6 +16,7 @@ from utils.model import SparseMoELanguageModel
 from utils.ebm import EnergyBasedModel
 from utils.train import train_model
 from utils.test import test_forgetting
+from utils.metrics import OnlineMetrics
 from utils.utils import (
     initialize_model,
     prepare_optimizer,           # returns (adam_optimizer, muon_optimizer)
@@ -135,7 +136,7 @@ def main():
     parser.add_argument("--rl_batch_size", type=int, default=8, help="RL training batch size")
     parser.add_argument("--rl_epochs", type=int, default=5, help="Number of RL training epochs")
     parser.add_argument("--rl_learning_rate", type=float, default=1e-4, help="RL learning rate")
-    parser.add_argument("--use_rl_module", action="store_true", 
+    parser.add_argument("--use_rl_module", action="store_true",
                     help="Use RL module for text compression instead of simple truncation.")
 
     args = parser.parse_args()
@@ -205,11 +206,11 @@ def main():
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
-    
+
         adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
-    
+
         # Initialize DeepSpeed engine (engine is your DeepSpeed object)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
@@ -218,14 +219,14 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-    
+
         if args.use_ebm:
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
             ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
         else:
             ebm = None
             ebm_optimizer = None
-    
+
         train_loader = prepare_dataloader(
             epoch=1,
             window_index=1,
@@ -236,7 +237,7 @@ def main():
             global_max=1e12,
             args=args
         )
-    
+
         # Call train_model; final checkpoint saving, barriers, and uploads occur inside train_model.
         train_model(
             model=engine,
@@ -320,28 +321,28 @@ def main():
         print_debug_info("RUN MODE START")
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-        
+
         consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-        
+
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
             if not os.path.exists(consolidated_model_path):
                 logging.error(f"Consolidated checkpoint not found at {consolidated_model_path} after S3 download")
                 raise FileNotFoundError(f"Expected consolidated checkpoint at {consolidated_model_path}")
-        
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-        
+
         if not os.path.exists(consolidated_model_path):
             logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
             raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
-        
+
         model, _ = initialize_model(args, device, init_from_scratch=False)
         model.eval()
         logging.info(f"Rank {current_rank}: Main transformer model loaded from consolidated checkpoint {consolidated_model_path}")
-        
+
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-        
+
         rl_module = None
         if args.use_rl_module:
             rl_module = HierarchicalAttentionRL(
@@ -357,7 +358,7 @@ def main():
             logging.info("Hierarchical Attention RL module loaded from checkpoint.")
         else:
             logging.info("RL module not used; falling back to simple truncation.")
-        
+
         if not args.test:
             if args.use_rl_module:
                 with torch.no_grad():
@@ -379,7 +380,7 @@ def main():
         else:
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
-        
+
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
@@ -387,7 +388,7 @@ def main():
             ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-        
+
             if args.percent_data < 100:
                 global_max = int(0.2 * 453932 * (args.percent_data / 100))
             else:
@@ -395,15 +396,15 @@ def main():
             cumulative_offset = 0
             all_metrics = OnlineMetrics()
             all_sector_metrics = {}
-    
+
             for i in range(1, 19):
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
-        
+
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
-        
+
                 metrics, sector_metrics, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
@@ -412,13 +413,13 @@ def main():
                     rl_module=rl_module,
                     args=args,
                     device=device,
-                    batch_size=5,
+                    batch_size=1,
                     current_offset=cumulative_offset,
                     global_max=global_max,
                     cache_dir="/tmp/hf_cache_datasets_run"
                 )
                 cumulative_offset += processed_in_file
-                
+
                 # Merge overall metrics
                 all_metrics.count += metrics.count
                 all_metrics.sum_sq_error += metrics.sum_sq_error
@@ -433,7 +434,7 @@ def main():
                 all_metrics.wins += metrics.wins
                 all_metrics.gross_profits += metrics.gross_profits
                 all_metrics.gross_losses += metrics.gross_losses
-                
+
                 # Merge sector metrics
                 for sector, sm in sector_metrics.items():
                     if sector not in all_sector_metrics:
@@ -451,9 +452,9 @@ def main():
                     all_sector_metrics[sector].wins += sm.wins
                     all_sector_metrics[sector].gross_profits += sm.gross_profits
                     all_sector_metrics[sector].gross_losses += sm.gross_losses
-                
+
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
-        
+
             # Compute final metrics
             results = all_metrics.compute()
             mse = results["mse"]
@@ -464,9 +465,9 @@ def main():
             avg_return = results["avg_return"]
             win_rate = results["win_rate"]
             profit_factor = results["profit_factor"]
-    
+
             sector_results = {sector: sm.compute() for sector, sm in all_sector_metrics.items()}
-    
+
             print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             print(f"Overall Trend Accuracy: {trend_acc:.4f}")
             print(f"Sharpe Ratio: {sharpe:.4f}")
@@ -474,7 +475,7 @@ def main():
             print(f"Average Return: {avg_return:.4f}")
             print(f"Win Rate: {win_rate:.2f}%")
             print(f"Profit Factor: {profit_factor:.4f}")
-        
+
             logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
             logging.info(f"Overall Trend Accuracy: {trend_acc:.4f}")
             logging.info(f"Sharpe Ratio: {sharpe:.4f}")
@@ -482,7 +483,7 @@ def main():
             logging.info(f"Average Return: {avg_return:.4f}")
             logging.info(f"Win Rate: {win_rate:.2f}%")
             logging.info(f"Profit Factor: {profit_factor:.4f}")
-            
+
             for sector, metrics in sector_results.items():
                 print(
                     f"Sector: {sector} - "
@@ -506,7 +507,7 @@ def main():
                     f"Win Rate: {metrics['win_rate']:.2f}%, "
                     f"Profit Factor: {metrics['profit_factor']:.4f}"
                 )
-    
+
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
