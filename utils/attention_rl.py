@@ -107,38 +107,35 @@ class HierarchicalAttentionRL(nn.Module):
         super().__init__()
         self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=4096)
         self.tokenizer.model_max_length = max_length
-        self.vocab_size = self.tokenizer.vocab_size
-
-        self.embedding = nn.Embedding(self.vocab_size, embed_dim)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.embed_dim = embed_dim
         self.max_length = max_length
         self.truncate_limit = truncate_limit
-
         self.downsampler = LearnedDownSampler(num_queries=num_queries, embed_dim=embed_dim)
-        self.reg_head = nn.Linear(embed_dim, 1)
 
-    def forward(self, formatted_text: str):
+    def forward(self, formatted_text: str, model: nn.Module):
         device = next(self.parameters()).device
         sections = split_into_sections(formatted_text)
         if len(sections) == 0:
-            dummy = torch.zeros(1, self.embed_dim, device=device)
-            return dummy, self.reg_head(dummy).squeeze(0), torch.tensor(0.0, device=device)
+            return torch.zeros(1, self.downsampler.num_queries, self.embed_dim, device=device, dtype=torch.float16)
 
         section_embeds = []
-        for sec in sections:
-            tokens = self.tokenizer(sec, truncation=True, padding="max_length",
-                                    max_length=self.max_length, return_tensors="pt")
-            input_ids = tokens["input_ids"].to(device)
-            embeds = self.embedding(input_ids)
-            section_embeds.append(embeds)
+        with torch.no_grad():
+            with torch.amp.autocast('cuda'):  # Updated autocast syntax
+                for sec in sections:
+                    tokens = self.tokenizer(sec, truncation=True, padding="max_length",
+                                            max_length=self.max_length, return_tensors="pt")
+                    input_ids = tokens["input_ids"].to(device)
+                    # Use get_embeddings with pool=False to keep sequence dimension
+                    embeds = model.get_embeddings(input_ids=input_ids, pool=False)
+                    section_embeds.append(embeds)
 
-        full_sequence = torch.cat(section_embeds, dim=1)
+        full_sequence = torch.cat(section_embeds, dim=1)  # (B, total_T, embed_dim)
         if self.truncate_limit is not None and full_sequence.size(1) > self.truncate_limit:
             full_sequence = full_sequence[:, -self.truncate_limit:, :]
-        downsampled, log_prob = self.downsampler(full_sequence)
-        pooled = downsampled.mean(dim=1)
-        pred = self.reg_head(pooled).squeeze(0)
-        return downsampled, pred, log_prob
+        downsampled, _ = self.downsampler(full_sequence)
+        return downsampled
 
 def rl_train_hAttention(args, model: nn.Module):
     """
@@ -204,7 +201,7 @@ def rl_train_hAttention(args, model: nn.Module):
             )
             print_gpu_memory_usage(tag=f"After DataLoader chunk {chunk_idx}")
 
-            for batch in rl_loader:
+            for batch_idx, batch in enumerate(rl_loader):
                 preds = []
                 targets = []
                 batch_log_probs = []
@@ -232,6 +229,8 @@ def rl_train_hAttention(args, model: nn.Module):
                 epoch_reward += reward.item()
                 num_batches += 1
 
+                print(f"Processed batch {batch_idx + 1}/{len(rl_loader)} "
+                      f"(Loss: {loss.item():.4f}, Reward: {reward.item():.4f})")
                 # Clean up after each batch
                 del preds, targets, batch_log_probs, preds_tensor, targets_tensor, loss
                 gc.collect()
