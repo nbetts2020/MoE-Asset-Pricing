@@ -321,28 +321,28 @@ def main():
         print_debug_info("RUN MODE START")
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-
+    
         consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-
+    
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
             if not os.path.exists(consolidated_model_path):
                 logging.error(f"Consolidated checkpoint not found at {consolidated_model_path} after S3 download")
                 raise FileNotFoundError(f"Expected consolidated checkpoint at {consolidated_model_path}")
-
+    
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-
+    
         if not os.path.exists(consolidated_model_path):
             logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
             raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
-
+    
         model, _ = initialize_model(args, device, init_from_scratch=False)
         model.eval()
         logging.info(f"Rank {current_rank}: Main transformer model loaded from consolidated checkpoint {consolidated_model_path}")
-
+    
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-
+    
         rl_module = None
         if args.use_rl_module:
             rl_module = HierarchicalAttentionRL(
@@ -362,12 +362,12 @@ def main():
             rl_module.eval()
         else:
             logging.info("RL module not used; falling back to simple truncation.")
-
+    
         if not args.test:
             # Non-test mode: predict for a single input text
             if args.use_rl_module:
                 with torch.no_grad():
-                    downsampled = rl_module(args.text, model=model)  # Pass model to get embeddings
+                    downsampled, _, _ = rl_module(args.text, model=model)  # Unpack tuple
                     compressed_embedding = downsampled.mean(dim=1)
                     pred = model.reg_head(compressed_embedding).squeeze(0)
                 print(f"Predicted Price: {pred.item()}")
@@ -385,7 +385,7 @@ def main():
             # Test mode: process all 18 run_dataset files
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for EBM logic.")
-
+    
             ebm_path = os.path.join("models", "ebm.pt")
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
             ebm.load_state_dict(torch.load(ebm_path, map_location=device))
@@ -393,7 +393,7 @@ def main():
             ebm.half()
             ebm.eval()
             logging.info("EBM model loaded from S3.")
-
+    
             if args.percent_data < 100:
                 global_max = int(0.2 * 453932 * (args.percent_data / 100))  # Adjust based on total rows if needed
             else:
@@ -401,15 +401,15 @@ def main():
             cumulative_offset = 0
             all_metrics = OnlineMetrics()
             all_sector_metrics = {}
-
+    
             for i in range(1, 19):  # 18 files: run_dataset_1.parquet to run_dataset_18.parquet
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
-
+    
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
-
+    
                 metrics, sector_metrics, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
@@ -424,95 +424,81 @@ def main():
                     cache_dir="/tmp/hf_cache_datasets_run"
                 )
                 cumulative_offset += processed_in_file
-
+    
                 # Merge overall metrics
                 all_metrics.count += metrics.count
                 all_metrics.sum_sq_error += metrics.sum_sq_error
                 all_metrics.sum_y += metrics.sum_y
                 all_metrics.sum_y_sq += metrics.sum_y_sq
                 all_metrics.trend_correct += metrics.trend_correct
-                all_metrics.excess_returns_sum += metrics.excess_returns_sum
-                all_metrics.excess_returns_sq_sum += metrics.excess_returns_sq_sum
-                all_metrics.downside_returns_sq_sum += metrics.downside_returns_sq_sum
-                all_metrics.downside_count += metrics.downside_count
-                all_metrics.strategy_returns_sum += metrics.strategy_returns_sum
-                all_metrics.wins += metrics.wins
-                all_metrics.gross_profits += metrics.gross_profits
-                all_metrics.gross_losses += metrics.gross_losses
-
+                for thresh in all_metrics.thresholds:
+                    all_stats = all_metrics.stats[thresh]
+                    metrics_stats = metrics.stats[thresh]
+                    all_stats["excess_returns_sum"] += metrics_stats["excess_returns_sum"]
+                    all_stats["excess_returns_sq_sum"] += metrics_stats["excess_returns_sq_sum"]
+                    all_stats["downside_returns_sq_sum"] += metrics_stats["downside_returns_sq_sum"]
+                    all_stats["downside_count"] += metrics_stats["downside_count"]
+                    all_stats["strategy_returns_sum"] += metrics_stats["strategy_returns_sum"]
+                    all_stats["wins"] += metrics_stats["wins"]
+                    all_stats["gross_profits"] += metrics_stats["gross_profits"]
+                    all_stats["gross_losses"] += metrics_stats["gross_losses"]
+    
                 # Merge sector metrics
                 for sector, sm in sector_metrics.items():
                     if sector not in all_sector_metrics:
                         all_sector_metrics[sector] = OnlineMetrics()
-                    all_sector_metrics[sector].count += sm.count
-                    all_sector_metrics[sector].sum_sq_error += sm.sum_sq_error
-                    all_sector_metrics[sector].sum_y += sm.sum_y
-                    all_sector_metrics[sector].sum_y_sq += sm.sum_y_sq
-                    all_sector_metrics[sector].trend_correct += sm.trend_correct
-                    all_sector_metrics[sector].excess_returns_sum += sm.excess_returns_sum
-                    all_sector_metrics[sector].excess_returns_sq_sum += sm.excess_returns_sq_sum
-                    all_sector_metrics[sector].downside_returns_sq_sum += sm.downside_returns_sq_sum
-                    all_sector_metrics[sector].downside_count += sm.downside_count
-                    all_sector_metrics[sector].strategy_returns_sum += sm.strategy_returns_sum
-                    all_sector_metrics[sector].wins += sm.wins
-                    all_sector_metrics[sector].gross_profits += sm.gross_profits
-                    all_sector_metrics[sector].gross_losses += sm.gross_losses
-
+                    all_sm = all_sector_metrics[sector]
+                    all_sm.count += sm.count
+                    all_sm.sum_sq_error += sm.sum_sq_error
+                    all_sm.sum_y += sm.sum_y
+                    all_sm.sum_y_sq += sm.sum_y_sq
+                    all_sm.trend_correct += sm.trend_correct
+                    for thresh in all_sm.thresholds:
+                        all_stats = all_sm.stats[thresh]
+                        sm_stats = sm.stats[thresh]
+                        all_stats["excess_returns_sum"] += sm_stats["excess_returns_sum"]
+                        all_stats["excess_returns_sq_sum"] += sm_stats["excess_returns_sq_sum"]
+                        all_stats["downside_returns_sq_sum"] += sm_stats["downside_returns_sq_sum"]
+                        all_stats["downside_count"] += sm_stats["downside_count"]
+                        all_stats["strategy_returns_sum"] += sm_stats["strategy_returns_sum"]
+                        all_stats["wins"] += sm_stats["wins"]
+                        all_stats["gross_profits"] += sm_stats["gross_profits"]
+                        all_stats["gross_losses"] += sm_stats["gross_losses"]
+    
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
-
-            # Compute final metrics
+    
+            # Compute and print updated metrics
             results = all_metrics.compute()
-            mse = results["mse"]
-            r2 = results["r2"]
-            trend_acc = results["trend_acc"]
-            sharpe = results["sharpe"]
-            sortino = results["sortino"]
-            avg_return = results["avg_return"]
-            win_rate = results["win_rate"]
-            profit_factor = results["profit_factor"]
-
+            print(f"Test MSE: {results['mse']:.4f}, R² Score: {results['r2']:.4f}")
+            print(f"Overall Trend Accuracy: {results['trend_acc']:.4f}")
+            for thresh in [0.0, 0.05, 0.10, 0.25, 0.50]:
+                thresh_str = f"{int(thresh * 100)}%" if thresh > 0 else "Current"
+                print(f"Buy at {thresh_str} higher:")
+                print(f"  Sharpe Ratio: {results[f'sharpe_{thresh}']:.4f}")
+                print(f"  Sortino Ratio: {results[f'sortino_{thresh}']:.4f}")
+                print(f"  Average Return: {results[f'avg_return_{thresh}']:.4f}")
+                print(f"  Win Rate: {results[f'win_rate_{thresh}']:.2f}%")
+                print(f"  Profit Factor: {results[f'profit_factor_{thresh}']:.4f}")
+    
             sector_results = {sector: sm.compute() for sector, sm in all_sector_metrics.items()}
-
-            print(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-            print(f"Overall Trend Accuracy: {trend_acc:.4f}")
-            print(f"Sharpe Ratio: {sharpe:.4f}")
-            print(f"Sortino Ratio: {sortino:.4f}")
-            print(f"Average Return: {avg_return:.4f}")
-            print(f"Win Rate: {win_rate:.2f}%")
-            print(f"Profit Factor: {profit_factor:.4f}")
-
-            logging.info(f"Test MSE: {mse:.4f}, R² Score: {r2:.4f}")
-            logging.info(f"Overall Trend Accuracy: {trend_acc:.4f}")
-            logging.info(f"Sharpe Ratio: {sharpe:.4f}")
-            logging.info(f"Sortino Ratio: {sortino:.4f}")
-            logging.info(f"Average Return: {avg_return:.4f}")
-            logging.info(f"Win Rate: {win_rate:.2f}%")
-            logging.info(f"Profit Factor: {profit_factor:.4f}")
-
             for sector, metrics in sector_results.items():
-                print(
-                    f"Sector: {sector} - "
-                    f"MSE: {metrics['mse']:.4f}, "
-                    f"R²: {metrics['r2']:.4f}, "
-                    f"Trend Accuracy: {metrics['trend_acc']:.4f}, "
-                    f"Sharpe Ratio: {metrics['sharpe']:.4f}, "
-                    f"Sortino Ratio: {metrics['sortino']:.4f}, "
-                    f"Average Return: {metrics['avg_return']:.4f}, "
-                    f"Win Rate: {metrics['win_rate']:.2f}%, "
-                    f"Profit Factor: {metrics['profit_factor']:.4f}"
-                )
-                logging.info(
-                    f"Sector: {sector} - "
-                    f"MSE: {metrics['mse']:.4f}, "
-                    f"R²: {metrics['r2']:.4f}, "
-                    f"Trend Accuracy: {metrics['trend_acc']:.4f}, "
-                    f"Sharpe Ratio: {metrics['sharpe']:.4f}, "
-                    f"Sortino Ratio: {metrics['sortino']:.4f}, "
-                    f"Average Return: {metrics['avg_return']:.4f}, "
-                    f"Win Rate: {metrics['win_rate']:.2f}%, "
-                    f"Profit Factor: {metrics['profit_factor']:.4f}"
-                )
-
+                print(f"\nSector: {sector}")
+                for thresh in [0.0, 0.05, 0.10, 0.25, 0.50]:
+                    thresh_str = f"{int(thresh * 100)}%" if thresh > 0 else "Current"
+                    print(f"  Buy at {thresh_str} higher:")
+                    print(f"    MSE: {metrics['mse']:.4f}, R²: {metrics['r2']:.4f}, Trend Acc: {metrics['trend_acc']:.4f}")
+                    print(f"    Sharpe: {metrics[f'sharpe_{thresh}']:.4f}, Sortino: {metrics[f'sortino_{thresh}']:.4f}")
+                    print(f"    Avg Return: {metrics[f'avg_return_{thresh}']:.4f}, "
+                          f"Win Rate: {metrics[f'win_rate_{thresh}']:.2f}%, "
+                          f"Profit Factor: {metrics[f'profit_factor_{thresh}']:.4f}")
+    
+            logging.info(f"Test MSE: {results['mse']:.4f}, R² Score: {results['r2']:.4f}, Trend Acc: {results['trend_acc']:.4f}")
+            for thresh in [0.0, 0.05, 0.10, 0.25, 0.50]:
+                thresh_str = f"{int(thresh * 100)}%" if thresh > 0 else "Current"
+                logging.info(f"Buy at {thresh_str}: Sharpe={results[f'sharpe_{thresh}']:.4f}, "
+                            f"Sortino={results[f'sortino_{thresh}']:.4f}, Avg Return={results[f'avg_return_{thresh}']:.4f}, "
+                            f"Win Rate={results[f'win_rate_{thresh}']:.2f}%, Profit Factor={results[f'profit_factor_{thresh}']:.4f}")
+                
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
