@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
 import subprocess
-# Removed unused import: from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
 from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, save_ebm_model
 from utils.config import config
@@ -16,7 +15,7 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 
 def train_model(
     model,
-    optimizers,
+    optimizer,  # Single optimizer object
     epochs,
     device,
     dataloader,
@@ -39,12 +38,27 @@ def train_model(
       - Optional EBM placeholders
       - DeepSpeed or standard PyTorch training
     Handles grad=None for sparse MoE models with DeepSpeed.
+    
+    Args:
+        model: The model to train (DeepSpeed engine if use_deepspeed=True, else PyTorch model)
+        optimizer: Single optimizer instance (used directly in non-DeepSpeed case)
+        epochs: Number of training epochs
+        device: Device to run training on (e.g., 'cuda' or 'cpu')
+        dataloader: DataLoader providing training batches
+        args: Command-line arguments from argparse
+        si: SynapticIntelligence instance (optional)
+        ewc: List of ElasticWeightConsolidation instances (optional)
+        replay_buffer: MemoryReplayBuffer instance (optional)
+        ebm: EnergyBasedModel instance (optional)
+        ebm_optimizer: Optimizer for EBM (optional)
+        tokenizer: Tokenizer for replay buffer (optional)
+        use_deepspeed: Boolean flag to enable DeepSpeed training
     """
     if use_deepspeed:
         engine = model  # DeepSpeed engine passed from main.py
-        engine_optimizer = optimizers[0]  # Single optimizer from DeepSpeed
+        # Optimizer is passed but not directly used in the loop; engine.step() handles it
     else:
-        adam_optimizer, muon_optimizer = optimizers
+        adam_optimizer = optimizer  # Single optimizer for non-DeepSpeed case
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -93,13 +107,11 @@ def train_model(
                 for name, param in engine.module.named_parameters():
                     if param.requires_grad and param.grad is None:
                         param.grad = torch.zeros_like(param, device=device)
-                engine.step()
+                engine.step()  # This internally calls the optimizer's step
             else:
                 adam_optimizer.zero_grad()
-                muon_optimizer.zero_grad()
                 loss.backward()
                 adam_optimizer.step()
-                muon_optimizer.step()
 
             if args.use_si and si:
                 si.update_weights(model)
