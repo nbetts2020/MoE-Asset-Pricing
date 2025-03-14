@@ -11,9 +11,9 @@ class Config:
     DROPOUT = 0.1        # Dropout rate
     NUM_EXPERTS = 8      # Number of experts in the MoE layer
     TOP_K = 2            # Number of experts to use per token
-    LEARNING_RATE = 2e-5
+    LEARNING_RATE = 1e-4
     EPOCHS = 3 
-    BATCH_SIZE = 8       # Effective batch size is 32 with 4 grad accumulation steps
+    BATCH_SIZE = 16       # Effective batch size is 32 with 2 grad accumulation steps
     
     LR_DECAY = 0.95      # Decay rate per layer
     LAMBDA_SI = 0.1      # Lambda val for synaptic intelligence
