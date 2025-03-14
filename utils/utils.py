@@ -776,18 +776,18 @@ def initialize_model(args, device, init_from_scratch=False):
 
 def prepare_optimizer(model, args):
     """
-    Prepares a hybrid optimizer:
-      - Uses DeepSpeed’s CPUAdam for low-dimensional parameters (embeddings, regression head, etc.)
-      - Uses Muon for high-dimensional parameters from the transformer blocks.
+    Prepares a single DeepSpeedCPUAdam optimizer with parameter groups for all model parameters.
+    - Embedding parameters with a decayed learning rate.
+    - Block parameters with their own learning rate.
+    - Regression head parameters with their own learning rate.
     """
     LR_DECAY = config.LR_DECAY
     LEARNING_RATE = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
 
-    adam_param_groups = []
-    muon_params = []
+    param_groups = []
 
-    # Embedding parameters (optimize with CPUAdam)
+    # Embedding parameters
     embedding_params_with_decay = []
     embedding_params_without_decay = []
     for name, param in list(model.token_embedding_table.named_parameters()) + list(model.position_embedding_table.named_parameters()):
@@ -796,18 +796,30 @@ def prepare_optimizer(model, args):
                 embedding_params_without_decay.append(param)
             else:
                 embedding_params_with_decay.append(param)
-    adam_param_groups.append({
+    param_groups.append({
         'params': embedding_params_with_decay,
-        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
+        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.keys) + 1)),
         'weight_decay': weight_decay
     })
-    adam_param_groups.append({
+    param_groups.append({
         'params': embedding_params_without_decay,
-        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
+        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.keys) + 1)),
         'weight_decay': 0.0
     })
 
-    # Regression head parameters (optimize with CPUAdam)
+    # Block parameters
+    block_params = []
+    for block in model.keys:
+        for name, param in block.named_parameters():
+            if param.requires_grad:
+                block_params.append(param)
+    param_groups.append({
+        'params': block_params,
+        'lr': LEARNING_RATE,  # Adjust this if you need a different rate for blocks
+        'weight_decay': weight_decay
+    })
+
+    # Regression head parameters
     reg_params_with_decay = []
     reg_params_without_decay = []
     for name, param in model.regression_head.named_parameters():
@@ -816,35 +828,22 @@ def prepare_optimizer(model, args):
                 reg_params_without_decay.append(param)
             else:
                 reg_params_with_decay.append(param)
-    adam_param_groups.append({
+    param_groups.append({
         'params': reg_params_with_decay,
         'lr': LEARNING_RATE,
         'weight_decay': weight_decay
     })
-    adam_param_groups.append({
+    param_groups.append({
         'params': reg_params_without_decay,
         'lr': LEARNING_RATE,
         'weight_decay': 0.0
     })
 
-    # Block parameters (optimize with Muon)
-    for block in model.blocks:
-        for name, param in block.named_parameters():
-            if param.requires_grad:
-                muon_params.append(param)
+    # Single optimizer for all parameters
+    optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE, weight_decay=weight_decay)
 
-    # Create the CPUAdam optimizer for the non-block parameters.
-    adam_optimizer = DeepSpeedCPUAdam(
-        [p for group in adam_param_groups for p in group['params']],
-        lr=LEARNING_RATE,
-        weight_decay=weight_decay
-    )
-
-    # Create the Muon optimizer for block parameters.
-    muon_optimizer = Muon(muon_params, lr=LEARNING_RATE, momentum=0.95)
-
-    logging.info("Initialized hybrid optimizer: Muon for block parameters and CPUAdam for embeddings and head.")
-    return adam_optimizer, muon_optimizer
+    logging.info("Initialized DeepSpeedCPUAdam optimizer with parameter groups for embeddings, blocks, and regression head.")
+    return optimizer
 
 def initialize_si(model, args):
     """
