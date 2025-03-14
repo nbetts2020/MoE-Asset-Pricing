@@ -372,6 +372,7 @@ def main():
                     pred = model.reg_head(compressed_embedding).squeeze(0)
                 print(f"Predicted Price: {pred.item()}")
             else:
+                tokenizer.truncation_side = 'left'
                 tokens = tokenizer(
                     args.text,
                     truncation=True,
