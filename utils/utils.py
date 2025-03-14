@@ -229,18 +229,29 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                     ebm_samples=args.ebm_num_samples,
                     rl_module=rl_module
                 )
-                encoding = tokenizer(
-                    best_context,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=config.BLOCK_SIZE,
-                    return_tensors="pt"
-                ).to(device)
-                input_ids = encoding["input_ids"]
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast():
-                        pred, _ = model(input_ids=input_ids)
-                pred_value = pred.item()
+
+                if args.use_rl_module and rl_module is not None:
+                    # Compress best_context using rl_module
+                    with torch.no_grad():
+                        with torch.cuda.amp.autocast():
+                            downsampled, pred, _ = rl_module(best_context, model=model)
+                    pred_value = pred.item()  # Use RL module’s prediction directly
+                else:
+                    # Original tokenization path
+                    tokenizer.truncation_side = 'left'
+                    encoding = tokenizer(
+                        best_context,
+                        truncation=True,
+                        padding="max_length",
+                        max_length=config.BLOCK_SIZE,
+                        return_tensors="pt"
+                    ).to(device)
+                    input_ids = encoding["input_ids"]
+                    with torch.no_grad():
+                        with torch.cuda.amp.autocast():
+                            pred, _ = model(input_ids=input_ids)
+                    pred_value = pred.item()
+
             except Exception as e:
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
@@ -391,6 +402,7 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
                     downsampled, _, _ = rl_module(candidate, model=model)  # Unpack tuple, take downsampled
                     mean_emb = downsampled.mean(dim=1)  # (1, embed_dim)
                 else:
+                    tokenizer.truncation_side = 'left'
                     encoding = tokenizer(
                         candidate,
                         truncation=True,
