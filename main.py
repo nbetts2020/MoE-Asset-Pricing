@@ -19,7 +19,7 @@ from utils.test import test_forgetting
 from utils.metrics import OnlineMetrics
 from utils.utils import (
     initialize_model,
-    prepare_optimizer,           # returns (adam_optimizer, muon_optimizer)
+    prepare_optimizer,           # returns just adam_optimizer now
     initialize_si,
     initialize_replay_buffer,
     save_ebm_model,
@@ -207,7 +207,7 @@ def main():
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
-        adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
+        adam_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
@@ -241,7 +241,7 @@ def main():
         # Call train_model; final checkpoint saving, barriers, and uploads occur inside train_model.
         train_model(
             model=engine,
-            optimizers=(adam_optimizer, muon_optimizer),
+            optimizers=adam_optimizer,
             epochs=config.EPOCHS,
             device=device,
             dataloader=train_loader,
@@ -282,7 +282,7 @@ def main():
             ebm = None
             ebm_optimizer = None
 
-        adam_optimizer, muon_optimizer = prepare_optimizer(model, args)
+        adam_optimizer = prepare_optimizer(model, args)
         if args.use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -296,7 +296,7 @@ def main():
 
         train_model(
             model=model,
-            optimizers=(adam_optimizer, muon_optimizer),
+            optimizers=adam_optimizer,
             epochs=config.EPOCHS,
             device=device,
             dataloader=update_dataloader,
