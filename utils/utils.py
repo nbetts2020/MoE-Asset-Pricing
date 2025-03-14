@@ -776,10 +776,7 @@ def initialize_model(args, device, init_from_scratch=False):
 
 def prepare_optimizer(model, args):
     """
-    Prepares a single DeepSpeedCPUAdam optimizer with parameter groups for all model parameters.
-    - Embedding parameters with a decayed learning rate.
-    - Block parameters with their own learning rate.
-    - Regression head parameters with their own learning rate.
+    Prepares the optimizer with layer-wise learning rate decay and optional weight decay (L2 regularization).
     """
     LR_DECAY = config.LR_DECAY
     LEARNING_RATE = config.LEARNING_RATE
@@ -790,44 +787,36 @@ def prepare_optimizer(model, args):
     # Embedding parameters
     embedding_params_with_decay = []
     embedding_params_without_decay = []
+
     for name, param in list(model.token_embedding_table.named_parameters()) + list(model.position_embedding_table.named_parameters()):
         if param.requires_grad:
             if name.endswith('bias') or 'LayerNorm.weight' in name:
                 embedding_params_without_decay.append(param)
             else:
                 embedding_params_with_decay.append(param)
+
     param_groups.append({
         'params': embedding_params_with_decay,
-        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.keys) + 1)),
+        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
         'weight_decay': weight_decay
     })
     param_groups.append({
         'params': embedding_params_without_decay,
-        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.keys) + 1)),
+        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
         'weight_decay': 0.0
-    })
-
-    # Block parameters
-    block_params = []
-    for block in model.keys:
-        for name, param in block.named_parameters():
-            if param.requires_grad:
-                block_params.append(param)
-    param_groups.append({
-        'params': block_params,
-        'lr': LEARNING_RATE,  # Adjust this if you need a different rate for blocks
-        'weight_decay': weight_decay
     })
 
     # Regression head parameters
     reg_params_with_decay = []
     reg_params_without_decay = []
+
     for name, param in model.regression_head.named_parameters():
         if param.requires_grad:
             if name.endswith('bias') or 'LayerNorm.weight' in name:
                 reg_params_without_decay.append(param)
             else:
                 reg_params_with_decay.append(param)
+
     param_groups.append({
         'params': reg_params_with_decay,
         'lr': LEARNING_RATE,
@@ -839,10 +828,31 @@ def prepare_optimizer(model, args):
         'weight_decay': 0.0
     })
 
-    # Single optimizer for all parameters
-    optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE, weight_decay=weight_decay)
+    # Block parameters with layer-wise learning rate decay
+    for i, block in enumerate(model.blocks):
+        block_params_with_decay = []
+        block_params_without_decay = []
+        for name, param in block.named_parameters():
+            if param.requires_grad:
+                if name.endswith('bias') or 'LayerNorm.weight' in name:
+                    block_params_without_decay.append(param)
+                else:
+                    block_params_with_decay.append(param)
+        lr = LEARNING_RATE * (LR_DECAY ** (len(model.blocks) - i))
+        param_groups.append({
+            'params': block_params_with_decay,
+            'lr': lr,
+            'weight_decay': weight_decay
+        })
+        param_groups.append({
+            'params': block_params_without_decay,
+            'lr': lr,
+            'weight_decay': 0.0
+        })
 
-    logging.info("Initialized DeepSpeedCPUAdam optimizer with parameter groups for embeddings, blocks, and regression head.")
+    # Replace standard AdamW with DeepSpeed's CPUAdam when using ZeRO-Offload.
+    optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE)
+    logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
     return optimizer
 
 def initialize_si(model, args):
