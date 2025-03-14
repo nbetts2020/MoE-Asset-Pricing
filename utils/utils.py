@@ -206,7 +206,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
     for batch in parquet_file.iter_batches(batch_size=batch_size):
         df_chunk = batch.to_pandas()
         df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
-        df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0]
+        df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0].reset_index(drop=True)
 
         num_rows = len(df_chunk)
         if current_offset + processed_in_file >= global_max:
