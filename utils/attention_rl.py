@@ -122,6 +122,7 @@ class HierarchicalAttentionRL(nn.Module):
         with torch.no_grad():
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 for sec in sections:
+                    self.tokenizer.truncation_side = 'left'
                     tokens = self.tokenizer(sec, truncation=True, padding="max_length",
                                           max_length=self.max_length, return_tensors="pt")
                     input_ids = tokens["input_ids"].to(device)
