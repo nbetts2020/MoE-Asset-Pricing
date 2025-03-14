@@ -39,7 +39,7 @@ class PrecomputedDataset(Dataset):
 
     def __getitem__(self, idx):
         text = self.df.iloc[idx].get("text", "")
-        tokenizer.truncation_side = 'left'
+        self.tokenizer.truncation_side = 'left'
         encoding = self.tokenizer(
             text,
             truncation=True,
