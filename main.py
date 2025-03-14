@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--use_ewc", action="store_true", help="Use Elastic Weight Consolidation")
     parser.add_argument("--lambda_ewc", type=float, default=0.4, help="EWC regularization strength")
     parser.add_argument("--use_ebm", action="store_true", help="Use energy-based model for prompt optimization")
-    parser.add_argument("--ebm_learning_rate", type=float, default=1e-4, help="Learning rate for the EBM")
+    parser.add_argument("--ebm_learning_rate", type=float, default=3e-4, help="Learning rate for the EBM")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
     parser.add_argument("--ebm_num_samples_train", type=int, help="Number of samples EBM generates during training")
     parser.add_argument("--use_ebm_format", action="store_true", help="Use simplified EBM formatting")
@@ -222,7 +222,7 @@ def main():
 
         if args.use_ebm:
             ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate * 0.1)
+            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
         else:
             ebm = None
             ebm_optimizer = None
