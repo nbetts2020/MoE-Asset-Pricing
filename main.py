@@ -241,7 +241,7 @@ def main():
         # Call train_model; final checkpoint saving, barriers, and uploads occur inside train_model.
         train_model(
             model=engine,
-            optimizers=adam_optimizer,
+            optimizer=adam_optimizer,
             epochs=config.EPOCHS,
             device=device,
             dataloader=train_loader,
@@ -296,7 +296,7 @@ def main():
 
         train_model(
             model=model,
-            optimizers=adam_optimizer,
+            optimizer=adam_optimizer,
             epochs=config.EPOCHS,
             device=device,
             dataloader=update_dataloader,
