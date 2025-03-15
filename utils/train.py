@@ -81,7 +81,7 @@ def train_model(
 
             with torch.amp.autocast('cuda', enabled=True):  # Updated for PyTorch 2.x
                 outputs, _ = model(input_ids=input_ids)
-                loss = F.mse_loss(outputs.squeeze(-1), labels.float())
+                loss = loss = F.smooth_l1_loss(outputs.squeeze(-1), labels.float()) # F.mse_loss(outputs.squeeze(-1), labels.float())
 
                 if args.use_l2:
                     loss += args.lambda_l2 * compute_l2_loss(model)
@@ -127,6 +127,7 @@ def train_model(
             else:
                 adam_optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 adam_optimizer.step()
 
             if args.use_si and si:
