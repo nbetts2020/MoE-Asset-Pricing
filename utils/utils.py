@@ -775,86 +775,98 @@ def initialize_model(args, device, init_from_scratch=False):
     return model, initialized_from_scratch
 
 def prepare_optimizer(model, args):
-    """
-    Prepares the optimizer with layer-wise learning rate decay and optional weight decay (L2 regularization).
-    """
     LR_DECAY = config.LR_DECAY
-    LEARNING_RATE = config.LEARNING_RATE
+    BASE_LR = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
+
+    # Helper function to decide if a param should skip weight decay
+    def skip_weight_decay(n):
+        return (
+            'bias' in n
+            or 'LayerNorm.weight' in n
+            or 'embedding_table' in n  # skip decay for embeddings as well
+        )
 
     param_groups = []
 
-    # Embedding parameters
+    # --- Embedding parameters ---
     embedding_params_with_decay = []
-    embedding_params_without_decay = []
-
-    for name, param in list(model.token_embedding_table.named_parameters()) + list(model.position_embedding_table.named_parameters()):
+    embedding_params_no_decay = []
+    for name, param in (
+        list(model.token_embedding_table.named_parameters()) +
+        list(model.position_embedding_table.named_parameters())
+    ):
         if param.requires_grad:
-            if name.endswith('bias') or 'LayerNorm.weight' in name:
-                embedding_params_without_decay.append(param)
+            if skip_weight_decay(name):
+                embedding_params_no_decay.append(param)
             else:
                 embedding_params_with_decay.append(param)
 
+    # If you do NOT want embeddings to have an extra layer decay, just use base LR
     param_groups.append({
         'params': embedding_params_with_decay,
-        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
+        'lr': BASE_LR,
         'weight_decay': weight_decay
     })
     param_groups.append({
-        'params': embedding_params_without_decay,
-        'lr': LEARNING_RATE * (LR_DECAY ** (len(model.blocks) + 1)),
+        'params': embedding_params_no_decay,
+        'lr': BASE_LR,
         'weight_decay': 0.0
     })
 
-    # Regression head parameters
+    # --- Regression head parameters ---
     reg_params_with_decay = []
-    reg_params_without_decay = []
-
+    reg_params_no_decay = []
     for name, param in model.regression_head.named_parameters():
         if param.requires_grad:
-            if name.endswith('bias') or 'LayerNorm.weight' in name:
-                reg_params_without_decay.append(param)
+            if skip_weight_decay(name):
+                reg_params_no_decay.append(param)
             else:
                 reg_params_with_decay.append(param)
 
     param_groups.append({
         'params': reg_params_with_decay,
-        'lr': LEARNING_RATE,
+        'lr': BASE_LR,
         'weight_decay': weight_decay
     })
     param_groups.append({
-        'params': reg_params_without_decay,
-        'lr': LEARNING_RATE,
+        'params': reg_params_no_decay,
+        'lr': BASE_LR,
         'weight_decay': 0.0
     })
 
-    # Block parameters with layer-wise learning rate decay
-    for i, block in enumerate(model.blocks):
+    # --- Transformer blocks with layer-wise decay ---
+    num_blocks = len(model.blocks)
+    for layer_idx, block in enumerate(model.blocks):
+        # Higher layer_idx -> earlier block -> bigger decay exponent
+        decay_factor = (LR_DECAY ** (num_blocks - 1 - layer_idx))
+        block_lr = BASE_LR * decay_factor
+
         block_params_with_decay = []
-        block_params_without_decay = []
+        block_params_no_decay = []
         for name, param in block.named_parameters():
             if param.requires_grad:
-                if name.endswith('bias') or 'LayerNorm.weight' in name:
-                    block_params_without_decay.append(param)
+                if skip_weight_decay(name):
+                    block_params_no_decay.append(param)
                 else:
                     block_params_with_decay.append(param)
-        lr = LEARNING_RATE * (LR_DECAY ** (len(model.blocks) - i))
+
         param_groups.append({
             'params': block_params_with_decay,
-            'lr': lr,
+            'lr': block_lr,
             'weight_decay': weight_decay
         })
         param_groups.append({
-            'params': block_params_without_decay,
-            'lr': lr,
+            'params': block_params_no_decay,
+            'lr': block_lr,
             'weight_decay': 0.0
         })
 
-    # Replace standard AdamW with DeepSpeed's CPUAdam when using ZeRO-Offload.
-    optimizer = DeepSpeedCPUAdam(param_groups, lr=LEARNING_RATE)
-    logging.info("Initialized DeepSpeedCPUAdam optimizer with layer-wise learning rate decay and weight decay.")
+    # Use DeepSpeedCPUAdam with per-group LRs (omit the top-level "lr=" to avoid confusion)
+    optimizer = DeepSpeedCPUAdam(param_groups)
+    logging.info("Initialized DeepSpeedCPUAdam with layer-wise LR decay and per-group weight decay.")
     return optimizer
-
+    
 def initialize_si(model, args):
     """
     Initializes Synaptic Intelligence (SI) if specified.
