@@ -38,7 +38,7 @@ def train_model(
       - Optional EBM placeholders
       - DeepSpeed or standard PyTorch training
     Handles grad=None for sparse MoE models with DeepSpeed.
-    
+
     Args:
         model: The model to train (DeepSpeed engine if use_deepspeed=True, else PyTorch model)
         optimizer: Single optimizer instance (used directly in non-DeepSpeed case)
@@ -56,7 +56,6 @@ def train_model(
     """
     if use_deepspeed:
         engine = model  # DeepSpeed engine passed from main.py
-        # Optimizer is passed but not directly used in the loop; engine.step() handles it
     else:
         adam_optimizer = optimizer  # Single optimizer for non-DeepSpeed case
 
@@ -70,6 +69,9 @@ def train_model(
         model.train()
         logging.info(f"=== Starting epoch {epoch}/{epochs} ===")
         total_batches = len(dataloader)
+        epoch_loss = 0.0  # Track total loss for the epoch
+        running_avg_loss = 0.0  # Initialize running average
+        alpha = 0.9  # Smoothing factor for EMA (0.9 = 10-batch smoothing)
 
         for step, batch in enumerate(dataloader):
             print(f"Processing batch {step + 1}/{total_batches}")
@@ -101,6 +103,20 @@ def train_model(
                 if args.use_si and si:
                     loss += si.penalty(model)
 
+            # Log loss for this batch
+            batch_loss = loss.item()
+            epoch_loss += batch_loss
+
+            # Update running average
+            if step == 0 and epoch == 1:
+                running_avg_loss = batch_loss  # First batch initializes directly
+            else:
+                running_avg_loss = alpha * running_avg_loss + (1 - alpha) * batch_loss
+
+            # Log batch loss and running average
+            logging.info(f"Epoch {epoch}, Batch {step + 1}/{total_batches}, "
+                        f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
+
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
@@ -119,7 +135,8 @@ def train_model(
             if args.use_replay_buffer and replay_buffer:
                 replay_buffer.add_batch(batch)
 
-        logging.info(f"=== Finished epoch {epoch} ===")
+        avg_epoch_loss = epoch_loss / total_batches
+        logging.info(f"=== Finished epoch {epoch}, Average Loss: {avg_epoch_loss:.4f} ===")
 
         if args.use_ewc and ewc:
             for ewc_instance in ewc:
