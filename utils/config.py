@@ -9,9 +9,9 @@ class Config:
     N_LAYER = 96         # Number of transformer blocks
     BLOCK_SIZE = 4096    # Maximum sequence length during rl attention - not max context window
     DROPOUT = 0.1        # Dropout rate
-    NUM_EXPERTS = 8      # Number of experts in the MoE layer
+    NUM_EXPERTS = 4      # Number of experts in the MoE layer
     TOP_K = 2            # Number of experts to use per token
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 3e-4
     EPOCHS = 3 
     BATCH_SIZE = 16       # Effective batch size is 32 with 2 grad accumulation steps
     
