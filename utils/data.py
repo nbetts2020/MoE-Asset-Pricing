@@ -49,6 +49,8 @@ class PrecomputedDataset(Dataset):
         )
         input_ids = encoding["input_ids"].squeeze(0)
         label = self.df.iloc[idx].get("weighted_avg_720_hrs", 0.0)  # Defaulting to 0.0 if missing
+        label = torch.tensor(label, dtype=torch.float)
+        label = torch.log1p(label)  # Log-scaled target
         return {"input_ids": input_ids, "label": torch.tensor(label, dtype=torch.float)}
 
 # -------------------------------------------------------------------------
