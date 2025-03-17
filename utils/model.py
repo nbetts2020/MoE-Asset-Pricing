@@ -13,7 +13,6 @@ cuda_available = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class MultiHeadAttention(nn.Module):
     """ Multi-head self-attention using FlashAttention """
-
     def __init__(self, n_embed, n_head):
         super().__init__()
         self.n_head = n_head
@@ -24,38 +23,28 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x, attention_mask=None):
         B, T, C = x.size()  # x: (B, T, n_embed)
-        # Project input to QKV and reshape
         qkv = self.qkv_proj(x)  # (B, T, 3 * n_embed)
         qkv = qkv.view(B, T, 3, self.n_head, self.head_size)  # (B, T, 3, n_head, head_size)
         qkv = qkv.permute(0, 2, 1, 3, 4)  # (B, 3, T, n_head, head_size)
         qkv = qkv.reshape(B * T, 3, self.n_head, self.head_size)  # (B*T, 3, n_head, head_size)
-
-        # Prepare cu_seqlens and max_seqlen
-        cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)  # (B + 1,)
-        max_seqlen = T  # Maximum sequence length
-
-        # Call flash_attn_unpadded_qkvpacked_func
+        cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
+        max_seqlen = T
         attn_output = flash_attn_unpadded_qkvpacked_func(
             qkv,
             cu_seqlens,
             max_seqlen,
             dropout_p=config.DROPOUT,
-            softmax_scale=None,   # use default scaling
+            softmax_scale=None,
             causal=True,
             return_attn_probs=False,
-        )  # Returns (B*T, n_head, head_size)
-
-        # Reshape attn_output back to (B, T, n_embed)
-        attn_output = attn_output.view(B, T, self.n_head, self.head_size)  # (B, T, n_head, head_size)
-        attn_output = attn_output.permute(0, 2, 1, 3).reshape(B, C, T).permute(0, 2, 1)  # (B, T, n_embed)
-
+        )  # (B*T, n_head, head_size)
+        attn_output = attn_output.view(B, T, self.n_head, self.head_size)
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(B, C, T).permute(0, 2, 1)
         out = self.out_proj(attn_output)
         return out
 
-
 class Expert(nn.Module):
     """ An MLP is a simple linear layer followed by a non-linearity i.e., each Expert """
-
     def __init__(self, n_embed):
         super().__init__()
         self.net = nn.Sequential(
@@ -80,16 +69,11 @@ class NoisyTopkRouter(nn.Module):
         noise_logits = self.noise_linear(mh_output)  # (B, T, num_experts)
         noise = torch.randn_like(logits) * F.softplus(noise_logits)
         noisy_logits = logits + noise
-
-        # Compute probabilities for all experts before top_k
-        full_router_probs = F.softmax(noisy_logits, dim=-1)  # (B, T, num_experts)
-
-        # Select top_k experts
+        full_router_probs = F.softmax(noisy_logits, dim=-1)
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
         zeros = torch.full_like(noisy_logits, float('-inf'))
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
-        router_output = F.softmax(sparse_logits, dim=-1)  # (B, T, num_experts)
-
+        router_output = F.softmax(sparse_logits, dim=-1)
         return router_output, indices, full_router_probs
 
 class SparseMoE(nn.Module):
@@ -103,7 +87,7 @@ class SparseMoE(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
-        router_output, indices, full_router_probs = self.router(x)  # get full_router_probs
+        router_output, indices, full_router_probs = self.router(x)
         final_output = torch.zeros_like(x)
         flat_x = x.view(-1, x.size(-1))
         flat_router_output = router_output.view(-1, router_output.size(-1))
@@ -124,20 +108,14 @@ class SparseMoE(nn.Module):
                 updates.index_add_(0, limited_indices, weighted_output)
 
         final_output += updates.view(batch_size, seq_len, -1)
-
-        # Compute entropy loss
-        entropy_loss = None  # Initialize
-
+        entropy_loss = None
         if self.training:
-            # Compute entropy over full routing probabilities
-            entropy = -torch.sum(full_router_probs * torch.log(full_router_probs + 1e-8), dim=-1)  # (B, T)
-            entropy_loss = entropy.mean()  # Scalar
-
+            entropy = -torch.sum(full_router_probs * torch.log(full_router_probs + 1e-8), dim=-1)
+            entropy_loss = entropy.mean()
         return final_output, entropy_loss
 
 class Block(nn.Module):
     """ Transformer block with FlashAttention and SparseMoE """
-
     def __init__(self, n_embed, n_head, num_experts, top_k):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
@@ -146,7 +124,7 @@ class Block(nn.Module):
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
 
     def forward(self, x, attention_mask=None):
-        x = x + self.sa(self.ln1(x))  # Self-attention without attention_mask
+        x = x + self.sa(self.ln1(x))
         moe_output, entropy_loss = self.smoe(self.ln2(x))
         x = x + moe_output
         return x, entropy_loss
@@ -154,62 +132,104 @@ class Block(nn.Module):
 class SparseMoELanguageModel(nn.Module):
     def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, tokenizer_name="hf-internal-testing/llama-tokenizer"):
         super(SparseMoELanguageModel, self).__init__()
-        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=4096)
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=32768)  # 16 * 2048
         vocab_size = self.tokenizer.vocab_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)  # 2048
         self.blocks = nn.ModuleList(
-            [Block(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)]
+            [Block(n_embed, n_head, num_experts=num_experts, top_k=top_k) for _ in range(n_layer)]  # 16 layers, 16 heads
         )
         self.ln_f = nn.LayerNorm(n_embed)
-        # Regression head
+        self.attn_weight = nn.Linear(n_embed, 1)  # For attention-weighted output
         self.regression_head = nn.Linear(n_embed, 1)
+        self.n_embed = n_embed
+        self.queries_per_chunk = 256
+        self.chunk_queries = nn.Parameter(torch.randn(self.queries_per_chunk, n_embed))
+        self.chunk_compression_attn = nn.MultiheadAttention(n_embed, num_heads=16, dropout=dropout, batch_first=True)
+        self.final_queries = nn.Parameter(torch.randn(block_size, n_embed))  # 2048
+        self.final_compression_attn = nn.MultiheadAttention(n_embed, num_heads=32, dropout=dropout, batch_first=True)
+        self.max_chunks = 16  # Updated to 16
+        self.chunk_size = block_size  # 2048
 
     def forward(self, input_ids, targets=None, use_entropy_reg=False, lambda_entropy=0.01):
         B, T = input_ids.shape
-        tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
-        x = tok_emb + pos_emb  # (B, T, n_embed)
+        num_chunks = (T + self.chunk_size - 1) // self.chunk_size
+        num_chunks_to_process = min(num_chunks, self.max_chunks)
 
-        total_entropy_loss = 0.0  # initialize total entropy loss
+        # Process chunks backwards
+        chunk_embs = []
+        for i in range(num_chunks_to_process):
+            end = T - (i * self.chunk_size)
+            start = max(end - self.chunk_size, 0)
+            chunk_ids = input_ids[:, start:end]
+            chunk_length = end - start
 
-        # Apply gradient checkpointing only during training
+            if chunk_length < self.chunk_size:
+                pad_length = self.chunk_size - chunk_length
+                pad_ids = torch.full((B, pad_length), self.tokenizer.pad_token_id, device=input_ids.device)
+                chunk_ids_padded = torch.cat([pad_ids, chunk_ids], dim=1)
+            else:
+                chunk_ids_padded = chunk_ids
+
+            tok_emb = self.token_embedding_table(chunk_ids_padded)  # (B, 2048, n_embed)
+            pos_emb = self.position_embedding_table(torch.arange(self.chunk_size, device=input_ids.device))
+            x = tok_emb + pos_emb  # (B, 2048, n_embed)
+            chunk_embs.append(x)
+
+        # Compress each chunk
+        chunk_summaries = []
+        for chunk_emb in chunk_embs:
+            chunk_query = self.chunk_queries.unsqueeze(0).expand(B, self.queries_per_chunk, -1)
+            chunk_summary, _ = self.chunk_compression_attn(chunk_query, chunk_emb, chunk_emb)  # (B, 128, n_embed)
+            chunk_summaries.append(chunk_summary)
+        intermediate_sequence = torch.cat(chunk_summaries, dim=1)  # (B, 128 * num_chunks, n_embed)
+
+        # Final compression to 2048 summary vectors
+        final_queries = self.final_queries.unsqueeze(0).expand(B, self.chunk_size, -1)  # (B, 2048, n_embed)
+        summary_vectors, _ = self.final_compression_attn(final_queries, intermediate_sequence, intermediate_sequence)  # (B, 2048, n_embed)
+
+        # Add position embeddings
+        pos_emb = self.position_embedding_table(torch.arange(self.chunk_size, device=input_ids.device))
+        x = summary_vectors + pos_emb  # (B, 2048, n_embed)
+
+        # Transformer blocks
+        total_entropy_loss = 0.0
         for block in self.blocks:
             if self.training:
                 x, entropy_loss = checkpoint(block, x, use_reentrant=False)
             else:
                 x, entropy_loss = block(x)
-
             if use_entropy_reg and entropy_loss is not None:
                 total_entropy_loss += entropy_loss
 
-        x = self.ln_f(x)       # (B, T, n_embed)
-        x = x.mean(dim=1)      # (B, n_embed)
-        output = self.regression_head(x)  # (B, 1)
-        output = output.squeeze(-1)       # (B,)
+        # Attention-weighted regression head
+        x = self.ln_f(x)  # (B, 2048, n_embed)
+        attn_weights = F.softmax(self.attn_weight(x), dim=1)  # (B, 2048, 1)
+        token_outputs = self.regression_head(x)  # (B, 2048, 1)
+        output = (token_outputs * attn_weights).sum(dim=1).squeeze(-1)  # (B,)
 
+        # Loss computation
         loss = None
         if targets is not None:
-            # Ensure targets are 1D to match output shape
             if targets.dim() == 2 and targets.size(1) == 1:
                 targets = targets.squeeze(1)
             task_loss = F.mse_loss(output, targets)
             loss = task_loss
             if use_entropy_reg:
-                loss += lambda_entropy * total_entropy_loss / len(self.blocks)  # average over blocks
+                loss += lambda_entropy * total_entropy_loss / len(self.blocks)
 
         return output, loss
 
     def get_embeddings(self, input_ids, pool=True):
         B, T = input_ids.shape
         tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=input_ids.device))  # (T, n_embed)
+        pos_emb = self.position_embedding_table(torch.arange(min(T, self.chunk_size), device=input_ids.device))
         x = tok_emb + pos_emb  # (B, T, n_embed)
         x = self.ln_f(x)
         if pool:
             x = x.mean(dim=1)  # (B, n_embed)
         return x
-
+        
     # Model is regressive, so a streaming output doesn't make sense - keeping it for potential future use
     # def generate(self, idx, max_new_tokens, stream=False, temperature=1.0):
     #     # Adjusted generate method (may need further modification)
