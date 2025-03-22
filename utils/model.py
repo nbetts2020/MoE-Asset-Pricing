@@ -35,7 +35,7 @@ class MultiHeadAttention(nn.Module):
             max_seqlen,
             dropout_p=config.DROPOUT,
             softmax_scale=None,
-            causal=True,
+            causal=False,
             return_attn_probs=False,
         )
         attn_output = attn_output.view(B, T, self.n_head, self.head_size)
