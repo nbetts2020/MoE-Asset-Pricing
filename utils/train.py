@@ -112,7 +112,8 @@ def train_model(
                 running_avg_loss = batch_loss  # First batch initializes directly
             else:
                 running_avg_loss = alpha * running_avg_loss + (1 - alpha) * batch_loss
-
+            if step % 10 == 0:
+                logging.info(f"{outputs[:5], labels[:5]}")
             # Log batch loss and running average
             logging.info(f"Epoch {epoch}, Batch {step + 1}/{total_batches}, "
                         f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
