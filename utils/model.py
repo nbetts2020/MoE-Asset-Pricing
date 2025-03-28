@@ -131,7 +131,7 @@ class Block(nn.Module):
 
 class PerceiverModule(nn.Module):
     """ Perceiver module with multiple cross-attention and self-attention layers """
-    def __init__(self, n_embed, num_latents, num_cross_attention_layers=2, num_self_attention_layers=16, latent_dim=None):
+    def __init__(self, n_embed, num_latents, num_cross_attention_layers=4, num_self_attention_layers=16, latent_dim=None):
         super().__init__()
         if latent_dim is None:
             latent_dim = n_embed
@@ -159,9 +159,9 @@ class PerceiverModule(nn.Module):
         return latents
 
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=128, num_cross_attention_layers=2, num_self_attention_layers=16, tokenizer_name="hf-internal-testing/llama-tokenizer"):
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=512, num_cross_attention_layers=4, num_self_attention_layers=16, tokenizer_name="hf-internal-testing/llama-tokenizer"):
         super().__init__()
-        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=16384)
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=8192)
         vocab_size = self.tokenizer.vocab_size
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
@@ -194,15 +194,15 @@ class SparseMoELanguageModel(nn.Module):
             pos_indices = torch.arange(T, device=device) % self.block_size
             pos_emb = self.position_embedding_table(pos_indices)
             x = tok_emb + pos_emb.unsqueeze(0)
-            x = self.perceiver(x)  # (B, num_latents, n_embed)
+            x = self.perceiver(x)  # (B, 128, n_embed)
         else:
             pos_emb = self.position_embedding_table(torch.arange(T, device=device))
             x = tok_emb + pos_emb.unsqueeze(0)  # (B, T, n_embed)
-
+    
         # Compute EBM energy
         ebm_input = x.mean(dim=1)  # (B, n_embed)
         ebm_energy = self.ebm(ebm_input).squeeze(-1)  # (B,)
-
+    
         total_entropy_loss = 0.0
         for block in self.blocks:
             if self.training:
@@ -211,22 +211,21 @@ class SparseMoELanguageModel(nn.Module):
                 x, entropy_loss = block(x)
             if use_entropy_reg and entropy_loss is not None:
                 total_entropy_loss += entropy_loss
-
-        x = self.ln_f(x)  # (B, num_latents or T, n_embed)
-
-        # Attention-based pooling
-        attn_scores = self.attn_pool_layer(x)  # (B, num_latents or T, 1)
-        attn_weights = F.softmax(attn_scores, dim=1)  # (B, num_latents or T, 1)
+    
+        x = self.ln_f(x)  # (B, 128 or T, n_embed)
+        attn_scores = self.attn_pool_layer(x)  # (B, 128 or T, 1)
+        attn_weights = F.softmax(attn_scores, dim=1)  # (B, 128 or T, 1)
         pooled = torch.sum(x * attn_weights, dim=1)  # (B, n_embed)
-
         output = self.regression_head(pooled).squeeze(-1)  # (B,)
-
+    
         loss = None
         if targets is not None:
             if targets.dim() == 2 and targets.size(1) == 1:
                 targets = targets.squeeze(1)
-            task_loss = F.mse_loss(output, targets)
-            ebm_loss = F.mse_loss(ebm_energy, task_loss.detach())
+            # Compute per-sample task loss
+            per_sample_task_loss = F.mse_loss(output, targets, reduction='none')  # (B,)
+            task_loss = per_sample_task_loss.mean()  # Scalar
+            ebm_loss = F.mse_loss(ebm_energy, per_sample_task_loss.detach())  # (B,) vs (B,)
             loss = task_loss + config.LAMBDA_EBM * percent_complete * ebm_loss
             if use_entropy_reg:
                 loss += lambda_entropy * total_entropy_loss / len(self.blocks)
