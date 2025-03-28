@@ -14,6 +14,7 @@ class Config:
     LEARNING_RATE = 3e-4
     EPOCHS = 3 
     BATCH_SIZE = 16       # Effective batch size is 32 with 2 grad accumulation steps
+    LAMBDA_EBM = 0.1
     
     LR_DECAY = 1      # Decay rate per layer
     LAMBDA_SI = 0.1      # Lambda val for synaptic intelligence
