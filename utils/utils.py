@@ -681,10 +681,10 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
     dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
 
     # Use DistributedSampler only if the default process group is initialized.
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        sampler = DistributedSampler(dataset, shuffle=shuffle)
-    else:
-        sampler = None
+    # if torch.distributed.is_available() and torch.distributed.is_initialized():
+    #     sampler = DistributedSampler(dataset, shuffle=shuffle)
+    # else:
+    #     sampler = None
 
     dataloader = DataLoader(
         dataset,
