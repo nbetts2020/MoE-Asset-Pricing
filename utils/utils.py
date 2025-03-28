@@ -685,6 +685,7 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
     #     sampler = DistributedSampler(dataset, shuffle=shuffle)
     # else:
     #     sampler = None
+    sampler = None
 
     dataloader = DataLoader(
         dataset,
