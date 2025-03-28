@@ -9,20 +9,18 @@ import subprocess
 from multiprocessing import cpu_count
 from sklearn.metrics import mean_squared_error, r2_score
 
-import deepspeed  # DeepSpeed integration
+import deepspeed
 from transformers import AutoTokenizer, LlamaTokenizerFast
 
 from utils.model import SparseMoELanguageModel
-from utils.ebm import EnergyBasedModel
 from utils.train import train_model
 from utils.test import test_forgetting
 from utils.metrics import OnlineMetrics
 from utils.utils import (
     initialize_model,
-    prepare_optimizer,           # returns just adam_optimizer now
+    prepare_optimizer,
     initialize_si,
     initialize_replay_buffer,
-    save_ebm_model,
     kaiming_init_weights,
     download_models_from_s3,
     ebm_select_contexts,
@@ -43,7 +41,6 @@ import gc
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
-
 def print_debug_info(stage):
     print(f"=== Debug Info: {stage} ===")
     print("Environment variables:")
@@ -57,7 +54,6 @@ def print_debug_info(stage):
         print("torch.distributed is NOT initialized")
     print("CUDA device count:", torch.cuda.device_count())
     print("====================================")
-
 
 def gather_lists_across_ranks(local_list):
     """
@@ -74,7 +70,6 @@ def gather_lists_across_ranks(local_list):
         return combined
     else:
         return []
-
 
 def main():
     pandarallel.initialize(nb_workers=cpu_count() - 1, progress_bar=True)
@@ -108,11 +103,7 @@ def main():
     parser.add_argument("--lambda_entropy", type=float, default=0.01, help="Entropy regularization strength")
     parser.add_argument("--use_ewc", action="store_true", help="Use Elastic Weight Consolidation")
     parser.add_argument("--lambda_ewc", type=float, default=0.4, help="EWC regularization strength")
-    parser.add_argument("--use_ebm", action="store_true", help="Use energy-based model for prompt optimization")
-    parser.add_argument("--ebm_learning_rate", type=float, default=3e-4, help="Learning rate for the EBM")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
-    parser.add_argument("--ebm_num_samples_train", type=int, help="Number of samples EBM generates during training")
-    parser.add_argument("--use_ebm_format", action="store_true", help="Use simplified EBM formatting")
+    parser.add_argument("--use_ebm", action="store_true", help="Use integrated energy-based model")
     parser.add_argument("--ebm_num_samples", type=int, default=25, help="Number of EBM samples in run mode (max 30)")
     parser.add_argument("--stock", type=str, required=False, help="Stock symbol for run mode")
     parser.add_argument("--date", type=str, required=False, help="Date for run mode (e.g., '2025-02-18')")
@@ -137,7 +128,7 @@ def main():
     parser.add_argument("--rl_epochs", type=int, default=5, help="Number of RL training epochs")
     parser.add_argument("--rl_learning_rate", type=float, default=1e-4, help="RL learning rate")
     parser.add_argument("--use_rl_module", action="store_true",
-                    help="Use RL module for text compression instead of simple truncation.")
+                        help="Use RL module for text compression instead of simple truncation.")
 
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
@@ -211,7 +202,6 @@ def main():
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
-        # Initialize DeepSpeed engine (engine is your DeepSpeed object)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=adam_optimizer,
@@ -219,13 +209,6 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-
-        if args.use_ebm:
-            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED).to(device)
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
-        else:
-            ebm = None
-            ebm_optimizer = None
 
         train_loader = prepare_dataloader(
             epoch=1,
@@ -238,7 +221,6 @@ def main():
             args=args
         )
 
-        # Call train_model; final checkpoint saving, barriers, and uploads occur inside train_model.
         train_model(
             model=engine,
             optimizer=adam_optimizer,
@@ -249,8 +231,6 @@ def main():
             si=initialize_si(engine, args) if args.use_si else None,
             ewc=[ElasticWeightConsolidation(engine, None, device, args)] if args.use_ewc else None,
             replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
-            ebm=ebm,
-            ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
             use_deepspeed=True
         )
@@ -269,18 +249,6 @@ def main():
         model.to(device)
         model.eval()
         logging.info("Main transformer model loaded from S3.")
-
-        if args.use_ebm:
-            ebm_path = os.path.join("models", "ebm.pt")
-            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
-            ebm.load_state_dict(torch.load(ebm_path, map_location=device))
-            ebm.to(device)
-            ebm.eval()
-            logging.info("EBM model loaded from S3.")
-            ebm_optimizer = torch.optim.AdamW(ebm.parameters(), lr=args.ebm_learning_rate)
-        else:
-            ebm = None
-            ebm_optimizer = None
 
         adam_optimizer = prepare_optimizer(model, args)
         if args.use_ddp:
@@ -304,16 +272,12 @@ def main():
             si=initialize_si(model, args) if args.use_si else None,
             ewc=[ElasticWeightConsolidation(model, None, device, args)] if args.use_ewc else None,
             replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
-            ebm=ebm,
-            ebm_optimizer=ebm_optimizer,
             tokenizer=tokenizer,
             use_deepspeed=False
         )
         logging.info("Update completed.")
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            if args.use_ebm:
-                save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
             torch.save(model.state_dict(), os.path.join(args.save_dir, "model_weights_update.pth"))
             logging.info("Updated model weights saved (single GPU / no ZeRO partition).")
 
@@ -321,28 +285,29 @@ def main():
         print_debug_info("RUN MODE START")
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-    
+
         consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-    
+
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
             if not os.path.exists(consolidated_model_path):
                 logging.error(f"Consolidated checkpoint not found at {consolidated_model_path} after S3 download")
                 raise FileNotFoundError(f"Expected consolidated checkpoint at {consolidated_model_path}")
-    
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-    
+
         if not os.path.exists(consolidated_model_path):
             logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
             raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
-    
+
         model, _ = initialize_model(args, device, init_from_scratch=False)
+        model.load_state_dict(torch.load(consolidated_model_path, map_location=device))
         model.eval()
         logging.info(f"Rank {current_rank}: Main transformer model loaded from consolidated checkpoint {consolidated_model_path}")
-    
+
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-    
+
         rl_module = None
         if args.use_rl_module:
             rl_module = HierarchicalAttentionRL(
@@ -355,21 +320,20 @@ def main():
             rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
             if os.path.exists(rl_checkpoint_path):
                 checkpoint = torch.load(rl_checkpoint_path, map_location=device)
-                rl_module.load_state_dict(checkpoint, strict=False)  # Handle potential extra keys like "embedding.weight"
+                rl_module.load_state_dict(checkpoint, strict=False)
                 logging.info("Hierarchical Attention RL module loaded from checkpoint with ignored keys.")
             else:
                 logging.warning(f"RL checkpoint not found at {rl_checkpoint_path}; proceeding with untrained RL module.")
             rl_module.eval()
         else:
             logging.info("RL module not used; falling back to simple truncation.")
-    
+
         if not args.test:
-            # Non-test mode: predict for a single input text
             if args.use_rl_module:
                 with torch.no_grad():
-                    downsampled, _, _ = rl_module(args.text, model=model)  # Unpack tuple
+                    downsampled, _, _ = rl_module(args.text, model=model)
                     compressed_embedding = downsampled.mean(dim=1)
-                    pred = model.reg_head(compressed_embedding).squeeze(0)
+                    pred = model.regression_head(compressed_embedding).squeeze(0)
                 print(f"Predicted Price: {pred.item()}")
             else:
                 tokenizer.truncation_side = 'left'
@@ -380,42 +344,32 @@ def main():
                     return_tensors="pt"
                 ).to(device)
                 with torch.no_grad():
-                    pred, _ = model(input_ids=tokens["input_ids"])
-                print(f"Predicted Price: {pred.item()}")
+                    output, _, _ = model(input_ids=tokens["input_ids"])
+                print(f"Predicted Price: {output.item()}")
         else:
-            # Test mode: process all 18 run_dataset files
             if not args.use_ebm:
-                raise ValueError("Test mode requires --use_ebm for EBM logic.")
-    
-            ebm_path = os.path.join("models", "ebm.pt")
-            ebm = EnergyBasedModel(embedding_dim=config.N_EMBED)
-            ebm.load_state_dict(torch.load(ebm_path, map_location=device))
-            ebm.to(device)
-            ebm.half()
-            ebm.eval()
-            logging.info("EBM model loaded from S3.")
-    
+                raise ValueError("Test mode requires --use_ebm for integrated EBM logic.")
+
             if args.percent_data < 100:
-                global_max = int(0.2 * 453932 * (args.percent_data / 100))  # Adjust based on total rows if needed
+                global_max = int(0.2 * 453932 * (args.percent_data / 100))
             else:
                 global_max = int(1e12)
             cumulative_offset = 0
             all_metrics = OnlineMetrics()
             all_sector_metrics = {}
-    
-            for i in range(1, 19):  # 18 files: run_dataset_1.parquet to run_dataset_18.parquet
+
+            for i in range(1, 19):
                 if cumulative_offset >= global_max:
                     logging.info("Global max reached; stopping further file processing.")
                     break
-    
+
                 run_filename = f"run_dataset_{i}.parquet"
                 logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
-    
+
                 metrics, sector_metrics, processed_in_file = process_run_dataset(
                     run_dataset_filename=run_filename,
                     tokenizer=tokenizer,
                     model=model,
-                    ebm=ebm,
                     rl_module=rl_module,
                     args=args,
                     device=device,
@@ -425,8 +379,7 @@ def main():
                     cache_dir="/tmp/hf_cache_datasets_run"
                 )
                 cumulative_offset += processed_in_file
-    
-                # Merge overall metrics
+
                 all_metrics.count += metrics.count
                 all_metrics.sum_sq_error += metrics.sum_sq_error
                 all_metrics.sum_y += metrics.sum_y
@@ -443,8 +396,7 @@ def main():
                     all_stats["wins"] += metrics_stats["wins"]
                     all_stats["gross_profits"] += metrics_stats["gross_profits"]
                     all_stats["gross_losses"] += metrics_stats["gross_losses"]
-    
-                # Merge sector metrics
+
                 for sector, sm in sector_metrics.items():
                     if sector not in all_sector_metrics:
                         all_sector_metrics[sector] = OnlineMetrics()
@@ -465,10 +417,9 @@ def main():
                         all_stats["wins"] += sm_stats["wins"]
                         all_stats["gross_profits"] += sm_stats["gross_profits"]
                         all_stats["gross_losses"] += sm_stats["gross_losses"]
-    
+
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
-    
-            # Compute and print updated metrics
+
             results = all_metrics.compute()
             print(f"Test MSE: {results['mse']:.4f}, R² Score: {results['r2']:.4f}")
             print(f"Overall Trend Accuracy: {results['trend_acc']:.4f}")
@@ -480,7 +431,7 @@ def main():
                 print(f"  Average Return: {results[f'avg_return_{thresh}']:.4f}")
                 print(f"  Win Rate: {results[f'win_rate_{thresh}']:.2f}%")
                 print(f"  Profit Factor: {results[f'profit_factor_{thresh}']:.4f}")
-    
+
             sector_results = {sector: sm.compute() for sector, sm in all_sector_metrics.items()}
             for sector, metrics in sector_results.items():
                 print(f"\nSector: {sector}")
@@ -492,14 +443,14 @@ def main():
                     print(f"    Avg Return: {metrics[f'avg_return_{thresh}']:.4f}, "
                           f"Win Rate: {metrics[f'win_rate_{thresh}']:.2f}%, "
                           f"Profit Factor: {metrics[f'profit_factor_{thresh}']:.4f}")
-    
+
             logging.info(f"Test MSE: {results['mse']:.4f}, R² Score: {results['r2']:.4f}, Trend Acc: {results['trend_acc']:.4f}")
             for thresh in [0.0, 0.05, 0.10, 0.25, 0.50]:
                 thresh_str = f"{int(thresh * 100)}%" if thresh > 0 else "Current"
                 logging.info(f"Buy at {thresh_str}: Sharpe={results[f'sharpe_{thresh}']:.4f}, "
                             f"Sortino={results[f'sortino_{thresh}']:.4f}, Avg Return={results[f'avg_return_{thresh}']:.4f}, "
                             f"Win Rate={results[f'win_rate_{thresh}']:.2f}%, Profit Factor={results[f'profit_factor_{thresh}']:.4f}")
-                
+
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
@@ -528,6 +479,7 @@ def main():
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
         with open(os.path.join(args.save_dir, "test_forgetting_results.json"), "w") as f:
             json.dump(test_results, f, indent=4)
+
     elif args.mode == "rl":
         print_debug_info("RL MODE START")
         if current_rank == 0:
@@ -560,13 +512,13 @@ def main():
 
         from utils.attention_rl import rl_train_hAttention
         rl_train_hAttention(args, model=model)
+
     else:
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', 'test_forgetting', or 'rl'.")
 
     if args.use_ddp:
         import torch.distributed as dist
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
