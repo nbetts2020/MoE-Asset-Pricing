@@ -179,7 +179,7 @@ def main():
     if not (0 < args.percent_data <= 100):
         raise ValueError("--percent_data must be between 0 and 100.")
 
-    tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name, model_max_length=4096)
+    tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name, model_max_length=8192)
     tokenizer.pad_token = tokenizer.eos_token
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
