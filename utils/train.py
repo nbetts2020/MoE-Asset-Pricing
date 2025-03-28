@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import logging
 import subprocess
 
-from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, save_ebm_model
+from utils.utils import compute_l2_loss, upload_checkpoint_to_s3
 from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
@@ -23,8 +23,6 @@ def train_model(
     si=None,
     ewc=None,
     replay_buffer=None,
-    ebm=None,
-    ebm_optimizer=None,
     tokenizer=None,
     use_deepspeed=False
 ):
@@ -35,7 +33,7 @@ def train_model(
       - Online Learning with SI (si)
       - Elastic Weight Consolidation (ewc)
       - Memory Replay Buffer (replay_buffer)
-      - Optional EBM placeholders
+      - EBM now integrated into model.forward()
       - DeepSpeed or standard PyTorch training
     Handles grad=None for sparse MoE models with DeepSpeed.
 
@@ -49,8 +47,6 @@ def train_model(
         si: SynapticIntelligence instance (optional)
         ewc: List of ElasticWeightConsolidation instances (optional)
         replay_buffer: MemoryReplayBuffer instance (optional)
-        ebm: EnergyBasedModel instance (optional)
-        ebm_optimizer: Optimizer for EBM (optional)
         tokenizer: Tokenizer for replay buffer (optional)
         use_deepspeed: Boolean flag to enable DeepSpeed training
     """
@@ -65,6 +61,7 @@ def train_model(
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
     logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
 
+    total_steps = len(dataloader) * epochs
     for epoch in range(1, epochs + 1):
         model.train()
         logging.info(f"=== Starting epoch {epoch}/{epochs} ===")
@@ -74,18 +71,28 @@ def train_model(
         alpha = 0.9  # Smoothing factor for EMA (0.9 = 10-batch smoothing)
 
         for step, batch in enumerate(dataloader):
+            current_step = (epoch - 1) * total_batches + step
+            percent_complete = current_step / total_steps
+
             print(f"Processing batch {step + 1}/{total_batches}")
 
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
             with torch.amp.autocast('cuda', enabled=True):  # Updated for PyTorch 2.x
-                outputs, _ = model(input_ids=input_ids)
-                loss = loss = F.smooth_l1_loss(outputs.squeeze(-1), labels.float()) # F.mse_loss(outputs.squeeze(-1), labels.float())
+                # Model now returns output, ebm_energy, and loss
+                output, ebm_energy, loss = model(
+                    input_ids=input_ids,
+                    targets=labels,
+                    percent_complete=percent_complete,
+                    use_entropy_reg=args.use_entropy_reg  # Pass if needed
+                )
 
+                # Add L2 regularization if enabled
                 if args.use_l2:
                     loss += args.lambda_l2 * compute_l2_loss(model)
 
+                # Add replay buffer loss if enabled
                 if replay_buffer and len(replay_buffer.buffer) > 0:
                     replay_loss = replay_buffer.replay_and_calculate_loss(
                         model=model,
@@ -96,10 +103,12 @@ def train_model(
                     )
                     loss += replay_loss
 
+                # Add EWC penalty if enabled
                 if args.use_ewc and ewc:
                     for ewc_instance in ewc:
                         loss += args.lambda_ewc * ewc_instance.penalty(model)
 
+                # Add SI penalty if enabled
                 if args.use_si and si:
                     loss += si.penalty(model)
 
@@ -113,7 +122,7 @@ def train_model(
             else:
                 running_avg_loss = alpha * running_avg_loss + (1 - alpha) * batch_loss
             if step % 10 == 0:
-                logging.info(f"{outputs[:5], labels[:5]}")
+                logging.info(f"Outputs: {output[:5]}, Labels: {labels[:5]}, EBM Energy: {ebm_energy[:5]}")
             # Log batch loss and running average
             logging.info(f"Epoch {epoch}, Batch {step + 1}/{total_batches}, "
                         f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
@@ -158,7 +167,10 @@ def train_model(
     checkpoint_dir = os.path.join(args.save_dir, tag)
     os.makedirs(checkpoint_dir, exist_ok=True)
     try:
-        model.save_checkpoint(args.save_dir, tag=tag, client_state={})
+        if use_deepspeed:
+            model.save_checkpoint(args.save_dir, tag=tag, client_state={})
+        else:
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "model.pth"))
     except Exception as e:
         raise RuntimeError(f"Rank {rank} failed to save checkpoint: {str(e)}")
 
@@ -166,7 +178,7 @@ def train_model(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    # Save model weights directly on rank 0 without optimizer states
+    # Save consolidated model weights on rank 0 (DeepSpeed case)
     if use_deepspeed and rank == 0:
         consolidated_path = os.path.join(args.save_dir, "consolidated_final.pth")
         state_dict = model.module.state_dict()  # Extract model weights directly
@@ -176,11 +188,9 @@ def train_model(
         else:
             logging.error(f"Failed to save consolidated model weights at {consolidated_path}")
 
-    # Rank 0 handles S3 upload and EBM saving
+    # Rank 0 handles S3 upload
     if (not torch.distributed.is_initialized()) or (rank == 0):
         if args.bucket:
             upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-        if args.use_ebm and ebm is not None:
-            save_ebm_model(ebm, epoch=config.EPOCHS, save_dir="models", args=args)
 
     logging.info("All epochs completed.")
