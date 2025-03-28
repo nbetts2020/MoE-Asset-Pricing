@@ -173,8 +173,20 @@ class SparseMoELanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embed)
         self.attn_pool_layer = nn.Linear(n_embed, 1)  # Attention pooling layer
         self.regression_head = nn.Linear(n_embed, 1)
+        
+        # Energy-Based Model
+        self.ebm = nn.Sequential(
+            nn.Linear(n_embed, n_embed),
+            nn.ReLU(),
+            nn.Linear(n_embed, 1)
+        )
+        for m in self.ebm:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, input_ids, targets=None, use_entropy_reg=False, lambda_entropy=0.01):
+    def forward(self, input_ids, targets=None, use_entropy_reg=False, lambda_entropy=0.01, percent_complete=0.0):
         B, T = input_ids.shape
         device = input_ids.device
         tok_emb = self.token_embedding_table(input_ids)
@@ -186,6 +198,10 @@ class SparseMoELanguageModel(nn.Module):
         else:
             pos_emb = self.position_embedding_table(torch.arange(T, device=device))
             x = tok_emb + pos_emb.unsqueeze(0)  # (B, T, n_embed)
+
+        # Compute EBM energy
+        ebm_input = x.mean(dim=1)  # (B, n_embed)
+        ebm_energy = self.ebm(ebm_input).squeeze(-1)  # (B,)
 
         total_entropy_loss = 0.0
         for block in self.blocks:
@@ -210,11 +226,12 @@ class SparseMoELanguageModel(nn.Module):
             if targets.dim() == 2 and targets.size(1) == 1:
                 targets = targets.squeeze(1)
             task_loss = F.mse_loss(output, targets)
-            loss = task_loss
+            ebm_loss = F.mse_loss(ebm_energy, task_loss.detach())
+            loss = task_loss + config.LAMBDA_EBM * percent_complete * ebm_loss
             if use_entropy_reg:
                 loss += lambda_entropy * total_entropy_loss / len(self.blocks)
-
-        return output, loss
+        
+        return output, ebm_energy, loss
 
     def get_embeddings(self, input_ids, pool=True):
         B, T = input_ids.shape
