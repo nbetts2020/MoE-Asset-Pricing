@@ -186,9 +186,15 @@ def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int =
         if rl_rows != -1 and accumulated >= rl_rows:
             break
 
-def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, args, device,
+def process_run_dataset(run_dataset_filename, tokenizer, model, rl_module, args, device,
                         batch_size=500, current_offset=0, global_max=int(1e12),
                         cache_dir="/tmp/hf_cache_datasets_run"):
+    import os
+    import gc
+    import shutil
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
     os.makedirs(cache_dir, exist_ok=True)
 
     file_path = hf_hub_download(
@@ -223,21 +229,18 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                 best_context = ebm_select_contexts(
                     df=df_chunk,
                     idx=idx,
-                    model=model,
-                    ebm=ebm,
+                    model=model,  # Now includes EBM internally
                     tokenizer=tokenizer,
                     ebm_samples=args.ebm_num_samples,
                     rl_module=rl_module
                 )
 
                 if args.use_rl_module and rl_module is not None:
-                    # Compress best_context using rl_module
                     with torch.no_grad():
                         with torch.cuda.amp.autocast():
                             downsampled, pred, _ = rl_module(best_context, model=model)
-                    pred_value = pred.item()  # Use RL module’s prediction directly
+                    pred_value = pred.item()  # Use RL module’s prediction
                 else:
-                    # Original tokenization path
                     tokenizer.truncation_side = 'left'
                     encoding = tokenizer(
                         best_context,
@@ -249,8 +252,8 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, ebm, rl_module, 
                     input_ids = encoding["input_ids"]
                     with torch.no_grad():
                         with torch.cuda.amp.autocast():
-                            pred, _ = model(input_ids=input_ids)
-                    pred_value = pred.item()
+                            output, _, _ = model(input_ids=input_ids)  # Updated to handle 3 return values
+                    pred_value = output.item()
 
             except Exception as e:
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
@@ -373,7 +376,7 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
         except Exception as e:
             logging.error(f"Error uploading RL Attention module to S3: {e}")
 
-def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=None):
+def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, rl_module=None):
     import random
     import numpy as np
     from utils.config import config
@@ -399,7 +402,7 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
         with torch.amp.autocast('cuda'):
             for candidate in sampled_candidates:
                 if rl_module is not None:
-                    downsampled, _, _ = rl_module(candidate, model=model)  # Unpack tuple, take downsampled
+                    downsampled, _, _ = rl_module(candidate, model=model)
                     mean_emb = downsampled.mean(dim=1)  # (1, embed_dim)
                 else:
                     tokenizer.truncation_side = 'left'
@@ -410,9 +413,19 @@ def ebm_select_contexts(df, idx, model, ebm, tokenizer, ebm_samples, rl_module=N
                         max_length=config.BLOCK_SIZE,
                         return_tensors="pt"
                     ).to(device)
-                    mean_emb = model.get_embeddings(encoding["input_ids"], pool=True)
-                energy = ebm(mean_emb).item()
-                candidate_energies.append(energy)
+                    input_ids = encoding["input_ids"]
+                    _, energy, _ = model(input_ids=input_ids)  # Get ebm_energy from forward
+                    mean_emb = None  # Not needed since energy is direct output
+
+                # Use ebm_energy directly if no RL module, otherwise compute energy from RL embeddings
+                if rl_module is None:
+                    energy_value = energy.item()
+                else:
+                    # If RL is used, assume model can still compute energy from mean_emb
+                    _, energy, _ = model(input_ids=None, embeddings=mean_emb)
+                    energy_value = energy.item()
+
+                candidate_energies.append(energy_value)
 
     best_idx = np.argmin([abs(e) for e in candidate_energies])
     return sampled_candidates[best_idx]
