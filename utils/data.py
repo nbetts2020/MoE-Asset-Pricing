@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # GLOBAL TOKENIZER SETUP
 # -------------------------------------------------------------------------
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "hf-internal-testing/llama-tokenizer")
-GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=4096)
+GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=8192)
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
 
@@ -44,7 +44,7 @@ class PrecomputedDataset(Dataset):
             text,
             truncation=True,
             padding="max_length",
-            max_length=self.block_size,
+            max_length=8192,
             return_tensors="pt"
         )
         input_ids = encoding["input_ids"].squeeze(0)
