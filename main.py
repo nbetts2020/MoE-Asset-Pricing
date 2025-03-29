@@ -38,6 +38,7 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from utils.ewc import ElasticWeightConsolidation
 from torch.utils.data.distributed import DistributedSampler
 import gc
+from deepspeed import zero
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
@@ -133,6 +134,7 @@ def main():
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
 
+    # Handle small/test-mode hyperparameters
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
         config.EPOCHS = 15
@@ -144,6 +146,7 @@ def main():
         logging.info("Switching to numeric_only hyperparameters for faster execution.")
         config.BLOCK_SIZE = 128
 
+    # CLI overrides
     if args.n_embed is not None:
         config.N_EMBED = args.n_embed
         logging.info(f"Overriding n_embed to {config.N_EMBED}")
@@ -169,6 +172,7 @@ def main():
     logging.info(f"Using device: {device}, rank: {rank}")
     print_debug_info("BEFORE SEED SETTING")
 
+    # Reproducibility
     random_seed = args.random_seed
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
@@ -190,18 +194,27 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     print_debug_info("BEFORE MODE SWITCH")
 
+    # ------------------ TRAIN MODE ------------------
     if args.mode == "train":
         print_debug_info("TRAIN MODE START")
-        model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
+
+        # Use ZeRO.Init so parameters are sharded across GPUs from the start
+        with zero.Init(config_dict_or_path=args.deepspeed_config):
+            model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
+
         logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
+
+        # Apply custom initialization if needed
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
+        # Prepare optimizer
         adam_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
+        # Initialize DeepSpeed Engine (ZeRO, etc.)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=adam_optimizer,
@@ -210,6 +223,7 @@ def main():
         )
         print_debug_info("AFTER DEEPSPEED INIT")
 
+        # Prepare data
         train_loader = prepare_dataloader(
             epoch=1,
             window_index=1,
@@ -221,6 +235,7 @@ def main():
             args=args
         )
 
+        # Train
         train_model(
             model=engine,
             optimizer=adam_optimizer,
@@ -236,13 +251,16 @@ def main():
         )
         logging.info("Training completed.")
 
+    # ------------------ UPDATE MODE ------------------
     elif args.mode == "update":
         print_debug_info("UPDATE MODE START")
         if not args.bucket:
             raise ValueError("When using update mode, --bucket is required.")
 
+        # Download current model artifacts from S3
         download_models_from_s3(bucket=args.bucket)
 
+        # Load existing weights
         model, _ = initialize_model(args, device, init_from_scratch=True)
         model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -262,6 +280,7 @@ def main():
         update_dataloader, data_bundle = prepare_dataloader(args)
         logging.info(f"Update DataLoader length: {len(update_dataloader)}")
 
+        # Fine-tune or "update" the model
         train_model(
             model=model,
             optimizer=adam_optimizer,
@@ -277,10 +296,12 @@ def main():
         )
         logging.info("Update completed.")
 
+        # Save updated model (rank 0 if distributed)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             torch.save(model.state_dict(), os.path.join(args.save_dir, "model_weights_update.pth"))
             logging.info("Updated model weights saved (single GPU / no ZeRO partition).")
 
+    # ------------------ RUN (INFERENCE) MODE ------------------
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
         if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
@@ -288,6 +309,7 @@ def main():
 
         consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
 
+        # Download the consolidated checkpoint
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
             if not os.path.exists(consolidated_model_path):
@@ -301,13 +323,29 @@ def main():
             logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
             raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
 
+        # Basic model creation; do NOT .to(device) if we plan to use DeepSpeed inference
         model, _ = initialize_model(args, device, init_from_scratch=False)
-        model.load_state_dict(torch.load(consolidated_model_path, map_location=device))
+        model.load_state_dict(torch.load(consolidated_model_path, map_location="cpu"))  # Load on CPU first
+
+        # ------------------ Multi-GPU Inference with DeepSpeed ------------------
+        # If WORLD_SIZE > 1, let's partition the model across GPUs. Otherwise it stays on one GPU.
+        mp_size = int(os.environ.get("WORLD_SIZE", 1))
+        # Use fp16 if your hardware supports it; otherwise, switch to bf16 or float32
+        model = deepspeed.init_inference(
+            model,
+            mp_size=mp_size,
+            dtype=torch.float16,
+            replace_method="auto",
+            config=args.deepspeed_config
+        )
         model.eval()
-        logging.info(f"Rank {current_rank}: Main transformer model loaded from consolidated checkpoint {consolidated_model_path}")
+        logging.info(
+            f"Rank {current_rank}: Main transformer model loaded from {consolidated_model_path} "
+            f"with mp_size={mp_size}"
+        )
 
+        # RL logic
         from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-
         rl_module = None
         if args.use_rl_module:
             rl_module = HierarchicalAttentionRL(
@@ -316,18 +354,17 @@ def main():
                 max_length=config.BLOCK_SIZE,
                 num_queries=config.BLOCK_SIZE,
                 truncate_limit=None
-            ).to(device)
+            )
             rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
             if os.path.exists(rl_checkpoint_path):
-                checkpoint = torch.load(rl_checkpoint_path, map_location=device)
+                checkpoint = torch.load(rl_checkpoint_path, map_location="cpu")
                 rl_module.load_state_dict(checkpoint, strict=False)
-                logging.info("Hierarchical Attention RL module loaded from checkpoint with ignored keys.")
+                logging.info("Hierarchical Attention RL module loaded from checkpoint (keys ignored where mismatched).")
             else:
                 logging.warning(f"RL checkpoint not found at {rl_checkpoint_path}; proceeding with untrained RL module.")
             rl_module.eval()
-        else:
-            logging.info("RL module not used; falling back to simple truncation.")
 
+        # ---------- Actual Inference Logic ----------
         if not args.test:
             if args.use_rl_module:
                 with torch.no_grad():
@@ -336,17 +373,21 @@ def main():
                     pred = model.regression_head(compressed_embedding).squeeze(0)
                 print(f"Predicted Price: {pred.item()}")
             else:
+                # Simple truncation approach
                 tokenizer.truncation_side = 'left'
                 tokens = tokenizer(
                     args.text,
                     truncation=True,
-                    max_length=config.BLOCK_SIZE,
+                    max_length=8192,
                     return_tensors="pt"
-                ).to(device)
+                )
                 with torch.no_grad():
+                    # DeepSpeed automatically handles GPU placement, so just pass CPU tensors
                     output, _, _ = model(input_ids=tokens["input_ids"])
                 print(f"Predicted Price: {output.item()}")
+
         else:
+            # 'test' inference: iterating over data, computing metrics
             if not args.use_ebm:
                 raise ValueError("Test mode requires --use_ebm for integrated EBM logic.")
 
@@ -372,7 +413,7 @@ def main():
                     model=model,
                     rl_module=rl_module,
                     args=args,
-                    device=device,
+                    device=device,  # device is typically 'cuda', but DS does the partitioning
                     batch_size=1,
                     current_offset=cumulative_offset,
                     global_max=global_max,
@@ -380,6 +421,7 @@ def main():
                 )
                 cumulative_offset += processed_in_file
 
+                # Accumulate overall stats
                 all_metrics.count += metrics.count
                 all_metrics.sum_sq_error += metrics.sum_sq_error
                 all_metrics.sum_y += metrics.sum_y
@@ -397,6 +439,7 @@ def main():
                     all_stats["gross_profits"] += metrics_stats["gross_profits"]
                     all_stats["gross_losses"] += metrics_stats["gross_losses"]
 
+                # Per-sector stats
                 for sector, sm in sector_metrics.items():
                     if sector not in all_sector_metrics:
                         all_sector_metrics[sector] = OnlineMetrics()
@@ -420,6 +463,7 @@ def main():
 
                 logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
 
+            # Compute final results
             results = all_metrics.compute()
             print(f"Test MSE: {results['mse']:.4f}, R² Score: {results['r2']:.4f}")
             print(f"Overall Trend Accuracy: {results['trend_acc']:.4f}")
@@ -448,9 +492,10 @@ def main():
             for thresh in [0.0, 0.05, 0.10, 0.25, 0.50]:
                 thresh_str = f"{int(thresh * 100)}%" if thresh > 0 else "Current"
                 logging.info(f"Buy at {thresh_str}: Sharpe={results[f'sharpe_{thresh}']:.4f}, "
-                            f"Sortino={results[f'sortino_{thresh}']:.4f}, Avg Return={results[f'avg_return_{thresh}']:.4f}, "
-                            f"Win Rate={results[f'win_rate_{thresh}']:.2f}%, Profit Factor={results[f'profit_factor_{thresh}']:.4f}")
+                             f"Sortino={results[f'sortino_{thresh}']:.4f}, Avg Return={results[f'avg_return_{thresh}']:.4f}, "
+                             f"Win Rate={results[f'win_rate_{thresh}']:.2f}%, Profit Factor={results[f'profit_factor_{thresh}']:.4f}")
 
+    # ------------------ TEST_FORGETTING MODE ------------------
     elif args.mode == "test_forgetting":
         print_debug_info("TEST_FORGETTING MODE START")
         model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
@@ -480,6 +525,7 @@ def main():
         with open(os.path.join(args.save_dir, "test_forgetting_results.json"), "w") as f:
             json.dump(test_results, f, indent=4)
 
+    # ------------------ RL MODE ------------------
     elif args.mode == "rl":
         print_debug_info("RL MODE START")
         if current_rank == 0:
@@ -516,6 +562,7 @@ def main():
     else:
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', 'test_forgetting', or 'rl'.")
 
+    # Destroy distributed process group if it was used
     if args.use_ddp:
         import torch.distributed as dist
         dist.destroy_process_group()
