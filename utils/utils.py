@@ -76,7 +76,10 @@ TOTAL_CHUNK_ROWS = sum(CHUNK_SIZES.values())  # 50000 + 25k*11 + 13146 = 338146
 
 def kaiming_init_weights(m):
     if isinstance(m, nn.Linear):
-        init.kaiming_normal_(m.weight)
+        if m.weight is not None and m.weight.dim() >= 2:
+            nn.init.xavier_uniform_(m.weight, gain=0.01)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
 
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
