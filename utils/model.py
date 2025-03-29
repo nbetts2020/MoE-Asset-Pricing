@@ -159,7 +159,7 @@ class PerceiverModule(nn.Module):
         return latents
 
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=512, num_cross_attention_layers=4, num_self_attention_layers=4, tokenizer_name="hf-internal-testing/llama-tokenizer"):
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=128, num_cross_attention_layers=4, num_self_attention_layers=4, tokenizer_name="hf-internal-testing/llama-tokenizer"):
         super().__init__()
         self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=8192)
         vocab_size = self.tokenizer.vocab_size
@@ -173,7 +173,7 @@ class SparseMoELanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embed)
         self.attn_pool_layer = nn.Linear(n_embed, 1)  # Attention pooling layer
         self.regression_head = nn.Linear(n_embed, 1)
-        
+
         # Energy-Based Model
         self.ebm = nn.Sequential(
             nn.Linear(n_embed, n_embed),
@@ -199,11 +199,11 @@ class SparseMoELanguageModel(nn.Module):
         else:
             pos_emb = self.position_embedding_table(torch.arange(T, device=device))
             x = tok_emb + pos_emb.unsqueeze(0)  # (B, T, n_embed)
-    
+
         # Compute EBM energy
         ebm_input = x.mean(dim=1)  # (B, n_embed)
         ebm_energy = self.ebm(ebm_input).squeeze(-1)  # (B,)
-    
+
         total_entropy_loss = 0.0
         for block in self.blocks:
             if self.training:
@@ -212,13 +212,13 @@ class SparseMoELanguageModel(nn.Module):
                 x, entropy_loss = block(x)
             if use_entropy_reg and entropy_loss is not None:
                 total_entropy_loss += entropy_loss
-    
+
         x = self.ln_f(x)  # (B, 128 or T, n_embed)
         attn_scores = self.attn_pool_layer(x)  # (B, 128 or T, 1)
         attn_weights = F.softmax(attn_scores, dim=1)  # (B, 128 or T, 1)
         pooled = torch.sum(x * attn_weights, dim=1)  # (B, n_embed)
         output = self.regression_head(pooled).squeeze(-1)  # (B,)
-    
+
         loss = None
         if targets is not None:
             if targets.dim() == 2 and targets.size(1) == 1:
@@ -230,7 +230,7 @@ class SparseMoELanguageModel(nn.Module):
             loss = task_loss + config.LAMBDA_EBM * percent_complete * ebm_loss
             if use_entropy_reg:
                 loss += lambda_entropy * total_entropy_loss / len(self.blocks)
-        
+
         return output, ebm_energy, loss
 
     def get_embeddings(self, input_ids, pool=True):
