@@ -185,7 +185,7 @@ def main():
 
     tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name, model_max_length=8192)
     tokenizer.pad_token = tokenizer.eos_token
-
+    print("Tokenizer vocab size:", tokenizer.vocab_size)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         current_rank = torch.distributed.get_rank()
     else:
@@ -201,8 +201,7 @@ def main():
         # Use ZeRO.Init so parameters are sharded across GPUs from the start
         with zero.Init(config_dict_or_path=args.deepspeed_config):
             model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
-
-        logging.info(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f} million parameters")
+            logging.info(f"Pre-init local params: {sum(p.numel() for p in model.parameters())}")
 
         # Apply custom initialization if needed
         if initialized_from_scratch:
@@ -222,6 +221,12 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
+
+        local_params = sum(p.numel() for p in engine.module.parameters())
+        total_params = torch.tensor(local_params, device=device)
+        torch.distributed.all_reduce(total_params, op=torch.distributed.ReduceOp.SUM)
+        if rank == 0:
+            logging.info(f"Model has {total_params.item() / 1e6:.2f} million parameters")
 
         # Prepare data
         train_loader = prepare_dataloader(
