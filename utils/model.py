@@ -182,7 +182,8 @@ class SparseMoELanguageModel(nn.Module):
         )
         for m in self.ebm:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.weight is not None and m.weight.dim() >= 2:
+                    nn.init.xavier_uniform_(m.weight, gain=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
