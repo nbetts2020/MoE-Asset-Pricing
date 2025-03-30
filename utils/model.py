@@ -131,7 +131,7 @@ class Block(nn.Module):
 
 class PerceiverModule(nn.Module):
     """ Perceiver module with multiple cross-attention and self-attention layers """
-    def __init__(self, n_embed, num_latents, num_cross_attention_layers=4, num_self_attention_layers=4, latent_dim=None):
+    def __init__(self, n_embed, num_latents, num_cross_attention_layers=4, num_self_attention_layers=8, latent_dim=None):
         super().__init__()
         if latent_dim is None:
             latent_dim = n_embed
@@ -159,9 +159,9 @@ class PerceiverModule(nn.Module):
         return latents
 
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=128, num_cross_attention_layers=4, num_self_attention_layers=4, tokenizer_name="hf-internal-testing/llama-tokenizer"):
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=256, num_cross_attention_layers=4, num_self_attention_layers=8, tokenizer_name="hf-internal-testing/llama-tokenizer"):
         super().__init__()
-        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=8192)
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=config.CONTEXT_WINDOW)
         vocab_size = self.tokenizer.vocab_size
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
