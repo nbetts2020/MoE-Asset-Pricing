@@ -121,6 +121,8 @@ def main():
     parser.add_argument("--n_layer", type=int, help="Number of transformer blocks override")
     parser.add_argument("--block_size", type=int, help="Max sequence length override")
     parser.add_argument("--context_window", type=int, help="Max context window")
+    parser.add_argument("--self_attention_p", type=int, help="Perceiver self attention layers")
+    parser.add_argument("--cross_attention_p", type=int, help="Perceiver cross attention layers")
     parser.add_argument("--epochs", type=int, help="Number of training epochs override")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--deepspeed_config", type=str, default="utils/deepspeed_config.json",
@@ -169,6 +171,12 @@ def main():
     if args.context_window is not None:
         config.CONTEXT_WINDOW = args.context_window
         logging.info(f"Overriding batch_size to {config.CONTEXT_WINDOW}")
+    if args.self_attention_p is not None:
+        config.SELF_ATTENTION_P = args.self_attention_p
+        logging.info(f"Overriding batch_size to {config.SELF_ATTENTION_P}")
+    if args.cross_attention_p is not None:
+        config.CROSS_ATTENTION_P = args.cross_attention_p
+        logging.info(f"Overriding batch_size to {config.CROSS_ATTENTION_P}")
 
     local_rank = args.local_rank
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
