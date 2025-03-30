@@ -201,7 +201,6 @@ def main():
         # Use ZeRO.Init so parameters are sharded across GPUs from the start
         with zero.Init(config_dict_or_path=args.deepspeed_config):
             model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
-            logging.info(f"Pre-init local params: {sum(p.numel() for p in model.parameters())}")
 
         # Apply custom initialization if needed
         if initialized_from_scratch:
@@ -212,6 +211,11 @@ def main():
         adam_optimizer = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
+
+        # Get trainable parameters BEFORE DeepSpeed wrapping
+        model_params = [p for p in model.parameters() if p.requires_grad]
+        param_count = sum(p.numel() for p in model_params)
+        logging.info(f"Trainable parameters: {param_count}")
 
         # Initialize DeepSpeed Engine (ZeRO, etc.)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
