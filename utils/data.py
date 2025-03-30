@@ -44,7 +44,7 @@ class PrecomputedDataset(Dataset):
             text,
             truncation=True,
             padding="max_length",
-            max_length=8192,
+            max_length=config.CONTEXT_WINDOW,
             return_tensors="pt"
         )
         input_ids = encoding["input_ids"].squeeze(0)
