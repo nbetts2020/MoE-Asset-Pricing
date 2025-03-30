@@ -137,7 +137,7 @@ def main():
     # Handle small/test-mode hyperparameters
     if args.test_model:
         logging.info("Test Mode Activated: Using smaller hyperparameters for faster execution.")
-        config.EPOCHS = 15
+        config.EPOCHS = 1
         config.N_EMBED = 32
         config.N_HEAD = 4
         config.N_LAYER = 12
@@ -212,11 +212,6 @@ def main():
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
-        # Get trainable parameters BEFORE DeepSpeed wrapping
-        model_params = [p for p in model.parameters() if p.requires_grad]
-        param_count = sum(p.numel() for p in model_params)
-        logging.info(f"Trainable parameters: {param_count}")
-
         # Initialize DeepSpeed Engine (ZeRO, etc.)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
@@ -225,12 +220,6 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-
-        local_params = sum(p.numel() for p in engine.module.parameters())
-        total_params = torch.tensor(local_params, device=device)
-        torch.distributed.all_reduce(total_params, op=torch.distributed.ReduceOp.SUM)
-        if rank == 0:
-            logging.info(f"Model has {total_params.item() / 1e6:.2f} million parameters")
 
         # Prepare data
         train_loader = prepare_dataloader(
