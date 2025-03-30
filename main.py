@@ -120,6 +120,7 @@ def main():
     parser.add_argument("--n_head", type=int, help="Number of attention heads override")
     parser.add_argument("--n_layer", type=int, help="Number of transformer blocks override")
     parser.add_argument("--block_size", type=int, help="Max sequence length override")
+    parser.add_argument("--context_window", type=int, help="Max context window")
     parser.add_argument("--epochs", type=int, help="Number of training epochs override")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--deepspeed_config", type=str, default="utils/deepspeed_config.json",
@@ -165,6 +166,9 @@ def main():
     if args.batch_size is not None:
         config.BATCH_SIZE = args.batch_size
         logging.info(f"Overriding batch_size to {config.BATCH_SIZE}")
+    if args.context_window is not None:
+        config.CONTEXT_WINDOW = args.context_window
+        logging.info(f"Overriding batch_size to {config.CONTEXT_WINDOW}")
 
     local_rank = args.local_rank
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
