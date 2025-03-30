@@ -4,13 +4,19 @@
   "zero_optimization": {
     "stage": 3,
     "offload_optimizer": {
-      "device": "cpu"
+      "device": "cpu",
+      "pin_memory": true
     },
     "offload_param": {
-      "device": "cpu"
+      "device": "cpu",
+      "pin_memory": true
     },
     "overlap_comm": true,
-    "contiguous_gradients": true
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 5e8,
+    "stage3_prefetch_bucket_size": 5e8,
+    "stage3_param_persistence_threshold": 1e6,
+    "stage3_gather_16bit_weights_on_model_save": true
   },
   "activation_checkpointing": {
     "partition_activations": true,
@@ -22,5 +28,7 @@
   },
   "bf16": {
     "enabled": true
-  }
+  },
+  "steps_per_print": 50,
+  "wall_clock_breakdown": true
 }
