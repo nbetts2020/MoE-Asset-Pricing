@@ -9,6 +9,8 @@ class Config:
     N_LAYER = 24         # Number of transformer blocks
     BLOCK_SIZE = 4048    # Maximum sequence length during rl attention - not max context window
     CONTEXT_WINDOW = 16384
+    SELF_ATTENTION_P = 4
+    CROSS_ATTENTION_P = 4
     DROPOUT = 0.1        # Dropout rate
     NUM_EXPERTS = 4      # Number of experts in the MoE layer
     TOP_K = 2            # Number of experts to use per token
