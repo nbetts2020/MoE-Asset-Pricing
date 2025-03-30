@@ -123,6 +123,7 @@ def main():
     parser.add_argument("--context_window", type=int, help="Max context window")
     parser.add_argument("--self_attention_p", type=int, help="Perceiver self attention layers")
     parser.add_argument("--cross_attention_p", type=int, help="Perceiver cross attention layers")
+    parser.add_argument("--num_latents", type=int, help="Perceiver number of latents")
     parser.add_argument("--epochs", type=int, help="Number of training epochs override")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--deepspeed_config", type=str, default="utils/deepspeed_config.json",
@@ -177,6 +178,9 @@ def main():
     if args.cross_attention_p is not None:
         config.CROSS_ATTENTION_P = args.cross_attention_p
         logging.info(f"Overriding batch_size to {config.CROSS_ATTENTION_P}")
+    if args.num_latents is not None:
+        config.NUM_LATENTS = args.num_latents
+        logging.info(f"Overriding batch_size to {config.NUM_LATENTS}")
 
     local_rank = args.local_rank
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
