@@ -11,6 +11,7 @@ class Config:
     CONTEXT_WINDOW = 16384
     SELF_ATTENTION_P = 4
     CROSS_ATTENTION_P = 4
+    NUM_LATENTS = 256
     DROPOUT = 0.1        # Dropout rate
     NUM_EXPERTS = 4      # Number of experts in the MoE layer
     TOP_K = 2            # Number of experts to use per token
