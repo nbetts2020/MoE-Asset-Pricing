@@ -191,14 +191,11 @@ class SparseMoELanguageModel(nn.Module):
         B, T = input_ids.shape
         device = input_ids.device
         tok_emb = self.token_embedding_table(input_ids)
-        if T > self.block_size:
-            pos_indices = torch.arange(T, device=device) % self.block_size
-            pos_emb = self.position_embedding_table(pos_indices)
-            x = tok_emb + pos_emb.unsqueeze(0)
-            x = self.perceiver(x)  # (B, 128, n_embed)
-        else:
-            pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-            x = tok_emb + pos_emb.unsqueeze(0)  # (B, T, n_embed)
+        
+        pos_indices = torch.arange(T, device=device) % self.block_size
+        pos_emb = self.position_embedding_table(pos_indices)
+        x = tok_emb + pos_emb.unsqueeze(0)
+        x = self.perceiver(x)  # (B, 128, n_embed)
 
         # Compute EBM energy
         ebm_input = x.mean(dim=1)  # (B, n_embed)
