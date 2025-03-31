@@ -159,7 +159,7 @@ class PerceiverModule(nn.Module):
         return latents
 
 class SparseMoELanguageModel(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=config.NUM_LATENTS, num_cross_attention_layers=config.CROSS_ATTENTION_P, num_self_attention_layers=self.SELF_ATTENTION_P, tokenizer_name="hf-internal-testing/llama-tokenizer"):
+    def __init__(self, n_embed, n_head, n_layer, block_size, dropout, num_experts, top_k, num_latents=config.NUM_LATENTS, num_cross_attention_layers=config.CROSS_ATTENTION_P, num_self_attention_layers=config.SELF_ATTENTION_P, tokenizer_name="hf-internal-testing/llama-tokenizer"):
         super().__init__()
         self.tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name, model_max_length=config.CONTEXT_WINDOW)
         vocab_size = self.tokenizer.vocab_size
