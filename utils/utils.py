@@ -255,7 +255,8 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, rl_module, args,
                     input_ids = encoding["input_ids"]
                     with torch.no_grad():
                         with torch.cuda.amp.autocast():
-                            output, _, _ = model(input_ids=input_ids)  # Updated to handle 3 return values
+                            outputs = model(input_ids=input_ids)  # Now returns a dictionary
+                            output = outputs["output"]  # Extract the prediction
                     pred_value = output.item()
 
             except Exception as e:
