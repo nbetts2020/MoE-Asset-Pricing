@@ -33,7 +33,7 @@ def train_model(
       - Online Learning with SI (si)
       - Elastic Weight Consolidation (ewc)
       - Memory Replay Buffer (replay_buffer)
-      - EBM now integrated into model.forward()
+      - EBM and TinyTransformer integrated into model.forward(), with separate losses
       - DeepSpeed or standard PyTorch training
     Handles grad=None for sparse MoE models with DeepSpeed.
 
@@ -80,13 +80,26 @@ def train_model(
             labels = batch['labels'].to(device)
 
             with torch.amp.autocast('cuda', enabled=True):  # Updated for PyTorch 2.x
-                # Model now returns output, ebm_energy, and loss
-                output, ebm_energy, loss = model(
+                # Model now returns a dictionary with outputs and losses
+                outputs = model(
                     input_ids=input_ids,
                     targets=labels,
                     percent_complete=percent_complete,
-                    use_entropy_reg=args.use_entropy_reg  # Pass if needed
+                    use_entropy_reg=args.use_entropy_reg,
+                    lambda_entropy=args.lambda_entropy
                 )
+                # Extract components from the dictionary
+                output = outputs["output"]
+                ebm_energy = outputs["ebm_energy"]
+                task_loss = outputs["task_loss"]
+                tiny_loss = outputs["tiny_loss"]
+                ebm_loss = outputs["ebm_loss"]
+                entropy_loss = outputs["entropy_loss"]
+
+                # Combine losses into a total loss
+                loss = task_loss + tiny_loss + (config.LAMBDA_EBM * percent_complete * ebm_loss)
+                if args.use_entropy_reg:
+                    loss += entropy_loss
 
                 # Add L2 regularization if enabled
                 if args.use_l2:
@@ -121,25 +134,31 @@ def train_model(
                 running_avg_loss = batch_loss  # First batch initializes directly
             else:
                 running_avg_loss = alpha * running_avg_loss + (1 - alpha) * batch_loss
+
+            # Log batch details every 10 steps
             if step % 10 == 0:
                 logging.info(f"Outputs: {output[:5]}, Labels: {labels[:5]}, EBM Energy: {ebm_energy[:5]}")
-            # Log batch loss and running average
+                logging.info(f"Task Loss: {task_loss.item():.4f}, Tiny Loss: {tiny_loss.item():.4f}, "
+                            f"EBM Loss: {ebm_loss.item():.4f}, Entropy Loss: {entropy_loss.item():.4f}")
+
             logging.info(f"Epoch {epoch}, Batch {step + 1}/{total_batches}, "
                         f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
 
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
+                # Handle grad=None for sparse MoE parameters
                 for name, param in engine.module.named_parameters():
                     if param.requires_grad and param.grad is None:
                         param.grad = torch.zeros_like(param, device=device)
-                engine.step()  # This internally calls the optimizer's step
+                engine.step()  # Internally calls the optimizer's step
             else:
                 adam_optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 adam_optimizer.step()
 
+            # Update online learning components
             if args.use_si and si:
                 si.update_weights(model)
 
