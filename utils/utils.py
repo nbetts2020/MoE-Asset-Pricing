@@ -791,7 +791,7 @@ def initialize_model(args, device, init_from_scratch=False):
 
     return model, initialized_from_scratch
 
-def prepare_optimizer(model, args):
+def prepare_optimizers(model, args):
     LR_DECAY = config.LR_DECAY
     BASE_LR = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
@@ -801,12 +801,30 @@ def prepare_optimizer(model, args):
         return (
             'bias' in n
             or 'LayerNorm.weight' in n
-            or 'embedding_table' in n  # skip decay for embeddings as well
+            or 'embedding_table' in n  # skip decay for embeddings
         )
 
-    param_groups = []
+    optimizers = {}
 
-    # --- Embedding parameters ---
+    # --- TinyTransformer optimizer ---
+    tiny_params_with_decay = []
+    tiny_params_no_decay = []
+    for name, param in model.tiny_transformer.named_parameters():
+        if param.requires_grad:
+            if skip_weight_decay(name):
+                tiny_params_no_decay.append(param)
+            else:
+                tiny_params_with_decay.append(param)
+    tiny_param_groups = [
+        {'params': tiny_params_with_decay, 'lr': BASE_LR, 'weight_decay': weight_decay},
+        {'params': tiny_params_no_decay, 'lr': BASE_LR, 'weight_decay': 0.0}
+    ]
+    optimizers['tiny'] = DeepSpeedCPUAdam(tiny_param_groups)
+
+    # --- Main transformer optimizer with layer-wise decay ---
+    main_param_groups = []
+
+    # Embedding parameters
     embedding_params_with_decay = []
     embedding_params_no_decay = []
     for name, param in (
@@ -818,20 +836,18 @@ def prepare_optimizer(model, args):
                 embedding_params_no_decay.append(param)
             else:
                 embedding_params_with_decay.append(param)
-
-    # If you do NOT want embeddings to have an extra layer decay, just use base LR
-    param_groups.append({
+    main_param_groups.append({
         'params': embedding_params_with_decay,
         'lr': BASE_LR,
         'weight_decay': weight_decay
     })
-    param_groups.append({
+    main_param_groups.append({
         'params': embedding_params_no_decay,
         'lr': BASE_LR,
         'weight_decay': 0.0
     })
 
-    # --- Regression head parameters ---
+    # Regression head parameters
     reg_params_with_decay = []
     reg_params_no_decay = []
     for name, param in model.regression_head.named_parameters():
@@ -840,25 +856,22 @@ def prepare_optimizer(model, args):
                 reg_params_no_decay.append(param)
             else:
                 reg_params_with_decay.append(param)
-
-    param_groups.append({
+    main_param_groups.append({
         'params': reg_params_with_decay,
         'lr': BASE_LR,
         'weight_decay': weight_decay
     })
-    param_groups.append({
+    main_param_groups.append({
         'params': reg_params_no_decay,
         'lr': BASE_LR,
         'weight_decay': 0.0
     })
 
-    # --- Transformer blocks with layer-wise decay ---
+    # Transformer blocks with layer-wise decay
     num_blocks = len(model.blocks)
-    for layer_idx, block in enumerate(model.blocks):
-        # Higher layer_idx -> earlier block -> bigger decay exponent
+    for layer_idx, block in enumerate(model.keys):
         decay_factor = (LR_DECAY ** (num_blocks - 1 - layer_idx))
         block_lr = BASE_LR * decay_factor
-
         block_params_with_decay = []
         block_params_no_decay = []
         for name, param in block.named_parameters():
@@ -867,22 +880,35 @@ def prepare_optimizer(model, args):
                     block_params_no_decay.append(param)
                 else:
                     block_params_with_decay.append(param)
-
-        param_groups.append({
+        main_param_groups.append({
             'params': block_params_with_decay,
             'lr': block_lr,
             'weight_decay': weight_decay
         })
-        param_groups.append({
+        main_param_groups.append({
             'params': block_params_no_decay,
             'lr': block_lr,
             'weight_decay': 0.0
         })
 
-    # Use DeepSpeedCPUAdam with per-group LRs (omit the top-level "lr=" to avoid confusion)
-    optimizer = DeepSpeedCPUAdam(param_groups)
-    logging.info("Initialized DeepSpeedCPUAdam with layer-wise LR decay and per-group weight decay.")
-    return optimizer
+    optimizers['main'] = DeepSpeedCPUAdam(main_param_groups)
+
+    # --- EBM optimizer ---
+    ebm_params_with_decay = []
+    ebm_params_no_decay = []
+    for name, param in model.ebm.named_parameters():
+        if param.requires_grad:
+            if skip_weight_decay(name):
+                ebm_params_no_decay.append(param)
+            else:
+                ebm_params_with_decay.append(param)
+    ebm_param_groups = [
+        {'params': ebm_params_with_decay, 'lr': BASE_LR, 'weight_decay': weight_decay},
+        {'params': ebm_params_no_decay, 'lr': BASE_LR, 'weight_decay': 0.0}
+    ]
+    optimizers['ebm'] = DeepSpeedCPUAdam(ebm_param_groups)
+
+    return optimizers
     
 def initialize_si(model, args):
     """
