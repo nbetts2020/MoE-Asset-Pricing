@@ -29,7 +29,6 @@ class MultiHeadAttention(nn.Module):
         qkv = qkv.reshape(B * T, 3, self.n_head, self.head_size)
         cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
         max_seqlen = T
-        # Always request full attention outputs for consistent shape.
         outputs = flash_attn_unpadded_qkvpacked_func(
             qkv, cu_seqlens, max_seqlen,
             dropout_p=config.DROPOUT, softmax_scale=None, causal=False,
@@ -58,7 +57,6 @@ class NoisyTopkRouter(nn.Module):
         self.top_k = top_k
         self.topkroute_linear = nn.Linear(n_embed, num_experts)
         self.noise_linear = nn.Linear(n_embed, num_experts)
-
     def forward(self, mh_output):
         logits = self.topkroute_linear(mh_output)
         noise_logits = self.noise_linear(mh_output)
@@ -93,7 +91,6 @@ class SparseMoE(nn.Module):
             expert_mask = (indices == i).any(dim=-1).view(-1)
             selected_indices = torch.nonzero(expert_mask).squeeze(-1)
             limited_indices = selected_indices[:expert_capacity]
-            print(f"[SparseMoE] Expert {i} selected {limited_indices.numel()} tokens")
             if limited_indices.numel() > 0:
                 expert_out = expert(flat_x[limited_indices])
                 gating = flat_router_output[limited_indices, i].unsqueeze(1)
@@ -141,8 +138,13 @@ class TinyTransformer(nn.Module):
         x = self.ln(x)
         pooled = x.mean(dim=1)
         output = self.regression_head(pooled)
-        # Return per-token attention scores
-        attn_scores = full_attn.sum(dim=2)  # (B, T)
+        # Process full_attn to produce per-token attention scores of shape (B, T)
+        if full_attn.dim() == 4:  # shape: (B, 1, T, T)
+            attn_scores = full_attn.squeeze(1).sum(dim=-1)  # -> (B, T)
+        elif full_attn.dim() == 3:  # shape: (B, 1, T)
+            attn_scores = full_attn.squeeze(1)             # -> (B, T)
+        else:
+            attn_scores = full_attn  # Assume already (B, T)
         print(f"[TinyTransformer] attn_scores: {attn_scores.shape}")
         return output, attn_scores
 
@@ -157,13 +159,9 @@ def pool_topk(token_embs, token_scores, indices, k):
     """
     cluster_scores = token_scores[indices]
     k = min(k, len(indices))
-
-    # Get top-k indices by attention score within this cluster
     topk_vals, topk_idx = torch.topk(cluster_scores, k=k)
     chosen_embs = token_embs[indices[topk_idx]]  # shape: (k, D)
-    # Weight them by softmax of their scores
     weights = F.softmax(topk_vals, dim=0).unsqueeze(1)  # (k, 1)
-    # Weighted average => single embedding
     pooled = (chosen_embs * weights).sum(dim=0, keepdim=True)  # (1, D)
     return pooled
 
@@ -184,6 +182,12 @@ class SparseMoELanguageModel(nn.Module):
 
     @staticmethod
     def fast_cluster(attn_scores, max_cluster_size=4096, min_clusters=4, max_clusters=8, device='cuda'):
+        """
+        Clusters the attention scores (shape B, T) into segments and returns
+        cluster labels.
+        """
+        if attn_scores.dim() > 2:
+            attn_scores = attn_scores.squeeze(1)   # ensure shape (B, T)
         print(f"[fast_cluster] attn_scores: {attn_scores.shape}")
         B, T = attn_scores.shape
         labels = torch.zeros_like(attn_scores, dtype=torch.long)
@@ -201,7 +205,7 @@ class SparseMoELanguageModel(nn.Module):
                 end = min(start + min(size, max_cluster_size), T)
                 boundaries.append(end)
                 start = end
-                if start >= T: 
+                if start >= T:
                     break
 
             refined = [0]
@@ -212,7 +216,7 @@ class SparseMoELanguageModel(nn.Module):
                     window_scores = seq_scores[current:window_end]
                     split_idx = torch.argmin(window_scores[1:]) + 1 + current
                     refined.append(
-                        split_idx.item() 
+                        split_idx.item()
                         if (split_idx - current <= max_cluster_size and window_end - split_idx <= max_cluster_size)
                         else window_end
                     )
@@ -228,103 +232,96 @@ class SparseMoELanguageModel(nn.Module):
                         current = next_boundary
 
             for i in range(len(refined) - 1):
-                labels[b, refined[i] : refined[i + 1]] = i
+                labels[b, refined[i]:refined[i + 1]] = i
 
         print(f"[fast_cluster] labels: {labels.shape}")
         return labels
 
     def preprocess_input(self, input_ids):
-        """
-        Instead of returning token IDs, this version applies the tiny transformer to get
-        attention scores, clusters the sequence, then does top-k pooling per cluster to
-        produce (B, block_size, n_embed) compressed embeddings.
-        """
         print(f"[preprocess_input] input_ids: {input_ids.shape}")
         B, T = input_ids.shape
         device = input_ids.device
 
-        # If short, just embed and pad
-        if T <= self.block_size:
-            print("[preprocess_input] Padding short seq")
-            tok_emb = self.token_embedding_table(input_ids)
-            if T < self.block_size:
-                pad = torch.zeros(B, self.block_size - T, tok_emb.size(-1), device=device)
-                return torch.cat([tok_emb, pad], dim=1)
-            return tok_emb
+        # Compute true lengths
+        pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+        non_pad_mask = (input_ids != pad_id)
+        true_lengths = non_pad_mask.to(torch.int64).sum(dim=1)
+        max_length = true_lengths.max().item()
+        print(f"[preprocess_input] True lengths: {true_lengths}")
 
-        # Get token-level attention scores from the tiny transformer
-        _, attn_scores = self.tiny_transformer(input_ids)  # (B, T)
-        print(f"[preprocess_input] attn_scores: {attn_scores.shape}")
+        if max_length <= self.block_size:
+            print("[preprocess_input] All sequences are <= block_size")
+            new_emb_list = []
+            for b in range(B):
+                seq_len = true_lengths[b].item()
+                sample_emb = self.token_embedding_table(input_ids[b, :seq_len])
+                if seq_len < self.block_size:
+                    pad_amount = self.block_size - seq_len
+                    pad_emb = torch.zeros(pad_amount, sample_emb.size(-1), device=device)
+                    sample_emb = torch.cat([sample_emb, pad_emb], dim=0)
+                new_emb_list.append(sample_emb.unsqueeze(0))
+            return torch.cat(new_emb_list, dim=0)
 
-        # Cluster tokens with fast_cluster
-        labels = self.fast_cluster(
-            attn_scores, max_cluster_size=4096, min_clusters=4, max_clusters=8, device=device
-        )
-
-        compressed_embeddings = []
+        compressed_list = []
         for b in range(B):
-            token_embs = self.token_embedding_table(input_ids[b])  # (T, n_embed)
-            token_scores = attn_scores[b]  # (T,)
-            labels_b = labels[b]  # (T,)
-            unique_labels = torch.unique(labels_b)
+            seq_len = true_lengths[b].item()
+            sliced_ids = input_ids[b, :seq_len].unsqueeze(0)
+            _, attn_scores = self.tiny_transformer(sliced_ids)
+            attn_scores = attn_scores.squeeze(0)[:seq_len]  # Trim to true length
+            attn_scores_batch = attn_scores.unsqueeze(0)
+            labels = self.fast_cluster(attn_scores_batch, max_cluster_size=4096, min_clusters=4, max_clusters=8, device=device)
+            labels_b = labels[0, :seq_len]  # Ensure labels match seq_len
 
-            # Calculate how many pooled embeddings to allocate per cluster
-            cluster_means = []
-            cluster_sizes = []
-            for label in unique_labels:
-                mask = (labels_b == label)
-                cluster_sizes.append(mask.sum().item())
-                cluster_means.append(token_scores[mask].mean())
+            token_embs = self.token_embedding_table(sliced_ids.squeeze(0))
+            unique_labels = torch.unique(labels_b)
+            cluster_means = [attn_scores[labels_b == label].mean() for label in unique_labels]
             cluster_means = torch.stack(cluster_means)
-            ratios = F.softmax(cluster_means, dim=0)
+            temperature = 2.0
+            ratios = F.softmax(cluster_means / temperature, dim=0)
+            if seq_len > self.block_size and (ratios > 0.01).sum() < 2:
+                ratios = torch.clamp(ratios, min=0.1)
+                ratios = ratios / ratios.sum()
             target_sizes = (ratios * self.block_size).long()
-            # Make sure the total sums up to block_size
             target_sizes[-1] = self.block_size - target_sizes[:-1].sum()
 
-            # For each cluster, pick top-k tokens and pool them
-            pooled_list = []
+            print(f"[preprocess_input] Sample {b} (length: {seq_len}):")
+            print(f"  Ratios: {ratios}")
+            print(f"  Target sizes: {target_sizes}")
+
+            pooled_pieces = []
             for i, label in enumerate(unique_labels):
                 mask = (labels_b == label)
                 indices = torch.nonzero(mask).squeeze(-1)
                 if indices.numel() == 0:
                     continue
                 indices, _ = torch.sort(indices)
-
                 tsize = target_sizes[i].item()
-                # Ensure we at least pool 1 token if possible
-                tsize = max(1, min(tsize, indices.numel()))
+                if tsize <= 1:
+                    continue
+                tsize = min(tsize, indices.numel())
+                print(f"Cluster {i}: label={label}, indices={indices}, tsize={tsize}")
+                cluster_pooled = pool_topk(token_embs, attn_scores, indices, tsize)
+                print(f"Pooled shape: {cluster_pooled.shape}")
+                pooled_pieces.append((indices[0].item(), cluster_pooled))
 
-                # Instead of segmenting, use top-k approach
-                cluster_pooled = pool_topk(token_embs, token_scores, indices, tsize)  # (1, n_embed)
-                pooled_list.append((indices[0].item(), cluster_pooled))  # Keep track for ordering
-
-                print(f"[preprocess_input] Batch {b} - Label {label.item()} pooled top-{tsize} tokens")
-
-            # Sort by the first token position so final reassembly respects original order
-            pooled_list = sorted(pooled_list, key=lambda x: x[0])
-            cat_pooled = torch.cat([p for _, p in pooled_list], dim=0) if pooled_list else \
+            cat_pooled = torch.cat([p for _, p in pooled_pieces], dim=0) if pooled_pieces else \
                          torch.empty(0, token_embs.size(-1), device=device)
-
-            # Now pad or truncate to block_size
             L = cat_pooled.size(0)
             if L < self.block_size:
-                pad = torch.zeros(self.block_size - L, token_embs.size(-1), device=device)
-                cat_pooled = torch.cat([cat_pooled, pad], dim=0)
+                pad_emb = torch.zeros(self.block_size - L, token_embs.size(-1), device=device)
+                cat_pooled = torch.cat([cat_pooled, pad_emb], dim=0)
             elif L > self.block_size:
-                cat_pooled = cat_pooled[: self.block_size]
-
-            compressed_embeddings.append(cat_pooled.unsqueeze(0))
-
-        compressed_embeddings = torch.cat(compressed_embeddings, dim=0)  # (B, block_size, n_embed)
+                cat_pooled = cat_pooled[:self.block_size]
+            compressed_list.append(cat_pooled.unsqueeze(0))
+        compressed_embeddings = torch.cat(compressed_list, dim=0)
         print(f"[preprocess_input] Compressed shape: {compressed_embeddings.shape}")
         return compressed_embeddings
 
-    def forward(self, input_ids, targets=None, use_entropy_reg=False, lambda_entropy=0.01, percent_complete=0.0):
+    def forward(self, input_ids, targets=None, use_entropy_reg=False, lambda_entropy=1e-2, percent_complete=0.0):
         print(f"[SMELM] input_ids: {input_ids.shape}")
         B, T = input_ids.shape
         device = input_ids.device
 
-        # If longer than block_size, compute an auxiliary loss from the tiny transformer
         tiny_loss = 0.0
         if T > self.block_size:
             print("[SMELM] Running TinyTransformer for loss")
@@ -334,12 +331,10 @@ class SparseMoELanguageModel(nn.Module):
                 tiny_loss = F.mse_loss(tiny_output.squeeze(-1), targets)
             print(f"[SMELM] Tiny loss: {tiny_loss.item()}")
 
-        # Compress the input to block_size embeddings
         comp_emb = self.preprocess_input(input_ids)  # (B, block_size, n_embed)
         pos_emb = self.position_embedding_table(torch.arange(comp_emb.size(1), device=device))
         x = comp_emb + pos_emb
 
-        # Pass through MoE blocks
         ent_loss_sum = 0.0
         for idx, block in enumerate(self.blocks):
             x, ent_loss = checkpoint(block, x, use_reentrant=False) if self.training else block(x)
@@ -351,20 +346,14 @@ class SparseMoELanguageModel(nn.Module):
         ebm_energy = self.ebm(embeddings)
         output = self.regression_head(embeddings).squeeze(-1)
 
-        # Compute final loss if targets are given
         if targets is not None:
             targets = targets.squeeze(1) if (targets.dim() == 2 and targets.size(1) == 1) else targets
             task_loss = F.mse_loss(output, targets, reduction='none').mean()
-
-            # EBM loss
             raw_mse = F.mse_loss(output, targets, reduction='none').detach()
             ebm_loss = F.mse_loss(ebm_energy, raw_mse)
-
             loss = task_loss + tiny_loss + config.LAMBDA_EBM * percent_complete * ebm_loss
-
             if use_entropy_reg and ent_loss_sum is not None:
                 loss += lambda_entropy * ent_loss_sum / len(self.blocks)
-
             print(f"[SMELM] Loss: {loss.item()}")
         else:
             loss = None
