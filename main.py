@@ -397,7 +397,8 @@ def main():
                 )
                 with torch.no_grad():
                     # DeepSpeed automatically handles GPU placement, so just pass CPU tensors
-                    output, _, _ = model(input_ids=tokens["input_ids"])
+                    outputs = model(input_ids=tokens["input_ids"])
+                    output = outputs["output"]
                 print(f"Predicted Price: {output.item()}")
 
         else:
