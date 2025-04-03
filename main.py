@@ -224,14 +224,14 @@ def main():
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
 
         # Prepare optimizer
-        adam_optimizer = prepare_optimizer(model, args)
+        optimizers = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
 
         # Initialize DeepSpeed Engine (ZeRO, etc.)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
-            optimizer=adam_optimizer,
+            optimizer=optimizers["main"],
             model_parameters=model.parameters(),
             config=args.deepspeed_config
         )
@@ -252,7 +252,7 @@ def main():
         # Train
         train_model(
             model=engine,
-            optimizer=adam_optimizer,
+            optimizer=optimizers,
             epochs=config.EPOCHS,
             device=device,
             dataloader=train_loader,
@@ -282,7 +282,7 @@ def main():
         model.eval()
         logging.info("Main transformer model loaded from S3.")
 
-        adam_optimizer = prepare_optimizer(model, args)
+        optimizers = prepare_optimizer(model, args)
         if args.use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -297,7 +297,7 @@ def main():
         # Fine-tune or "update" the model
         train_model(
             model=model,
-            optimizer=adam_optimizer,
+            optimizer=optimizers,
             epochs=config.EPOCHS,
             device=device,
             dataloader=update_dataloader,
