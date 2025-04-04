@@ -1,4 +1,4 @@
-*will be updated soon*
+*will be updated soon to reflect new latent attention mechanisms*
 
 # Natural Language for Asset Pricing
 
