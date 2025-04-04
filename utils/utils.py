@@ -792,7 +792,7 @@ def initialize_model(args, device, init_from_scratch=False):
 
     return model, initialized_from_scratch
 
-def prepare_optimizers(model, args):
+def prepare_optimizer(model, args):
     LR_DECAY = config.LR_DECAY
     BASE_LR = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
