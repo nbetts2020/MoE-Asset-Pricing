@@ -797,7 +797,7 @@ def prepare_optimizer(model, args):
     BASE_LR = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
 
-    # Helper function to decide if a param should skip weight decay
+    # Helper: decide if a parameter should skip weight decay
     def skip_weight_decay(n):
         return (
             'bias' in n
@@ -868,9 +868,9 @@ def prepare_optimizer(model, args):
         'weight_decay': 0.0
     })
 
-    # Transformer blocks with layer-wise decay
+    # Transformer blocks with layer-wise decay using model.blocks
     num_blocks = len(model.blocks)
-    for layer_idx, block in enumerate(model.keys):
+    for layer_idx, block in enumerate(model.blocks):
         decay_factor = (LR_DECAY ** (num_blocks - 1 - layer_idx))
         block_lr = BASE_LR * decay_factor
         block_params_with_decay = []
