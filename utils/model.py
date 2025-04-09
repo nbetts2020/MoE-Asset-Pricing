@@ -223,7 +223,7 @@ class BucketTransformerAggregator(nn.Module):
         self.bucket_centers = nn.Parameter(
             torch.linspace(min_val, max_val, steps=num_buckets), requires_grad=False
         )  # shape (24,), non-trainable
-        
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=n_embed,
             nhead=n_head,
@@ -233,7 +233,7 @@ class BucketTransformerAggregator(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.logits_head = nn.Linear(n_embed, num_buckets)
-        
+
         # Attention vector for pooling
         self.attn_vector = nn.Parameter(torch.randn(n_embed))
 
