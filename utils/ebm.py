@@ -16,11 +16,14 @@ class EnergyBasedModel(nn.Module):
         self.temperature = temperature
 
         # Initialize weights with small gains for stability.
-        for m in self.fc:
+        for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                # Only apply Xavier if weight is at least 2D
+                if m.weight.dim() >= 2:
+                    nn.init.xavier_uniform_(m.weight, gain=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
 
     def forward(self, full_embedding):
         """
