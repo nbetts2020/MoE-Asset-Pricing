@@ -848,26 +848,6 @@ def prepare_optimizer(model, args):
         'weight_decay': 0.0
     })
 
-    # Regression head parameters
-    reg_params_with_decay = []
-    reg_params_no_decay = []
-    for name, param in model.regression_head.named_parameters():
-        if param.requires_grad:
-            if skip_weight_decay(name):
-                reg_params_no_decay.append(param)
-            else:
-                reg_params_with_decay.append(param)
-    main_param_groups.append({
-        'params': reg_params_with_decay,
-        'lr': BASE_LR,
-        'weight_decay': weight_decay
-    })
-    main_param_groups.append({
-        'params': reg_params_no_decay,
-        'lr': BASE_LR,
-        'weight_decay': 0.0
-    })
-
     # Transformer blocks with layer-wise decay using model.blocks
     num_blocks = len(model.blocks)
     for layer_idx, block in enumerate(model.blocks):
