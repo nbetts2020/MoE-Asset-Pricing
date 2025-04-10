@@ -825,7 +825,7 @@ def prepare_optimizer(model, args):
     # --- Main transformer optimizer with layer-wise decay ---
     main_param_groups = []
 
-    # Embedding parameters
+    # Embedding parameters: token and positional embeddings
     embedding_params_with_decay = []
     embedding_params_no_decay = []
     for name, param in (
@@ -848,7 +848,7 @@ def prepare_optimizer(model, args):
         'weight_decay': 0.0
     })
 
-    # Transformer blocks with layer-wise decay using model.blocks
+    # Transformer blocks with layer-wise decay
     num_blocks = len(model.blocks)
     for layer_idx, block in enumerate(model.blocks):
         decay_factor = (LR_DECAY ** (num_blocks - 1 - layer_idx))
@@ -871,6 +871,27 @@ def prepare_optimizer(model, args):
             'lr': block_lr,
             'weight_decay': 0.0
         })
+
+    # Extra modules from the main model: ln_f, high_attn_pool, regression_head, and soft_cluster
+    extra_params_with_decay = []
+    extra_params_no_decay = []
+    for module in [model.ln_f, model.high_attn_pool, model.regression_head, model.soft_cluster]:
+        for name, param in module.named_parameters():
+            if param.requires_grad:
+                if skip_weight_decay(name):
+                    extra_params_no_decay.append(param)
+                else:
+                    extra_params_with_decay.append(param)
+    main_param_groups.append({
+        'params': extra_params_with_decay,
+        'lr': BASE_LR,
+        'weight_decay': weight_decay
+    })
+    main_param_groups.append({
+        'params': extra_params_no_decay,
+        'lr': BASE_LR,
+        'weight_decay': 0.0
+    })
 
     optimizers['main'] = DeepSpeedCPUAdam(main_param_groups)
 
