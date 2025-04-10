@@ -14,6 +14,65 @@ from utils.ebm import EnergyBasedModel  # Assuming ebm.py is in the same directo
 cuda_available = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 #############################################
+# Minimal RoPE Helper
+#############################################
+def build_sin_cos(seq_len, dim, device, base=10000.0):
+    """
+    Build sine/cosine curves for minimal RoPE.
+    seq_len: maximum sequence length
+    dim: half of the head dimension (since we chunk in 2)
+    device: torch device
+    base: RoPE base frequency
+    Returns:
+      sin, cos => shape (seq_len, dim)
+    """
+    position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)  # (T, 1)
+    div_term = torch.exp(
+        torch.arange(0, dim * 2, 2, dtype=torch.float, device=device)
+        * (-math.log(base) / (dim * 2))
+    )  # shape (dim,)
+    # broadcast => (T, dim)
+    sin = torch.sin(position * div_term)
+    cos = torch.cos(position * div_term)
+    return sin, cos
+
+
+def apply_rope(q, k, sin, cos):
+    """
+    Applies rotary embeddings to q, k in a minimal way.
+    q, k => (B, T, n_head, head_size)
+    sin, cos => (T, head_size//2)
+    We split each vector in half: x[:,:,:, :D] and x[:,:,:, D:].
+    Then rotate those halves according to the RoPE formula.
+    """
+    B, T, n_head, head_size = q.shape
+    half = head_size // 2
+
+    # Slice out first/second half
+    # q1, q2 => (B, T, n_head, half)
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+
+    # Expand sin, cos for broadcast
+    # sin, cos => (T, half) => (1, T, 1, half)
+    sin_ = sin.unsqueeze(0).unsqueeze(2)
+    cos_ = cos.unsqueeze(0).unsqueeze(2)
+
+    # Apply rotation
+    q_out_1 = q1 * cos_ - q2 * sin_
+    q_out_2 = q2 * cos_ + q1 * sin_
+    k_out_1 = k1 * cos_ - k2 * sin_
+    k_out_2 = k2 * cos_ + k1 * sin_
+
+    # Recombine
+    q_rotated = torch.cat([q_out_1, q_out_2], dim=-1)
+    k_rotated = torch.cat([k_out_1, k_out_2], dim=-1)
+
+    return q_rotated, k_rotated
+
+#############################################
 # MultiHeadAttention
 #############################################
 class MultiHeadAttention(nn.Module):
@@ -25,12 +84,43 @@ class MultiHeadAttention(nn.Module):
         self.qkv_proj = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.out_proj = nn.Linear(n_embed, n_embed, bias=False)
 
+        # We assume a fixed max block size or chunk size
+        # For safety, pick something >= your max T
+        self.max_seq_len = 2048
+        # Build sin/cos for minimal rope
+        # shape => (max_seq_len, head_size//2)
+        sin, cos = build_sin_cos(self.max_seq_len, self.head_size // 2, device='cpu')
+        self.register_buffer('rope_sin', sin, persistent=False)
+        self.register_buffer('rope_cos', cos, persistent=False)
+
     def forward(self, x, return_attn_probs=False):
         B, T, C = x.size()
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(B, T, 3, self.n_head, self.head_size).permute(0, 2, 1, 3, 4)
-        qkv = qkv.reshape(B * T, 3, self.n_head, self.head_size)
 
+        # 1) Project to Q,K,V
+        qkv = self.qkv_proj(x)  # (B, T, 3*C)
+        # Reshape => (B, T, 3, n_head, head_size)
+        qkv_reshape = qkv.view(B, T, 3, self.n_head, self.head_size)
+
+        # 2) Extract Q, K, V
+        q = qkv_reshape[:, :, 0, :, :]  # (B, T, n_head, head_size)
+        k = qkv_reshape[:, :, 1, :, :]
+        v = qkv_reshape[:, :, 2, :, :]
+
+        # 3) Apply minimal RoPE to Q, K
+        # Make sure we slice rope_sin, rope_cos to length T
+        sin_t = self.rope_sin[:T, :]
+        cos_t = self.rope_cos[:T, :]
+        q, k = apply_rope(q, k, sin_t, cos_t)
+
+        # 4) Put them back
+        qkv_reshape[:, :, 0, :, :] = q
+        qkv_reshape[:, :, 1, :, :] = k
+        qkv_reshape[:, :, 2, :, :] = v
+
+        # 5) Flatten => shape (B*T, 3, n_head, head_size)
+        qkv = qkv_reshape.view(B * T, 3, self.n_head, self.head_size)
+
+        # 6) Use FlashAttn
         cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
         max_seqlen = T
 
@@ -40,11 +130,16 @@ class MultiHeadAttention(nn.Module):
             return_attn_probs=True
         )
         attn_output, attn_probs, full_attn = outputs
+
+        # 7) Reshape back => (B, T, n_head, head_size) => (B, T, C)
         attn_output = attn_output.view(B, T, self.n_head, self.head_size)\
                                  .permute(0, 2, 1, 3).reshape(B, T, C)
         out = self.out_proj(attn_output)
 
-        return (out, attn_probs, full_attn) if return_attn_probs else out
+        if return_attn_probs:
+            return out, attn_probs, full_attn
+        else:
+            return out
 
 
 #############################################
@@ -208,64 +303,33 @@ class SoftClusteringModule(nn.Module):
 
 
 #############################################
-# BucketTransformerAggregator
+# HighDimAttentionPooling (New Aggregator)
 #############################################
-class BucketTransformerAggregator(nn.Module):
+class HighDimAttentionPooling(nn.Module):
     """
-    Single layer aggregator for regression with 24 discrete buckets
-    from 0..11. Transforms each (B, T, E) sequence into a single
-    embedding using attention pooling, produces 24 logits, softmax them,
-    then computes the weighted sum (expected value) across bucket centers.
+    Implements single-query attention pooling.
+    This module learns a query vector to attend over the transformer outputs and then
+    projects the pooled vector to a high-dimensional representation (e.g. 32k).
     """
-    def __init__(self, n_embed, n_head, num_layers=2, dropout=0.1, num_buckets=24, min_val=0.0, max_val=11.0):
+    def __init__(self, embed_dim, high_dim=32000):
         super().__init__()
-        self.num_buckets = num_buckets
-        self.bucket_centers = nn.Parameter(
-            torch.linspace(min_val, max_val, steps=num_buckets), requires_grad=False
-        )  # shape (24,), non-trainable
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=n_embed,
-            nhead=n_head,
-            dim_feedforward=4 * n_embed,
-            dropout=dropout,
-            batch_first=False
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.logits_head = nn.Linear(n_embed, num_buckets)
-
-        # Attention vector for pooling
-        self.attn_vector = nn.Parameter(torch.randn(n_embed))
+        self.q = nn.Parameter(torch.randn(1, embed_dim))
+        self.proj = nn.Linear(embed_dim, high_dim)
 
     def forward(self, x):
-        """
-        x: (B, T, E)
-        Returns:
-          output: (B,) expected value from bucket centers
-          final embeddings: (B, T, E)
-        """
+        # x: (B, T, embed_dim)
         B, T, E = x.shape
-        x_t = x.permute(1, 0, 2)  # (T, B, E)
-        encoded = self.encoder(x_t)  # (T, B, E)
-        x_out = encoded.permute(1, 0, 2)  # (B, T, E)
+        # Expand q for all items in the batch
+        q_expanded = self.q.expand(B, -1).unsqueeze(1)  # (B, 1, E)
+        # Compute attention scores: (B, 1, T)
+        attn_scores = torch.bmm(q_expanded, x.transpose(1, 2)) / math.sqrt(E)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        # Weighted sum of x based on attention weights -> (B, E)
+        pooled = torch.bmm(attn_weights, x).squeeze(1)
+        # Project to high-dimensional space (e.g. 32k)
+        high_dim_vector = self.proj(pooled)
+        return high_dim_vector
 
-        # Attention pooling (instead of mean pooling)
-        # Compute attention scores and weights across T
-        attn_scores = torch.matmul(x_out, self.attn_vector)  # (B, T)
-        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # (B, T, 1)
-        pooled = (x_out * attn_weights).sum(dim=1)  # (B, E)
-
-        # Produce logits => shape (B, 24)
-        logits = self.logits_head(pooled)
-
-        # Convert to probabilities
-        probs = F.softmax(logits, dim=-1)  # (B, 24)
-
-        # Expected value => sum_{i=1..24} [ prob[i] * bucket_center[i] ]
-        bucket_centers = self.bucket_centers.unsqueeze(0).to(pooled.device)  # (1, 24)
-        output = (probs * bucket_centers).sum(dim=-1)  # (B,)
-
-        return output, x_out
 
 #############################################
 # Updated SparseMoELanguageModel
@@ -285,16 +349,10 @@ class SparseMoELanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embed)
         self.block_size = block_size
 
-        # Use the new 24-bucket aggregator
-        self.final_aggregator = BucketTransformerAggregator(
-            n_embed=n_embed,
-            n_head=n_head,
-            num_layers=2,
-            dropout=dropout,
-            num_buckets=24,    # you can tweak
-            min_val=0.0,       # if your logged scale is 0..11
-            max_val=11.0
-        )
+        # Remove BucketTransformerAggregator and use HighDimAttentionPooling instead.
+        self.high_attn_pool = HighDimAttentionPooling(n_embed, high_dim=32768)
+        # New regression head for the high-dimensional vector.
+        self.regression_head = nn.Linear(32768, 1)
 
         self.ebm = EnergyBasedModel(n_embed)
 
@@ -383,11 +441,12 @@ class SparseMoELanguageModel(nn.Module):
         # 5) final LN
         x = self.ln_f(x)
 
-        # 6) aggregator => produces distribution over 24 buckets => expected value
-        output, final_embeddings = self.final_aggregator(x)
+        # 6) Use high-dimensional attention pooling for regression.
+        high_dim_vector = self.high_attn_pool(x)  # (B, 32000)
+        output = self.regression_head(high_dim_vector)
 
-        # 7) EBM
-        ebm_input = final_embeddings.mean(dim=1)
+        # 7) EBM input remains as the mean of x over tokens.
+        ebm_input = x.mean(dim=1)
         ebm_energy = self.ebm(ebm_input)
 
         # 8) compute losses
@@ -420,8 +479,10 @@ class SparseMoELanguageModel(nn.Module):
         for idx, block in enumerate(self.blocks):
             x, _ = block(x)
         x = self.ln_f(x)
-        _, final_embeddings = self.final_aggregator(x)
+        # Use the high-dimensional pooled vector as the final embedding.
+        high_dim_vector = self.high_attn_pool(x)
         if return_tokenwise:
-            return final_embeddings
+            # Optionally, you might return the token-level outputs (x) if needed
+            return x
         else:
-            return final_embeddings.mean(dim=1)
+            return high_dim_vector
