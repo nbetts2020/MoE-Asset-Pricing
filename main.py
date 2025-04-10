@@ -12,7 +12,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import deepspeed
 from transformers import AutoTokenizer, LlamaTokenizerFast
 
-from utils.model import SparseMoELanguageModel, BucketTransformerAggregator
+from utils.model import SparseMoELanguageModel
 from utils.train import train_model
 from utils.test import test_forgetting
 from utils.metrics import OnlineMetrics
@@ -227,13 +227,6 @@ def main():
         optimizers = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
-
-        self.final_aggregator = BucketTransformerAggregator(
-            n_embed=n_embed,
-            n_head=n_head,
-            num_layers=2,
-            dropout=dropout
-        )
 
         # Initialize DeepSpeed Engine (ZeRO, etc.)
         engine, engine_optimizer, _, _ = deepspeed.initialize(
