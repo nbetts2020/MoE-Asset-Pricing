@@ -12,6 +12,7 @@ from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
+from deepspeed.runtime.zero.stage3 import GatheredParameters
 
 def train_model(
     model,
@@ -69,11 +70,19 @@ def train_model(
             percent_complete = current_step / pretrain_total_steps
 
             print(f"[Pretrain] Processing batch {step + 1}/{total_batches}")
-
             input_ids = batch['input_ids'].to(device)
-            # In pretraining, labels are the same as input_ids for next-token prediction.
-            with torch.amp.autocast('cuda', enabled=True):
-                loss = model.forward_next_token(input_ids, reduction="mean")
+
+            # In pretraining, use the next-token prediction branch.
+            # Fix for CCE data type mismatch in DeepSpeed ZeRO-3
+            # Explicitly handle parameter gathering and precision for CCE compatibility
+            with torch.amp.autocast('cuda', enabled=False):
+                # Gather distributed parameters
+                with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
+                    # Explicitly convert to BF16 which CCE's backward pass requires
+                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
+
+                    # Forward in BF16 mode - no autocast, explicit conversion
+                    loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
 
             batch_loss = loss.item()
             epoch_loss += batch_loss
@@ -85,6 +94,45 @@ def train_model(
             if step % 10 == 0:
                 logging.info(f"[Pretrain] Epoch {epoch}, Batch {step + 1}/{total_batches}, "
                              f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
+                # --- Debug Block: Print token-level info without EOS padding ---
+                model.eval()
+                with torch.no_grad():
+                    B, T = input_ids.shape
+                    # Use right slicing to get the relevant block.
+                    if T > model.block_size:
+                        input_ids_trim = input_ids[:, -model.block_size:]
+                        T_trim = model.block_size
+                    else:
+                        input_ids_trim = input_ids
+                        T_trim = T
+                    # Compute an attention mask (1 for non-pad tokens, 0 for pad tokens).
+                    pad_id = int(model.tokenizer.pad_token_id or model.tokenizer.eos_token_id)
+                    attn_mask = (input_ids_trim != pad_id)
+                    # Now forward through the embedding layers.
+                    tok_emb = model.token_embedding_table(input_ids_trim)
+                    pos_emb = model.position_embedding_table(torch.arange(T_trim, device=device))
+                    x = tok_emb + pos_emb
+                    for block in model.blocks:
+                        x, _ = block(x, attn_mask)
+                    x = model.ln_f(x)
+                    # Shift: tokens 0..T_trim-1 used to predict tokens 1..T_trim.
+                    shift_embeddings = x[:, :-1, :].reshape(-1, x.size(-1))
+                    with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
+                        classifier = model.token_embedding_table.weight.clone()
+                    logits = shift_embeddings @ classifier.T
+                    predicted_ids = logits.argmax(dim=1).reshape(input_ids_trim.size(0), -1)
+                    # Filter out padded tokens using the attention mask.
+                    for i in range(min(2, input_ids_trim.size(0))):
+                        active_input_tokens = [token for token, m in zip(input_ids_trim[i].tolist(), attn_mask[i].tolist()) if m]
+                        active_target_tokens = [token for token, m in zip(input_ids_trim[i, 1:].tolist(), attn_mask[i, 1:].tolist()) if m]
+                        active_pred_tokens = [token for token, m in zip(predicted_ids[i].tolist(), attn_mask[i, 1:].tolist()) if m]
+                        input_text = model.tokenizer.decode(active_input_tokens)
+                        target_text = model.tokenizer.decode(active_target_tokens)
+                        pred_text = model.tokenizer.decode(active_pred_tokens)
+                        print("Filtered Input tokens:    ", input_text)
+                        print("Filtered Target tokens:   ", target_text)
+                        print("Filtered Predicted tokens:", pred_text)
+                model.train()
 
             if use_deepspeed:
                 engine.zero_grad()
@@ -131,7 +179,6 @@ def train_model(
     ###########################################################################
     # Phase 2: Regression Fine-Tuning
     ###########################################################################
-    # We'll run the remainder of epochs as regression fine-tuning.
     finetune_epochs = epochs - PRETRAIN_EPOCHS if epochs > PRETRAIN_EPOCHS else 1
     logging.info("=== Phase 2: Regression Fine-Tuning ===")
     finetune_total_steps = len(dataloader) * finetune_epochs
@@ -161,7 +208,6 @@ def train_model(
                     use_entropy_reg=args.use_entropy_reg,
                     lambda_entropy=args.lambda_entropy
                 )
-                # Extract losses and outputs (tiny_loss is removed)
                 output = outputs["output"]
                 ebm_energy = outputs["ebm_energy"]
                 task_loss = outputs["task_loss"]
