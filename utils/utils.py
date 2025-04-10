@@ -807,21 +807,6 @@ def prepare_optimizer(model, args):
 
     optimizers = {}
 
-    # --- TinyTransformer optimizer ---
-    tiny_params_with_decay = []
-    tiny_params_no_decay = []
-    for name, param in model.tiny_transformer.named_parameters():
-        if param.requires_grad:
-            if skip_weight_decay(name):
-                tiny_params_no_decay.append(param)
-            else:
-                tiny_params_with_decay.append(param)
-    tiny_param_groups = [
-        {'params': tiny_params_with_decay, 'lr': BASE_LR, 'weight_decay': weight_decay},
-        {'params': tiny_params_no_decay, 'lr': BASE_LR, 'weight_decay': 0.0}
-    ]
-    optimizers['tiny'] = DeepSpeedCPUAdam(tiny_param_groups)
-
     # --- Main transformer optimizer with layer-wise decay ---
     main_param_groups = []
 
