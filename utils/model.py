@@ -49,14 +49,12 @@ def apply_rope(q, k, sin, cos):
     half = head_size // 2
 
     # Slice out first/second half
-    # q1, q2 => (B, T, n_head, half)
     q1 = q[..., :half]
     q2 = q[..., half:]
     k1 = k[..., :half]
     k2 = k[..., half:]
 
-    # Expand sin, cos for broadcast
-    # sin, cos => (T, half) => (1, T, 1, half)
+    # Expand sin, cos for broadcast => (1, T, 1, half)
     sin_ = sin.unsqueeze(0).unsqueeze(2)
     cos_ = cos.unsqueeze(0).unsqueeze(2)
 
@@ -87,7 +85,7 @@ class MultiHeadAttention(nn.Module):
         # We assume a fixed max block size or chunk size
         # For safety, pick something >= your max T
         self.max_seq_len = 2048
-        # Build sin/cos for minimal rope
+        # Build sin/cos for minimal RoPE
         # shape => (max_seq_len, head_size//2)
         sin, cos = build_sin_cos(self.max_seq_len, self.head_size // 2, device='cpu')
         self.register_buffer('rope_sin', sin, persistent=False)
@@ -96,7 +94,7 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, return_attn_probs=False):
         B, T, C = x.size()
 
-        # 1) Project to Q,K,V
+        # 1) Project to Q, K, V
         qkv = self.qkv_proj(x)  # (B, T, 3*C)
         # Reshape => (B, T, 3, n_head, head_size)
         qkv_reshape = qkv.view(B, T, 3, self.n_head, self.head_size)
@@ -107,7 +105,6 @@ class MultiHeadAttention(nn.Module):
         v = qkv_reshape[:, :, 2, :, :]
 
         # 3) Apply minimal RoPE to Q, K
-        # Make sure we slice rope_sin, rope_cos to length T
         sin_t = self.rope_sin[:T, :]
         cos_t = self.rope_cos[:T, :]
         q, k = apply_rope(q, k, sin_t, cos_t)
@@ -132,7 +129,7 @@ class MultiHeadAttention(nn.Module):
         attn_output, attn_probs, full_attn = outputs
 
         # 7) Reshape back => (B, T, n_head, head_size) => (B, T, C)
-        attn_output = attn_output.view(B, T, self.n_head, self.head_size)\
+        attn_output = attn_output.view(B, T, self.n_head, self.head_size) \
                                  .permute(0, 2, 1, 3).reshape(B, T, C)
         out = self.out_proj(attn_output)
 
@@ -350,9 +347,13 @@ class SparseMoELanguageModel(nn.Module):
         self.block_size = block_size
 
         # Remove BucketTransformerAggregator and use HighDimAttentionPooling instead.
-        self.high_attn_pool = HighDimAttentionPooling(n_embed, high_dim=32768)
-        # New regression head for the high-dimensional vector.
-        self.regression_head = nn.Linear(32768, 1)
+        self.high_attn_pool = HighDimAttentionPooling(n_embed, high_dim=32000)
+        # New regression MLP for the high-dimensional vector instead of a single linear layer.
+        self.regression_head = nn.Sequential(
+            nn.Linear(32000, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1)
+        )
 
         self.ebm = EnergyBasedModel(n_embed)
 
@@ -482,7 +483,6 @@ class SparseMoELanguageModel(nn.Module):
         # Use the high-dimensional pooled vector as the final embedding.
         high_dim_vector = self.high_attn_pool(x)
         if return_tokenwise:
-            # Optionally, you might return the token-level outputs (x) if needed
             return x
         else:
             return high_dim_vector
