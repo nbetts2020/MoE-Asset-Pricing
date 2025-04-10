@@ -224,7 +224,17 @@ class Block(nn.Module):
         self.smoe = SparseMoE(n_embed, num_experts, top_k)
 
     def forward(self, x, attention_mask=None):
-        x = x + self.sa(self.ln1(x))
+        # If an attention mask is provided, mask out padded tokens.
+        # The mask is assumed to be of shape (B, T) with 1 for valid tokens and 0 for padding.
+        if attention_mask is not None:
+            x_masked = x * attention_mask.unsqueeze(-1)
+        else:
+            x_masked = x
+
+        # Use the masked input for the self-attention module.
+        attn_out = self.sa(self.ln1(x_masked))
+        x = x + attn_out
+
         moe_out, ent_loss = self.smoe(self.ln2(x))
         x = x + moe_out
         return x, ent_loss
