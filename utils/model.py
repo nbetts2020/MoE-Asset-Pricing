@@ -84,7 +84,7 @@ class MultiHeadAttention(nn.Module):
 
         # We assume a fixed max block size or chunk size
         # For safety, pick something >= your max T
-        self.max_seq_len = 2048
+        self.max_seq_len = config.BLOCK_SIZE
         # Build sin/cos for minimal RoPE
         # shape => (max_seq_len, head_size//2)
         sin, cos = build_sin_cos(self.max_seq_len, self.head_size // 2, device='cpu')
