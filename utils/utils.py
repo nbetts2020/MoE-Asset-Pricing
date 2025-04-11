@@ -81,6 +81,60 @@ def kaiming_init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
+def prepare_ft_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
+                          global_offset, global_max, args, sampler=None):
+    """
+    Downloads the 'ft_dataset_1.parquet' file from the Hugging Face repository
+    nbettencourt/sc454k-preprocessed-dfs and prepares a DataLoader based on the given
+    epoch, window_index, and other parameters.
+    
+    Parameters:
+      epoch (int): Current training epoch.
+      window_index (int): A window index to help partition the data (if applicable).
+      tokenizer: Tokenizer to use (e.g. GLOBAL_TOKENIZER).
+      batch_size (int): Batch size for the DataLoader.
+      shuffle (bool): Whether to shuffle the dataset.
+      global_offset (int): The offset in the dataset (to allow for partial loading).
+      global_max (int): The maximum number of rows to load.
+      args: Additional command-line arguments.
+      sampler: Optional sampler (e.g. DistributedSampler).
+    
+    Returns:
+      DataLoader: A PyTorch DataLoader for the precomputed dataset.
+    """
+    # Download the preprocessed parquet file from Hugging Face Hub.
+    file_path = hf_hub_download(
+        repo_id="nbettencourt/sc454k-preprocessed-dfs",
+        filename="ft_dataset_1.parquet",
+        repo_type="dataset"
+    )
+    # Read the parquet file into a DataFrame.
+    df = pd.read_parquet(file_path)
+    
+    # Optionally, you can slice or process the DataFrame based on epoch/window_index/global_offset/global_max
+    # For example:
+    if global_offset is not None and global_max is not None:
+        df = df.iloc[global_offset: min(global_offset + global_max, len(df))]
+    
+    # Create the dataset instance.
+    dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
+    
+    # If distributed training is enabled, you may want to use DistributedSampler.
+    sampler = sampler  # For now, this remains None unless set from outside.
+    
+    # Create the DataLoader.
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=custom_collate_fn,
+        pin_memory=True,
+        drop_last=True
+    )
+    return dataloader
+
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
     """
     For run mode, loads a chunk from the original preprocessed dataset.
