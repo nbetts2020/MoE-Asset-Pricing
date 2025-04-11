@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "hf-internal-testing/llama-tokenizer")
 GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=8192)
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
+# For now, we use context_window equal to block_size during next-token prediction.
 GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
 
 # -------------------------------------------------------------------------
@@ -27,8 +28,10 @@ class PrecomputedDataset(Dataset):
     """
     Dataset that assumes text has been precomputed and stored in a DataFrame.
     It tokenizes the text on demand and retrieves the regression target.
+    
+    In this updated version (Option #1) we append the label as text.
+    The label string is appended with a clear marker "[30 DAY LABEL]:".
     """
-
     def __init__(self, df, tokenizer, block_size):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
@@ -39,19 +42,31 @@ class PrecomputedDataset(Dataset):
 
     def __getitem__(self, idx):
         text = self.df.iloc[idx].get("text", "")
+        # Get the numerical label (for example, weighted_avg_720_hrs) and prepare it.
+        # Here we also log-scale it (if desired) for evaluation purposes.
+        raw_label = self.df.iloc[idx].get("weighted_avg_720_hrs", 0.0)
+        # Format the raw label as text with a clear marker.
+        label_str = f"\n<30 DAY LABEL>: {raw_label:.2f}"
+        # Append the label string to the article text.
+        new_text = text + label_str
+
+        # Set truncation side to left so that when the text is too long, we retain the most recent tokens,
+        # which now include the appended label.
         self.tokenizer.truncation_side = 'left'
         encoding = self.tokenizer(
-            text,
+            new_text,
             truncation=True,
             padding="max_length",
             max_length=config.CONTEXT_WINDOW,
             return_tensors="pt"
         )
         input_ids = encoding["input_ids"].squeeze(0)
-        label = self.df.iloc[idx].get("weighted_avg_720_hrs", 0.0)  # Defaulting to 0.0 if missing
-        label = torch.tensor(label, dtype=torch.float)
-        label = torch.log1p(label)  # Log-scaled target
-        return {"input_ids": input_ids, "label": torch.tensor(label, dtype=torch.float)}
+
+        # Optionally compute a log-scaled version of the raw label for later regression evaluation.
+        # (This is independent of the text-generation objective.)
+        label_tensor = torch.log1p(torch.tensor(raw_label, dtype=torch.float))
+
+        return {"input_ids": input_ids, "label": label_tensor}
 
 # -------------------------------------------------------------------------
 # CUSTOM COLLATE FUNCTION
