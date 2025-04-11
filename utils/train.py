@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
 import subprocess
+import re
 
 from utils.utils import compute_l2_loss, upload_checkpoint_to_s3
 from utils.config import config
@@ -13,6 +14,14 @@ from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.stage3 import GatheredParameters
+
+def extract_label_value(decoded_text):
+    # This regex tries to find a number after the literal "[30 DAY LABEL]:"
+    match = re.search(r'\[30 DAY LABEL\]:\s*([\d\.]+)', decoded_text)
+    if match:
+        return float(match.group(1))
+    else:
+        return None
 
 def train_model(
     model,
@@ -132,6 +141,15 @@ def train_model(
                         print("Filtered Input tokens:    ", input_text)
                         print("Filtered Target tokens:   ", target_text)
                         print("Filtered Predicted tokens:", pred_text)
+
+                    # Attempt to extract the numerical values following the "[30 DAY LABEL]:" marker.
+                    true_label = extract_label_value(target_text)
+                    pred_label = extract_label_value(pred_text)
+                    if true_label is not None and pred_label is not None:
+                        mse = (pred_label - true_label) ** 2
+                        print(f"MSE for sample {i}: {mse}")
+                    else:
+                        print(f"Could not extract label value for sample {i}")
                 model.train()
 
             if use_deepspeed:
