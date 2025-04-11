@@ -15,6 +15,10 @@ from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 
+# Import the helper function we defined in model.py to update RoPE buffers.
+from model import update_model_rope_for_extended_context
+
+# (Keep your extract_label_value function as is)
 def extract_label_value(decoded_text):
     # This regex tries to find a number after the literal "[30 DAY LABEL]:"
     match = re.search(r'\<30 DAY LABEL\>:\s*([\d\.]+)', decoded_text)
@@ -38,10 +42,9 @@ def train_model(
 ):
     """
     Training loop for next-token prediction pretraining only.
-    
-    In this phase the model (and online learning components such as SI/EWC/replay, if provided)
-    trains using the next-token prediction branch. The loss is computed using cut cross-entropy,
-    which is efficient for large vocabularies. EBM parameters remain as an argument for potential future use.
+    This function first performs normal pretraining with the standard context length,
+    saves the checkpoint, then updates config.BLOCK_SIZE to 65536 and rebuilds the
+    RoPE buffers, proceeding to run continual pretraining with the extended (64k) context.
     
     DeepSpeed or standard PyTorch training is supported.
     """
@@ -53,16 +56,17 @@ def train_model(
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     total_steps = len(dataloader) * epochs
-    logging.info(f"Starting full pretraining on rank {rank}.")
+    logging.info(f"Starting normal pretraining on rank {rank}.")
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
     logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
 
     ###########################################################################
-    # Next-token Prediction Pretraining
+    # Normal Next-token Prediction Pretraining
     ###########################################################################
     PRETRAIN_EPOCHS = epochs  # Use all epochs for next-token prediction
-    logging.info("=== Next-token Prediction Pretraining ===")
+    logging.info("=== Normal Next-token Prediction Pretraining ===")
     pretrain_total_steps = len(dataloader) * PRETRAIN_EPOCHS
+
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
         model.train()
         logging.info(f"--- Epoch {epoch}/{PRETRAIN_EPOCHS} ---")
@@ -78,9 +82,7 @@ def train_model(
             print(f"[Pretrain] Processing batch {step + 1}/{total_batches}")
             input_ids = batch['input_ids'].to(device)
 
-            # Use the next-token prediction branch.
-            # Fix for CCE dtype mismatch in DeepSpeed ZeRO-3:
-            # Explicitly gather and convert token embedding table to BF16.
+            # Next-token prediction branch with explicit BF16 gathering.
             with torch.amp.autocast('cuda', enabled=False):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
@@ -96,11 +98,10 @@ def train_model(
             if step % 10 == 0:
                 logging.info(f"[Pretrain] Epoch {epoch}, Batch {step + 1}/{total_batches}, "
                              f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
-                # --- Debug Block: Print token-level info without EOS padding and compute MSE for the label ---
+                # Debug Block: Print filtered tokens and compute MSE for the label.
                 model.eval()
                 with torch.no_grad():
                     B, T = input_ids.shape
-                    # Use right slicing to get the relevant block.
                     if T > model.block_size:
                         input_ids_trim = input_ids[:, -model.block_size:]
                         T_trim = model.block_size
@@ -130,7 +131,6 @@ def train_model(
                         print("Filtered Input tokens:    ", input_text)
                         print("Filtered Target tokens:   ", target_text)
                         print("Filtered Predicted tokens:", pred_text)
-                        # Attempt to extract numerical values via the label marker.
                         true_label = extract_label_value(target_text)
                         pred_label = extract_label_value(pred_text)
                         if true_label is not None and pred_label is not None:
@@ -172,8 +172,8 @@ def train_model(
         avg_epoch_loss = epoch_loss / total_batches
         logging.info(f"[Pretrain] Finished Epoch {epoch}, Average Loss: {avg_epoch_loss:.4f}")
 
-    # Save pretrained checkpoint after pretraining phase.
-    pretrain_tag = "pretrained"
+    # Save checkpoint from normal pretraining
+    pretrain_tag = "normal_pretrained"
     pretrain_dir = os.path.join(args.save_dir, pretrain_tag)
     os.makedirs(pretrain_dir, exist_ok=True)
     try:
@@ -196,4 +196,87 @@ def train_model(
     if (not torch.distributed.is_initialized()) or (rank == 0):
         if args.bucket:
             upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-    logging.info("Pretraining phase complete.")
+    logging.info("Normal pretraining phase complete.")
+
+    ###########################################################################
+    # Continual Pretraining with Extended Context (64k tokens)
+    ###########################################################################
+    logging.info("=== Starting Continual Pretraining Phase with Extended Context ===")
+    # Update the configuration: here we update BLOCK_SIZE for extended context.
+    config.BLOCK_SIZE = 65536
+
+    # Update the tokenizer's max length if needed:
+    model.tokenizer.model_max_length = config.CONTEXT_WINDOW = 65536
+
+    # Rebuild RoPE buffers in each transformer block to handle extended context.
+    update_model_rope_for_extended_context(model, new_seq_len=65536, base=500000.0)
+
+    # (Assume you create a new dataloader that produces 64k token sequences, e.g. via prepare_ft_dataloader)
+    continual_dataloader = args.continual_dataloader  # This should be prepared externally
+
+    CONTINUAL_EPOCHS = args.continual_epochs if hasattr(args, "continual_epochs") else 1
+    continual_total_steps = len(continual_dataloader) * CONTINUAL_EPOCHS
+    logging.info(f"Continual Pretraining will run for {CONTINUAL_EPOCHS} epochs, {len(continual_dataloader)} batches per epoch.")
+
+    for epoch in range(1, CONTINUAL_EPOCHS + 1):
+        model.train()
+        logging.info(f"--- Continual Epoch {epoch}/{CONTINUAL_EPOCHS} ---")
+        total_batches = len(continual_dataloader)
+        epoch_loss = 0.0
+        running_avg_loss = 0.0
+
+        for step, batch in enumerate(continual_dataloader):
+            input_ids = batch['input_ids'].to(device)
+
+            with torch.amp.autocast('cuda', enabled=False):
+                with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
+                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
+                    loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
+
+            batch_loss = loss.item()
+            epoch_loss += batch_loss
+
+            if step % 10 == 0:
+                logging.info(f"[Continual] Epoch {epoch}, Batch {step + 1}/{total_batches}, Loss: {batch_loss:.4f}")
+
+            if use_deepspeed:
+                engine.zero_grad()
+                engine.backward(loss)
+                for name, param in engine.module.named_parameters():
+                    if param.requires_grad and param.grad is None:
+                        param.grad = torch.zeros_like(param, device=device)
+                engine.step()
+            else:
+                adam_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                adam_optimizer.step()
+
+        avg_epoch_loss = epoch_loss / total_batches
+        logging.info(f"[Continual] Finished Epoch {epoch}, Average Loss: {avg_epoch_loss:.4f}")
+
+    # Save checkpoint from continual pretraining
+    continual_tag = "continual_pretrained_64k"
+    continual_dir = os.path.join(args.save_dir, continual_tag)
+    os.makedirs(continual_dir, exist_ok=True)
+    try:
+        if use_deepspeed:
+            model.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
+        else:
+            torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
+    except Exception as e:
+        raise RuntimeError(f"Rank {rank} failed to save continual pretrained checkpoint: {str(e)}")
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    if use_deepspeed and rank == 0:
+        consolidated_path = os.path.join(args.save_dir, "consolidated_" + continual_tag + ".pth")
+        state_dict = model.module.state_dict()
+        torch.save(state_dict, consolidated_path)
+        if os.path.exists(consolidated_path):
+            logging.info(f"Continual pretrained consolidated weights saved to {consolidated_path}")
+        else:
+            logging.error(f"Failed to save continual pretrained consolidated weights at {consolidated_path}")
+    if (not torch.distributed.is_initialized()) or (rank == 0):
+        if args.bucket:
+            upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
+    logging.info("Continual pretraining phase complete.")
