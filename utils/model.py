@@ -68,10 +68,25 @@ class MultiHeadAttention(nn.Module):
         self.qkv_proj = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.out_proj = nn.Linear(n_embed, n_embed, bias=False)
         self.max_seq_len = config.BLOCK_SIZE
+        # Build initial RoPE buffers using the default base
         sin, cos = build_sin_cos(self.max_seq_len, self.head_size // 2, device='cpu')
         self.register_buffer('rope_sin', sin, persistent=False)
         self.register_buffer('rope_cos', cos, persistent=False)
-
+        
+    def update_rope_buffers(self, new_seq_len, base=500000.0):
+        """
+        Rebuilds the RoPE buffers to cover extended context lengths.
+        
+        Parameters:
+           new_seq_len (int): The new maximum sequence length (e.g., 64k).
+           base (float): The RoPE base frequency to use (often increased for longer contexts).
+        """
+        self.max_seq_len = new_seq_len
+        sin, cos = build_sin_cos(new_seq_len, self.head_size // 2, device='cpu', base=base)
+        # Re-register the buffers to ensure they're updated during training/inference.
+        self.register_buffer('rope_sin', sin, persistent=False)
+        self.register_buffer('rope_cos', cos, persistent=False)
+        
     def forward(self, x, return_attn_probs=False):
         B, T, C = x.size()
         qkv = self.qkv_proj(x)
@@ -82,6 +97,7 @@ class MultiHeadAttention(nn.Module):
         sin_t = self.rope_sin[:T, :]
         cos_t = self.rope_cos[:T, :]
         q, k = apply_rope(q, k, sin_t, cos_t)
+        # Update the qkv_reshape with rotated q and k
         qkv_reshape[:, :, 0, :, :] = q
         qkv_reshape[:, :, 1, :, :] = k
         qkv_reshape[:, :, 2, :, :] = v
@@ -289,3 +305,23 @@ class SparseMoELanguageModel(nn.Module):
             return x.mean(dim=1)
         else:
             return x
+
+#############################################
+# Helper Function for Extended-Context RoPE
+#############################################
+def update_model_rope_for_extended_context(model, new_seq_len, base=500000.0):
+    """
+    Iterates through each transformer block in the model and updates its RoPE buffers to cover new_seq_len.
+    
+    Parameters:
+      model: An instance of SparseMoELanguageModel.
+      new_seq_len (int): The new target sequence length (e.g. 64000 for 64k tokens).
+      base (float): The new RoPE base frequency to use.
+    
+    Returns:
+      model: The updated model with extended-context RoPE buffers.
+    """
+    for block in model.blocks:
+        # Update the RoPE buffers in the MultiHeadAttention module of each block.
+        block.sa.update_rope_buffers(new_seq_len, base=base)
+    return model
