@@ -117,7 +117,7 @@ def prepare_ft_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
         df = df.iloc[global_offset: min(global_offset + global_max, len(df))]
     
     # Create the dataset instance.
-    dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
+    dataset = PrecomputedDataset(df, tokenizer, block_size=block_size)
     
     # If distributed training is enabled, you may want to use DistributedSampler.
     sampler = sampler  # For now, this remains None unless set from outside.
