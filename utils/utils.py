@@ -111,16 +111,15 @@ def prepare_ft_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
     # Read the parquet file into a DataFrame.
     df = pd.read_parquet(file_path)
     
-    # Optionally, you can slice or process the DataFrame based on epoch/window_index/global_offset/global_max
-    # For example:
+    # Optionally slice the DataFrame based on global_offset/global_max.
     if global_offset is not None and global_max is not None:
         df = df.iloc[global_offset: min(global_offset + global_max, len(df))]
     
     # Create the dataset instance.
     dataset = PrecomputedDataset(df, tokenizer, block_size=block_size)
     
-    # If distributed training is enabled, you may want to use DistributedSampler.
-    sampler = sampler  # For now, this remains None unless set from outside.
+    # Use the sampler if provided (remains None otherwise).
+    sampler = sampler
     
     # Create the DataLoader.
     dataloader = DataLoader(
@@ -133,6 +132,11 @@ def prepare_ft_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
         pin_memory=True,
         drop_last=True
     )
+    
+    # Delete the downloaded dataset file to clean up.
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    
     return dataloader
 
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
