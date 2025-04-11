@@ -90,7 +90,7 @@ class MultiHeadAttention(nn.Module):
         max_seqlen = T
         outputs = flash_attn_unpadded_qkvpacked_func(
             qkv, cu_seqlens, max_seqlen,
-            dropout_p=config.DROPOUT, softmax_scale=None, causal=False,
+            dropout_p=config.DROPOUT, softmax_scale=None, causal=True,
             return_attn_probs=True
         )
         attn_output, attn_probs, full_attn = outputs
