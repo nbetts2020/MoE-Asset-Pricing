@@ -8,7 +8,7 @@ import logging
 import subprocess
 import re
 
-from utils.utils import compute_l2_loss, upload_checkpoint_to_s3
+from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, prepare_ft_dataloader
 from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
@@ -56,7 +56,7 @@ def train_model(
     This function first performs normal pretraining with the standard context length,
     saves the checkpoint, then updates config.BLOCK_SIZE to 65536 and rebuilds the
     RoPE buffers, proceeding to run continual pretraining with the extended (64k) context.
-    
+
     DeepSpeed or standard PyTorch training is supported.
     """
     if use_deepspeed:
@@ -214,18 +214,18 @@ def train_model(
     ###########################################################################
     logging.info("=== Starting Continual Pretraining Phase with Extended Context ===")
     # Update the configuration: here we update BLOCK_SIZE for extended context.
-    config.BLOCK_SIZE = 65536
+    config.BLOCK_SIZE = 1024 # 65536
 
     # Update the tokenizer's max length if needed:
-    model.tokenizer.model_max_length = config.CONTEXT_WINDOW = 65536
+    model.tokenizer.model_max_length = config.CONTEXT_WINDOW = config.BLOCK_SIZE
 
     # Rebuild RoPE buffers in each transformer block to handle extended context.
-    update_model_rope_for_extended_context(model, new_seq_len=65536, base=500000.0)
+    update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
 
     # (Assume you create a new dataloader that produces 64k token sequences, e.g. via prepare_ft_dataloader)
-    continual_dataloader = args.continual_dataloader  # This should be prepared externally
+    continual_dataloader = prepare_ft_dataloader(tokenizer, config.BLOCK_SIZE, False, args)  # This should be prepared externally
 
-    CONTINUAL_EPOCHS = args.continual_epochs if hasattr(args, "continual_epochs") else 1
+    CONTINUAL_EPOCHS = 1
     continual_total_steps = len(continual_dataloader) * CONTINUAL_EPOCHS
     logging.info(f"Continual Pretraining will run for {CONTINUAL_EPOCHS} epochs, {len(continual_dataloader)} batches per epoch.")
 
