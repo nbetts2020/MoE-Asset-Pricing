@@ -52,6 +52,7 @@ import gc
 
 import torch.distributed as dist
 from deepspeed.ops.adam import DeepSpeedCPUAdam
+from deepspeed.runtime.zero.stage3 import GatheredParameters
 
 from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
 
@@ -850,7 +851,32 @@ def initialize_model(args, device, init_from_scratch=False):
 
     return model, initialized_from_scratch
 
+import os
+import torch
+from utils.config import config
+from deepspeed.runtime.zero.stage3 import GatheredParameters
+# Ensure DeepSpeedCPUAdam is imported; if not, import it accordingly:
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+
 def prepare_optimizer(model, args):
+    """
+    Prepares optimizer parameter groups for continual pretraining with extended context.
+    This version only includes the model parts used for next-token prediction:
+      - Embedding parameters (token and positional embeddings)
+      - Transformer block parameters (with layerwise decay)
+      - The final LayerNorm module (ln_f)
+    It excludes extra modules (e.g., high_attn_pool, regression_head, soft_cluster)
+    that are only needed for fine-tuning tasks.
+    
+    Also prepares a separate optimizer for the EBM.
+    
+    Parameters:
+      model: The model instance.
+      args: Argument holder containing hyperparameters such as lambda_l2.
+    
+    Returns:
+      A dictionary of optimizers, with keys 'main' and 'ebm'.
+    """
     LR_DECAY = config.LR_DECAY
     BASE_LR = config.LEARNING_RATE
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
@@ -915,16 +941,15 @@ def prepare_optimizer(model, args):
             'weight_decay': 0.0
         })
 
-    # Extra modules from the main model: ln_f, high_attn_pool, regression_head, and soft_cluster
+    # Extra module: only include the final LayerNorm (ln_f) for next-token prediction.
     extra_params_with_decay = []
     extra_params_no_decay = []
-    for module in [model.ln_f, model.high_attn_pool, model.regression_head, model.soft_cluster]:
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                if skip_weight_decay(name):
-                    extra_params_no_decay.append(param)
-                else:
-                    extra_params_with_decay.append(param)
+    for name, param in model.ln_f.named_parameters():
+        if param.requires_grad:
+            if skip_weight_decay(name):
+                extra_params_no_decay.append(param)
+            else:
+                extra_params_with_decay.append(param)
     main_param_groups.append({
         'params': extra_params_with_decay,
         'lr': BASE_LR,
@@ -954,7 +979,7 @@ def prepare_optimizer(model, args):
     optimizers['ebm'] = DeepSpeedCPUAdam(ebm_param_groups)
 
     return optimizers
-    
+
 def initialize_si(model, args):
     """
     Initializes Synaptic Intelligence (SI) if specified.
