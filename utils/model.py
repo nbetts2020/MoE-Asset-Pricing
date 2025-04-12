@@ -94,8 +94,8 @@ class MultiHeadAttention(nn.Module):
         q = qkv_reshape[:, :, 0, :, :]
         k = qkv_reshape[:, :, 1, :, :]
         v = qkv_reshape[:, :, 2, :, :]
-        sin_t = self.rope_sin[:T, :]
-        cos_t = self.rope_cos[:T, :]
+        sin_t = self.rope_sin[:T, :].to(x.device)
+        cos_t = self.rope_cos[:T, :].to(x.device)
         q, k = apply_rope(q, k, sin_t, cos_t)
         # Update the qkv_reshape with rotated q and k
         qkv_reshape[:, :, 0, :, :] = q
