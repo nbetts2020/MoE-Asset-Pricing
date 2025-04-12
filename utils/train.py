@@ -20,10 +20,21 @@ from utils.model import update_model_rope_for_extended_context
 
 # (Keep your extract_label_value function as is)
 def extract_label_value(decoded_text):
-    # This regex tries to find a number after the literal "[30 DAY LABEL]:"
+    """
+    Extracts the numerical label following the "<30 DAY LABEL>:" marker and returns it as a float.
+    If multiple dots are found (e.g. "2..98"), they are replaced with a single dot.
+    Returns None if extraction or conversion fails.
+    """
     match = re.search(r'\<30 DAY LABEL\>:\s*([\d\.]+)', decoded_text)
     if match:
-        return float(match.group(1))
+        num_str = match.group(1)
+        # Replace multiple dots with a single dot.
+        num_str = re.sub(r'\.\.+', '.', num_str)
+        try:
+            return float(num_str)
+        except ValueError as e:
+            logging.error(f"Could not convert label string to float: '{num_str}'. Error: {e}")
+            return None
     else:
         return None
 
