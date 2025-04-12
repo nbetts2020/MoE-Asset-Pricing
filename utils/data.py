@@ -46,7 +46,7 @@ class PrecomputedDataset(Dataset):
         # Here we also log-scale it (if desired) for evaluation purposes.
         raw_label = self.df.iloc[idx].get("weighted_avg_720_hrs", 0.0)
         # Format the raw label as text with a clear marker.
-        label_str = f"\n<30 DAY LABEL>: {raw_label:.2f}"
+        label_str = f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f}"
         # Append the label string to the article text.
         new_text = text + label_str
 
