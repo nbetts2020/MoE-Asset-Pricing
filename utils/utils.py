@@ -135,10 +135,6 @@ def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1 = True, 
         drop_last=True
     )
 
-    # Delete the downloaded dataset file to clean up.
-    if os.path.exists(file_path):
-        os.remove(file_path)
-
     return dataloader
 
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
