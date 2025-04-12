@@ -16,7 +16,7 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 
 # Import the helper function we defined in model.py to update RoPE buffers.
-from model import update_model_rope_for_extended_context
+from utils.model import update_model_rope_for_extended_context
 
 # (Keep your extract_label_value function as is)
 def extract_label_value(decoded_text):
