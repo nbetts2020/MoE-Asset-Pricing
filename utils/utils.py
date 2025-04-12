@@ -120,7 +120,7 @@ def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, sampler=None):
     # Create the DataLoader.
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=config.BATCH_SIZE,
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=0,
