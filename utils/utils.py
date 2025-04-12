@@ -82,8 +82,7 @@ def kaiming_init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-def prepare_ft_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
-                          global_offset, global_max, args, sampler=None):
+def prepare_ft_dataloader(tokenizer, batch_size, shuffle, args, sampler=None):
     """
     Downloads the 'ft_dataset_1.parquet' file from the Hugging Face repository
     nbettencourt/sc454k-preprocessed-dfs and prepares a DataLoader based on the given
@@ -111,10 +110,6 @@ def prepare_ft_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
     )
     # Read the parquet file into a DataFrame.
     df = pd.read_parquet(file_path)
-    
-    # Optionally slice the DataFrame based on global_offset/global_max.
-    if global_offset is not None and global_max is not None:
-        df = df.iloc[global_offset: min(global_offset + global_max, len(df))]
     
     # Create the dataset instance.
     dataset = PrecomputedDataset(df, tokenizer, block_size=block_size)
