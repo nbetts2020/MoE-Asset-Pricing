@@ -82,7 +82,7 @@ def kaiming_init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, sampler=None):
+def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1 = True, sampler=None):
     """
     Downloads the 'ft_dataset_1.parquet' file from the Hugging Face repository
     nbettencourt/sc454k-preprocessed-dfs and prepares a DataLoader based on the given
@@ -102,12 +102,18 @@ def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, sampler=None):
     Returns:
       DataLoader: A PyTorch DataLoader for the precomputed dataset.
     """
-    # Download the preprocessed parquet file from Hugging Face Hub.
-    file_path = hf_hub_download(
-        repo_id="nbettencourt/sc454k-preprocessed-dfs",
-        filename="ft_dataset_1.parquet",
-        repo_type="dataset"
-    )
+    if stage_1:
+        # Download the preprocessed parquet file from Hugging Face Hub.
+        file_path = hf_hub_download(
+            repo_id="nbettencourt/sc454k-preprocessed-dfs",
+            filename="ft_dataset_1.parquet",
+            repo_type="dataset"
+        )
+    else:
+        file_path = hf_hub_download(
+            repo_id="nbettencourt/sc454k-preprocessed-dfs",
+            filename="ft_dataset_2.parquet",
+            repo_type="dataset"
     # Read the parquet file into a DataFrame.
     df = pd.read_parquet(file_path)
 
