@@ -240,7 +240,7 @@ def train_model(
     logging.info("Continual pretraining phase complete.")
 
     ############################################################################
-    # PHASE 3: Supervised Fine-tuning Stage (using ft_dataset_2)
+    # PHASE 4 (yes, 4): Supervised Fine-tuning Stage (using ft_dataset_2)
     ############################################################################
     logging.info("=== Starting Supervised Fine-tuning Stage ===")
     # For supervised fine-tuning, we load new data by setting stage_1=False.
