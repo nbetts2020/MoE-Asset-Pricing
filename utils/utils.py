@@ -9,6 +9,7 @@ from muon import Muon
 
 import pandas as pd
 import pyarrow.parquet as pq
+import re
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
@@ -82,6 +83,10 @@ def kaiming_init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
+def rreplace(s, old, new, occurrence=1):
+    parts = s.rsplit(old, occurrence)
+    return new.join(parts)
+
 def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1 = True, sampler=None):
     """
     Downloads the 'ft_dataset_1.parquet' file from the Hugging Face repository
@@ -116,6 +121,7 @@ def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1 = True, 
             repo_type="dataset"
     # Read the parquet file into a DataFrame.
     df = pd.read_parquet(file_path)
+    df["text"] = df["text"].apply(lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1))
 
     # Create the dataset instance.
     dataset = PrecomputedDataset(df, tokenizer, block_size=block_size)
@@ -293,6 +299,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, rl_module, args,
                     ebm_samples=args.ebm_num_samples,
                     rl_module=rl_module
                 )
+                best_context = rreplace(best_context, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
 
                 if args.use_rl_module and rl_module is not None:
                     with torch.no_grad():
