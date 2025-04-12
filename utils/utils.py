@@ -82,12 +82,12 @@ def kaiming_init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-def prepare_ft_dataloader(tokenizer, batch_size, shuffle, args, sampler=None):
+def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, sampler=None):
     """
     Downloads the 'ft_dataset_1.parquet' file from the Hugging Face repository
     nbettencourt/sc454k-preprocessed-dfs and prepares a DataLoader based on the given
     epoch, window_index, and other parameters.
-    
+
     Parameters:
       epoch (int): Current training epoch.
       window_index (int): A window index to help partition the data (if applicable).
@@ -98,7 +98,7 @@ def prepare_ft_dataloader(tokenizer, batch_size, shuffle, args, sampler=None):
       global_max (int): The maximum number of rows to load.
       args: Additional command-line arguments.
       sampler: Optional sampler (e.g. DistributedSampler).
-    
+
     Returns:
       DataLoader: A PyTorch DataLoader for the precomputed dataset.
     """
@@ -110,13 +110,13 @@ def prepare_ft_dataloader(tokenizer, batch_size, shuffle, args, sampler=None):
     )
     # Read the parquet file into a DataFrame.
     df = pd.read_parquet(file_path)
-    
+
     # Create the dataset instance.
     dataset = PrecomputedDataset(df, tokenizer, block_size=block_size)
-    
+
     # Use the sampler if provided (remains None otherwise).
     sampler = sampler
-    
+
     # Create the DataLoader.
     dataloader = DataLoader(
         dataset,
@@ -128,11 +128,11 @@ def prepare_ft_dataloader(tokenizer, batch_size, shuffle, args, sampler=None):
         pin_memory=True,
         drop_last=True
     )
-    
+
     # Delete the downloaded dataset file to clean up.
     if os.path.exists(file_path):
         os.remove(file_path)
-    
+
     return dataloader
 
 def get_data(epoch, window_index, global_offset, global_max, args=None, cache_dir="/tmp/hf_cache_datasets"):
