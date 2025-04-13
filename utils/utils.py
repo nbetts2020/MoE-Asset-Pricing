@@ -87,28 +87,24 @@ def rreplace(s, old, new, occurrence=1):
     parts = s.rsplit(old, occurrence)
     return new.join(parts)
 
-def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1 = True, sampler=None):
+def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1=True, gradual_latent_mask=False, full_latent_mask=False, sampler=None):
     """
-    Downloads the 'ft_dataset_1.parquet' file from the Hugging Face repository
-    nbettencourt/sc454k-preprocessed-dfs and prepares a DataLoader based on the given
-    epoch, window_index, and other parameters.
+    Downloads the appropriate parquet file and prepares a DataLoader based on the given parameters.
 
     Parameters:
-      epoch (int): Current training epoch.
-      window_index (int): A window index to help partition the data (if applicable).
       tokenizer: Tokenizer to use (e.g. GLOBAL_TOKENIZER).
-      batch_size (int): Batch size for the DataLoader.
+      block_size (int): Sequence length.
       shuffle (bool): Whether to shuffle the dataset.
-      global_offset (int): The offset in the dataset (to allow for partial loading).
-      global_max (int): The maximum number of rows to load.
-      args: Additional command-line arguments.
+      args: Additional arguments.
+      stage_1 (bool): Whether to use dataset 1 (True) or dataset 2 (False).
+      gradual_latent_mask (bool): Whether to use a gradual latent mask on the reasoning segment.
+      full_latent_mask (bool): Whether to use a full latent mask on the reasoning segment.
       sampler: Optional sampler (e.g. DistributedSampler).
 
     Returns:
       DataLoader: A PyTorch DataLoader for the precomputed dataset.
     """
     if stage_1:
-        # Download the preprocessed parquet file from Hugging Face Hub.
         file_path = hf_hub_download(
             repo_id="nbettencourt/sc454k-preprocessed-dfs",
             filename="ft_dataset_1.parquet",
@@ -119,17 +115,18 @@ def prepare_ft_dataloader(tokenizer, block_size, shuffle, args, stage_1 = True, 
             repo_id="nbettencourt/sc454k-preprocessed-dfs",
             filename="ft_dataset_2.parquet",
             repo_type="dataset"
+        )  # Ensure the closing parenthesis is here.
+
     # Read the parquet file into a DataFrame.
     df = pd.read_parquet(file_path)
     df["text"] = df["text"].apply(lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1))
 
     # Create the dataset instance.
-    dataset = PrecomputedDataset(df, tokenizer, block_size=block_size)
+    dataset = PrecomputedDataset(df, tokenizer, block_size=block_size,
+                                 gradual_attention_mask=gradual_latent_mask,
+                                 full_attention_mask=full_latent_mask)
 
-    # Use the sampler if provided (remains None otherwise).
-    sampler = sampler
-
-    # Create the DataLoader.
+    # Use the sampler if provided.
     dataloader = DataLoader(
         dataset,
         batch_size=config.BATCH_SIZE,
