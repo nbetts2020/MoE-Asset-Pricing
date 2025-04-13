@@ -17,9 +17,15 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------------
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "hf-internal-testing/llama-tokenizer")
 GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=config.BLOCK_SIZE)
+
+# Add special tokens
+special_tokens = {
+    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>']
+}
+GLOBAL_TOKENIZER.add_special_tokens(special_tokens)
+
+# Set pad token
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
-# For now, we use context_window equal to block_size during next-token prediction.
-GLOBAL_TOKENIZER.model_max_length = config.BLOCK_SIZE
 
 # -------------------------------------------------------------------------
 # PRECOMPUTED DATASET CLASS
