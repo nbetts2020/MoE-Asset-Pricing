@@ -199,8 +199,16 @@ def main():
     if not (0 < args.percent_data <= 100):
         raise ValueError("--percent_data must be between 0 and 100.")
 
-    tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name, model_max_length=config.CONTEXT_WINDOW)
+    tokenizer = LlamaTokenizerFast.from_pretrained(
+    args.tokenizer_name, 
+    model_max_length=config.CONTEXT_WINDOW
+    )
+    special_tokens = {
+        'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>']
+    }
+    tokenizer.add_special_tokens(special_tokens)
     tokenizer.pad_token = tokenizer.eos_token
+
     print("Tokenizer vocab size:", tokenizer.vocab_size)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         current_rank = torch.distributed.get_rank()
