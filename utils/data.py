@@ -82,17 +82,17 @@ class PrecomputedDataset(Dataset):
     The label string is appended with a clear marker ("<STOCK PRICE 30 DAYS OUT>:").
     
     This updated version supports latent masking via two boolean flags:
-      - gradual_attention_mask: mask a fraction of tokens in the reasoning segment.
-      - full_attention_mask: mask the entire reasoning segment.
+      - gradual_latent_mask: mask a fraction of tokens in the reasoning segment.
+      - full_latent_mask: mask the entire reasoning segment.
     
     Only one of these should be True at a time.
     """
-    def __init__(self, df, tokenizer, block_size, gradual_attention_mask=False, full_attention_mask=False):
+    def __init__(self, df, tokenizer, block_size, gradual_latent_mask=False, full_latent_mask=False):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.block_size = block_size
-        self.gradual_attention_mask = gradual_attention_mask
-        self.full_attention_mask = full_attention_mask
+        self.gradual_latent_mask = gradual_latent_mask
+        self.full_latent_mask = full_latent_mask
         
         # Pre-calculate special token IDs.
         self.latent_token_id = self.tokenizer.convert_tokens_to_ids('<bot>')
@@ -124,7 +124,7 @@ class PrecomputedDataset(Dataset):
         input_ids_list = input_ids.tolist()
 
         # Apply latent masking if requested.
-        if self.gradual_attention_mask:
+        if self.gradual_latent_mask:
             input_ids_list = schedule_masking(
                 input_ids_list,
                 self.reasoning_start_id,
@@ -132,7 +132,7 @@ class PrecomputedDataset(Dataset):
                 self.latent_token_id,
                 gradual=True
             )
-        elif self.full_attention_mask:
+        elif self.full_latent_mask:
             input_ids_list = schedule_masking(
                 input_ids_list,
                 self.reasoning_start_id,
