@@ -126,7 +126,6 @@ Training proceeds in three stages:
 - Block Size: `4,048`  
 - Dropout: `0.1`  
 - MoE Experts: `4` (Top-2 gating)  
-- Learning Rate: `3e-4`  
 - Batch Size: `16` (with 2x grad accumulation)  
 
 Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - forked from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
