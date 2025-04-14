@@ -273,56 +273,6 @@ def main():
         )
         logging.info("Training completed.")
 
-    # ------------------ UPDATE MODE ------------------
-    elif args.mode == "update":
-        print_debug_info("UPDATE MODE START")
-        if not args.bucket:
-            raise ValueError("When using update mode, --bucket is required.")
-
-        # Download current model artifacts from S3
-        download_models_from_s3(bucket=args.bucket)
-
-        # Load existing weights
-        model, _ = initialize_model(args, device, init_from_scratch=True)
-        model_path = os.path.join("model", args.save_model_name if args.save_model_name else "model_weights.pth")
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval()
-        logging.info("Main transformer model loaded from S3.")
-
-        optimizers = prepare_optimizer(model, args)
-        if args.use_ddp:
-            model = torch.nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank
-            )
-            logging.info("Model wrapped with DistributedDataParallel.")
-
-        update_dataloader, data_bundle = prepare_dataloader(args)
-        logging.info(f"Update DataLoader length: {len(update_dataloader)}")
-
-        # Fine-tune or "update" the model
-        train_model(
-            model=model,
-            optimizer=optimizers,
-            epochs=config.EPOCHS,
-            device=device,
-            dataloader=update_dataloader,
-            args=args,
-            si=initialize_si(model, args) if args.use_si else None,
-            ewc=[ElasticWeightConsolidation(model, None, device, args)] if args.use_ewc else None,
-            replay_buffer=initialize_replay_buffer(args) if args.use_replay_buffer else None,
-            tokenizer=tokenizer,
-            use_deepspeed=False
-        )
-        logging.info("Update completed.")
-
-        # Save updated model (rank 0 if distributed)
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "model_weights_update.pth"))
-            logging.info("Updated model weights saved (single GPU / no ZeRO partition).")
-
     # ------------------ RUN (INFERENCE) MODE ------------------
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
@@ -547,41 +497,6 @@ def main():
         logging.info(f"Catastrophic Forgetting Test Results: {test_results}")
         with open(os.path.join(args.save_dir, "test_forgetting_results.json"), "w") as f:
             json.dump(test_results, f, indent=4)
-
-    # ------------------ RL MODE ------------------
-    elif args.mode == "rl":
-        print_debug_info("RL MODE START")
-        if current_rank == 0:
-            if args.bucket:
-                download_models_from_s3(bucket=args.bucket)
-            consolidated_model_path = consolidate_checkpoint_to_pth(
-                checkpoint_dir=args.save_dir,
-                tag="final",
-                output_path=args.save_dir
-            )
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                obj_list = [consolidated_model_path]
-                torch.distributed.broadcast_object_list(obj_list, src=0)
-                consolidated_model_path = obj_list[0]
-        else:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                obj_list = [""]
-                torch.distributed.broadcast_object_list(obj_list, src=0)
-                consolidated_model_path = obj_list[0]
-            else:
-                consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-        model, _ = initialize_model(args, device, init_from_scratch=True)
-        model.load_state_dict(torch.load(consolidated_model_path, map_location=device), strict=False)
-        model.to(device)
-        model.eval()
-        logging.info("Main transformer model loaded from consolidated checkpoint.")
-
-        from utils.attention_rl import rl_train_hAttention
-        rl_train_hAttention(args, model=model)
-
     else:
         raise ValueError("Invalid mode. Choose from 'train', 'run', 'update', 'test_forgetting', or 'rl'.")
 
