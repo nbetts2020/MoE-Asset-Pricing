@@ -113,7 +113,7 @@ This combination enables the model to focus on the most relevant data within the
 
 Training proceeds in three stages:
 
-- **Pre-training**: Standard LLM pre-training with 4K block size using a Mixture of Experts transformer (4 experts, top-2 gating).  
+- **Pre-training**: Standard LLM pre-training with 4K block size using a Mixture of Experts transformer (4 experts, top-2 gating), trained with cut cross entropy loss function.  
 - **Continuous Pre-training**: Extends context window to 64K by updating rotary positional embeddings.  
 - **Fine-tuning**: Focuses on latent reasoning and trains Energy-Based Model (EBM) concurrently.
 
