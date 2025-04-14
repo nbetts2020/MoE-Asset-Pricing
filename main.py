@@ -79,15 +79,14 @@ def main():
 
     parser = argparse.ArgumentParser(description="SparseMoE Language Model")
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank passed by DeepSpeed launcher")
-    parser.add_argument("mode", choices=["train", "run", "update", "test_forgetting", "rl"],
-                        help="Mode: 'train', 'run', 'update', 'test_forgetting', or 'rl'")
+    parser.add_argument("mode", choices=["train", "run", "test_forgetting"],
+                        help="Mode: 'train', 'run', or 'test_forgetting'")
     parser.add_argument("input_text", type=str, nargs="?", default=None,
                         help="Input text if mode='run' (unless --test).")
     parser.add_argument("--tokenizer_name", type=str, default="hf-internal-testing/llama-tokenizer", help="Pretrained tokenizer name")
     parser.add_argument("--model", type=str, default=None, help="Hugging Face repo ID to load the model from")
     parser.add_argument("--save_model_name", type=str, default=None, help="Name of saved model")
     parser.add_argument("--test", action="store_true", help="Evaluate on the test set in run mode")
-    parser.add_argument("--update", action="store_true", help="Perform an update")
     parser.add_argument("--percent_data", type=float, default=100.0, help="Percentage of data to use (0 < percent_data <= 100)")
     parser.add_argument("--save_dir", type=str, default="model", help="Directory to save the model and states")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for checkpoints")
@@ -121,20 +120,11 @@ def main():
     parser.add_argument("--n_layer", type=int, help="Number of transformer blocks override")
     parser.add_argument("--block_size", type=int, help="Max sequence length override")
     parser.add_argument("--context_window", type=int, help="Max context window")
-    parser.add_argument("--self_attention_p", type=int, help="Perceiver self attention layers")
-    parser.add_argument("--cross_attention_p", type=int, help="Perceiver cross attention layers")
-    parser.add_argument("--num_latents", type=int, help="Perceiver number of latents")
     parser.add_argument("--epochs", type=int, help="Number of training epochs override")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--deepspeed_config", type=str, default="utils/deepspeed_config.json",
                         help="Path to the DeepSpeed config file")
-    parser.add_argument("--rl_rows", type=int, default=100000, help="Total rows to sample for RL (-1 for all)")
-    parser.add_argument("--rl_batch_size", type=int, default=8, help="RL training batch size")
-    parser.add_argument("--rl_epochs", type=int, default=5, help="Number of RL training epochs")
-    parser.add_argument("--rl_learning_rate", type=float, default=1e-4, help="RL learning rate")
-    parser.add_argument("--use_rl_module", action="store_true",
-                        help="Use RL module for text compression instead of simple truncation.")
-
+    
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
 
