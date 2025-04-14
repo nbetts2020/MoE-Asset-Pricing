@@ -852,13 +852,6 @@ def initialize_model(args, device, init_from_scratch=False):
 
     return model, initialized_from_scratch
 
-import os
-import torch
-from utils.config import config
-from deepspeed.runtime.zero.stage3 import GatheredParameters
-# Ensure DeepSpeedCPUAdam is imported; if not, import it accordingly:
-from deepspeed.ops.adam import DeepSpeedCPUAdam
-
 def prepare_optimizer(model, args):
     """
     Prepares optimizer parameter groups for continual pretraining with extended context.
