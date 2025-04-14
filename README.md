@@ -1,4 +1,4 @@
-*will be updated soon to reflect new latent attention mechanisms*
+*some configs subject to change*
 
 # Natural Language for Asset Pricing
 
@@ -6,10 +6,11 @@ Traditional models for asset pricing, such as the Capital Asset Pricing Model (C
 
 Recent research, such as "Deep Learning for Asset Pricing by Chen et al. (2019)"[^1] and "Structural Deep Learning in Conditional Asset Pricing by Fan et al. (2022)"[^2], demonstrate the effectiveness of deep learning in handling the non-linearities and time-varying dynamics of asset prices. These approaches leverage architectures such as feed-forward networks, LSTMs, and GANs to incorporate a wide range of economic and firm-specific factors, providing a more flexible and data-driven method for predicting future prices and risk premiums.
 
-Building upon an abundance of research in Large Language Models (LLMs) and Mixture-of-Experts (MoE) architectures, this project introduces a transformer-based SparseMoE Language Model tailored for asset price prediction for small cap stocks, wherein the model's final fully connected (dense) layer consists of one output unit (where the output is a singular continuous scalar value), as opposed to a probability distribution. Drawing from extensive textual data related to a stock in the form of articles, news reports, and financial statements, the model, along with complementary tools such as Online Learning and an optimal context selection algorithm, predicts the stock price 30 days out.
+Building upon an abundance of research in Large Language Models (LLMs), Mixture-of-Experts (MoE) architectures, and test-time compute, this project introduces a transformer-based Mixture of Experts Reasoning Large Language Model tailored for asset price prediction for small cap stocks, wherein the modality of prediction comes in the form of next-token prediction. Drawing from extensive textual data related to a stock in the form of articles, news reports, and financial statements, the model, along with complementary tools such as Online Learning and an optimal context selection algorithm, predicts the stock price 30 days out.
 
 ## Data[^3]
 
+### SC454k
 SC454k is a dataset of roughly 454k news articles and press releases related to small cap stocks from nasdaq.com and attached with market data from the Trade and Quote Millisecond dataset (TAQ/MSEC) from Wharton Research Data Services. The schema of the data looks something like this:
 
 - **Symbol**: the ticker symbol of respective stock (e.g., AAPL)
@@ -26,18 +27,65 @@ SC454k is a dataset of roughly 454k news articles and press releases related to 
 - **Author**: person or entity responsible for publishing the 'Article'. May appear as an entity similar to the 'Publication' (e.g., Publication: Zacks, Author: Zacks Equity Research) or as individual person (e.g., Publication: Validea, Author: John Reese)
 - **Risk_Free_Rate**: annualized 1-month U.S. Treasury bill yield at the time of the article's publication - rate is sourced from Federal Reserve Economic Data (FRED), where values are expressed as decimals
 - **weighted_avg_x_hours**: stock price 'x' hours away from 'Date' (calculated from a weighted average of the 8 closest stock prices to 'Date')
-  
-**Scraping/Pairing Market Data**
+
+#### Scraping/Pairing Market Data**
 
 Scraping the non-pricing aspects of this dataset was conducted across 10 EC2 t2.large instances across two parts: scraping links, then the content of these links. Puppeteer, a headless Chrome browser in JavaScript, was used for lightweight, quick scraping. Data was subsequently cleaned with a combination of PySpark and NumPy. Pairing this with market data was made available through Wharton Research Data Services and their extensive collection of financial datasets. One collection of these datasets is the Trade and Quote Millisecond dataset (TAQ/MSEC), consisting of millisecond level access to the tick-by-tick trade and quote data of all activity within the U.S. National Market System. The process of pairing this pricing data with the timestamped news article/press release data through their API was magnitudes more tricky than meets the eye. The issue comes down to one thing: latency. The granularity of the API call can only be day-level, meaning a simple call to get the pricing data for say `Apr. 3, 2020 11:13:37AM` will return around 10-15 thousand records of data, and because multiple prices are being retrieved for each news article/press release (I'm grabbing the price of the stock 4 days before, 2 days before, all the way to 30 days after with more granularity in between, totaling 18 different prices across 10 unique days), this is a large amount of data to pair, even with highly-optimized C++ code. Thus, the pairing algorithm went through a number of iterations to optimize efficiency such as promoting a more indexed-based approach to finding dates, a stringent approach to clearing out unused memory, and customized bash scripts for easy deployment of multiple EC2 instances. Ultimately, totaling around 1400 hours of compute across 41 (yes, 41) m7g.medium instances. Any values where no market data was available is denoted with a null value. The number of rows with complete market data totals just above 440k.
 
 Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial News Dataset in Time Series"[^4].
 
+### SC8k-R
+
+SC8k-R is a dataset of 8k high-quality, long-context finance reasoning examples, built from SC454k, with synthetic reasoning traces from Llama 4 Maverick. Each sample includes a financial news article, as well as other relevant articles and associated pricing data, where the given task is to predict the predict the price of the stock 30 days out. The reasoning trace attempts to use logic, rather than direct historical knowledge, to draw conclusions and derive its answer. The prompt is given as:
+
+```
+You will create Chain of Thought (CoT) reasoning traces. CoT is a prompting method that encourages structured thinking about a problem. It dissects the issue into a sequence of logical reasoning steps.
+
+You will receive a series of financial news articles (all articles are not guaranteed to be relevant towards completing the task), subsequent pricing data, and a ground truth label of that stock's price 30 days out, your task is to use this context to create sound reasoning traces that will lead to what the price of the stock will be 30 days out. You will know the answer in advance (do not mention this in your output), but will be creating a plausible chain of logic that gets you to arrive at that answer (true label denoted by <30 DAY LABEL>).
+
+Based on that, your role is to break it down into a series of logical reasoning traces and you will not use any historical knowledge for reasoning, only logical steps towards deriving a reasonable answer. Here's how to do it:
+
+1. **Break Down the Problem**: Split the question into sub-components.
+2. **Explore Hypotheses**: Propose 3-4 approaches to solve it, including flawed ones. This means looking at context (the various articles and pricing data) and deriving various perspectives on them and what they might mean for the stock's price a month from the last given price.
+3. **Validate Each Step**: Check assumptions, verify calculations, and test logic.
+4. **Self-Correct**: If an error is found, explain how to fix it.
+5. **Synthesize**: Combine valid insights into a conclusion.
+
+The Assistant’s reasoning **must** mimic a **natural internal monologue**, including:
+- Doubts ("Wait, does this assumption hold?"),
+- Counterfactuals ("What if X were different?").
+
+**Critical Instructions**:
+- Use natural self-dialogue: doubts ("Is this assumption valid?"), analogies ("This works like..."), and counterfactuals ("If X were false...").
+- **If uncertain, admit it in the answer** (e.g., "Hmm I'm not sure given the context...", "I might be missing...").
+- **Never state unverified claims as facts**.
+
+Format the response as:
+<reasoning>
+[Detailed internal dialogue, in a narrative and flowing format, such as:
+"First, I need to understand... So, the main objective is...
+Hmm, maybe I should consider...
+Then, I need to ...
+I should improve ...
+In addition to this, ...
+
+Testing Hypothesis A: [explanation].
+Oh, that doesn't work because [error]. I'll try Hypothesis B...
+Confirming with an example: [specific case].
+Based on the hypotheses I believe that...
+The most likely is...
+</reasoning>
+
+Be sure to include specifics numbers, figures, and information from the given context in your reasoning.
+
+Here's the context (remember ONLY <reasoning> and </reasoning> should be in your output (if there are other tags than these in the output, there will be trouble!), <30 DAY LABEL> represents the ground truth label, and do not mention the final price in your output nor make any definitive guesses, you are only generating a plausible reasoning trace that would derive that answer (do not mention anything like I've been told to not say this or that)):
+```
+
 ## Key Features
 
 **Sparse Mixture-of-Experts (MoE) Architecture**[^5]: An architecture in which $k$ experts are divvied up to solve a task, a popular technique as of recent, boasting similar performance yet less compute compared to their monolithic counterparts. To illustrate why this might be useful, let's think about the case of next token prediction. When handing the prompt “Tell me about President Eisenhower’s first inaugural address” to an LLM, little to no activation is present amongst the majority of the model’s neurons. In this instance, the model will not activate neurons tailored for subjects that are irrelevant towards the prompt. To name a few, neurons focused on technical computing, abstract mathematical theories, and deep scientific concepts, among many others, will stay inactive as their expertise holds, at most, a tangential connection with the prompt. This is, quite frankly, extremely inefficient. When dealing with a task that's already computationally expensive and faced with a shortage of GPUs, this inefficiency only compounds the issues. Thus, MoEs attempt to curtail this inefficiency by creating a number of models that each specialize in a certain task.
 
-**64k Context Window/Optimal Context Selection**[^6][^7][^8]: A large context window was chosen to ensure the model has access to as much relevant information as possible. This is made possible by leveraging an Energy-Based Model and Monte Carlo Sampling to evaluate and score each article-context pair to identify the most pertinent information. The EBM assigns lower energy values to more useful contexts based on their Mean Squared Error (MSE) in predicting stock prices, while Monte Carlo Sampling uses these energy values to probabilistically select higher-scoring contexts. The context sampled from includes the following components:
+**64k Context Window/Optimal Context Selection**[^6][^7][^8]: A large context window was chosen to ensure that the model has access to as much relevant information as possible. This extended window is enabled by updating the rotary positional embeddings – specifically, by regenerating the sine and cosine buffers to cover sequences up to 64k tokens. Furthermore, in order to identify the most relevant article-context combinations for each prediction, at inference time, multiple article-context pairs are generated (25 to be exact) per prompt. An Energy-Based Model (EBM) assigns a scalar energy to each candidate, with lower energy values indicating more informative contexts. A margin-based contrastive loss is used to train the EBM, allowing for the best (lowest-energy) candidate to be clearly separated from the others. This process optimizes context selection by directly training the model to recognize and prioritize high-value information. The context sampled from includes the following components:
 
 - **Broader Economic Information**
 - **Industry-Specific Information**
@@ -47,7 +95,9 @@ Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial N
 
 This combination enables the model to focus on the most relevant data within the given sample space, enhancing prediction accuracy.
 
-**Custom Training Pipeline:** Optimized for training for the NVIDIA Ampere architecture, employing techniques like mixed precision and gradient checkpointing for efficient resource utilization.
+**Custom Training Pipeline:** Optimized for training on the NVIDIA Ampere architecture, employing techniques like mixed precision and gradient checkpointing for efficient memory utilization. DeepSpeed, Microsoft's distributed learning library, is used to scale ADAPT-1B. Stage 3 ZeRO optimization is used for full parameter and activation partitioning across GPUs, while offloading all optimizer states and operations to the CPU.
+
+**Latent Reasoning:** Drawing from Meta's Coconut framework, ADAPT-1B performs reasoning in the latent space before producing answers. In Coconut, "continuous thoughts" are hidden states recursively fed back into the model, allowing reasoning to unfold internally without emitting language tokens. ADAPT-1B extends this idea using a curriculum learning strategy inspired by iCoT, using the SC8k-R dataset to gradually replace explicit reasoning tokens with latent ones - allowing the model to internalize reasoning steps within its latent space.
 
 **FlashAttention 2**[^9][^10]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
@@ -61,79 +111,60 @@ This combination enables the model to focus on the most relevant data within the
 
 ## Training Details
 
-- **Loss Function**: MSE between the predicted and actual stock prices.
+Training proceeds in three stages:
 
-  $\text{Loss} = \frac{1}{N} \sum_{i=1}^{N} (\hat{y}_i - y_i)^2$
+- **Pre-training**: Standard LLM pre-training with 4K block size using a Mixture of Experts transformer (4 experts, top-2 gating).  
+- **Continuous Pre-training**: Extends context window to 64K by updating rotary positional embeddings.  
+- **Fine-tuning**: Focuses on latent reasoning and trains Energy-Based Model (EBM) concurrently.
 
-- **Optimizer**: AdamW optimizer with a base learning rate of $2 \times 10^{-5}$. Layer-wise learning rate decay is applied with a decay factor of $0.95$ per layer, starting from the deepest layers. The embedding layers and regression head use the base learning rate, while deeper layers have progressively smaller learning rates due to the decay.
+### Configs
 
-- **Batch Size**: 16 sequences per batch.
-
-- **Epochs**: Trained for up to 20 epochs, with early stopping enabled if the loss does not improve for 5 consecutive epochs (configurable via `--early_stopping_patience` argument).
-
-- **# of Experts:** 8
-
-- **# of Active Experts per Token:** 2
-
-- **Tokenizer:** GPT-2
-
-- **Techniques Used**:
-  - **Gradient Checkpointing**[^13][^14]: Reduces memory usage by recomputing intermediate activations during the backward pass.
-  - **Mixed Precision Training**: Utilizes half-precision floating points to speed up training and reduce memory consumption.
-  - **FlashAttention 2**: Efficient attention mechanism for handling long sequences.
-  - **Layer-wise Learning Rate Decay (LLRD)**[^15]: Ensures more stable updates by applying smaller learning rates to lower layers and higher rates to upper layers, improving convergence.
-
-As financial analysis is defined by changing markets, it only makes sense to pair it with an architecture that caters well to its inherent modality. The disparity amongst inputs makes this a suitable candidate for a MoE, and provides contribution to an area of research that has previously not been explored in-depth.
+- Embedding Dimension: `1792`  
+- Transformer Layers: `24`  
+- Attention Heads: `32`  
+- Context Window: `65,536`  
+- Block Size: `4,048`  
+- Dropout: `0.1`  
+- MoE Experts: `4` (Top-2 gating)  
+- Learning Rate: `3e-4`  
+- Batch Size: `16` (with 2x grad accumulation)  
 
 Inspiration for the basic components of this architecture were taken from terrific work of Avinash Sooriyarachchi - forked from his [MakeMoE](https://github.com/AviSoori1x/makeMoE) repo.
 
-## Energy-Based Model and Monte Carlo Sampling for Optimal Context Selection [^6][^7][^8]
+## Energy-Based Model and Bootstrap Comparison for Optimal Context Selection [^6][^7][^8]
 
-The inspiration for a context optimal algorithm (**C***), comes from the belief that scalable transformer-based models are highly capable, yet substantially more capable when given tools such as prompt optimization and/or test-time compute, facilitating the model's ability to focus on the most pertinent information for improved predictions. In order to enhance the selection of optimal context for each article, this project incorporates an **Energy-Based Model (EBM)** coupled with **Monte Carlo Sampling**. The EBM is designed as a separate feedforward neural network that assigns a scalar energy value to each article-context pair. Specifically, for a given article $A$ and a generated context $C$, the EBM computes the energy $E(A, C)$ as follows:
+The inspiration for a context optimal algorithm (**C***), comes from the belief that scalable transformer-based models are highly capable, yet substantially more capable when given tools such as prompt optimization and/or test-time compute, facilitating the model's ability to focus on the most pertinent information for improved predictions. In order to enhance the selection of optimal context for each input, this project incorporates an **Energy-Based Model (EBM)** together with a bootstrap comparison strategy. The EBM is a separate feedforward neural network that assigns a scalar energy value to a fully concatenated article-context representation. For a given input sequence \(X\) (consisting of an article and its sampled context), the EBM computes the energy:
 
-$$
-E(A, C) = \text{EBM}(f(A), f(C))
-$$
+$E(X) = EBM(f(X))$
 
-where $f(A)$ and $f(C)$ are the embedding vectors of the article and context, respectively. The EBM is implemented as a simple feedforward neural network (Multi-Layer Perceptron) that takes the concatenated embeddings of $A$ and $C$ and outputs a single scalar value representing the energy. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM, yet does not dive into more sophisticated approaches such as contrastive divergence or other advanced architectural variants commonly seen in modern EBMs, yet this deliberate simplification allows for efficient context optimization while maintaining computational tractability.
+where $f(X)$ is the attention-pooled embedding vector of the full sequence. The EBM is implemented as a simple multi-layer perceptron that maps this embedding to a single scalar value. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM and does not dive into more sophisticated approaches commonly seen in modern EBMs, yet it's this deliberate simplification that allows for efficient context optimization while maintaining computational tractability in optimizing performance.
 
 ### Energy Computation and Scaling
 
-The energy $E(A, C)$ directly correlates with the MSE of the model's prediction for the given article-context pair. Since a lower MSE indicates a better prediction, it aligns with the EBM's objective of assigning lower energy to more useful contexts. The MSE values are scaled using Min-Max Normalization to ensure numerical stability and effective probability distribution during sampling:
+The energy \(E(X)\) is trained to correlate with the Mean Squared Error (MSE) of the model’s downstream prediction. Lower MSE indicates better predictions, so the EBM is optimized to assign lower energy values to more useful (i.e., more predictive) inputs. To stabilize training and standardize the energy distribution, MSE values are scaled using Min-Max Normalization:
 
 <p align="center">
   <img src="https://latex.codecogs.com/svg.latex?\text{Scaled%20Energy}%20=%20\frac{\text{MSE}%20-%20\text{MSE}_{\text{min}}}{\text{MSE}_{\text{max}}%20-%20\text{MSE}_{\text{min}}%20+%20\epsilon}">
 </p>
 
-where $\epsilon$ is a small constant to prevent division by zero. This scaling transforms the energy values to a standardized range, facilitating a more balanced and meaningful probability distribution for sampling.
+where $\epsilon$ is a small constant to avoid division by zero. This scaling ensures more stable energy comparisons across bootstrap samples.
 
-### Monte Carlo Sampling Based on Energy Values
+### Bootstrap Comparison for Candidate Selection
 
-**Monte Carlo Sampling** is employed to select the most useful contexts for training. The sampling probability $P(C)$ for each context tuple $C$ is defined using the Boltzmann distribution:
-
-$$
-P(C) = \frac{e^{-\text{Scaled Energy}(A, C)/T}}{\sum_{i} e^{-\text{Scaled Energy}(A, C_i)/T}}
-$$
-
-where $T$ is the temperature parameter that controls the randomness of the sampling process. A lower $T$ biases the selection towards contexts with the lowest energy (highest usefulness), while a higher $T$ introduces more diversity in context selection.
-
-**Sampling Process:**
+At inference time, for each prompt, the model generates 25 distinct versions of the full input using bootstrap sampling (e.g., selecting different subsets of supporting articles). Each version is passed through the model to produce an embedding, which is scored by the EBM:
 
 1. **Energy Evaluation:**  
-  For each article $A$ in a batch, the EBM evaluates and assigns energy scores to $k$ generated contexts, where $k$ is defined as the max between the total number of epochs minus the current epoch and 5. This pyramid-down approach ensures that the EBM focuses on capturing the most relevant knowledge during training while maintaining computational efficiency.
+   The EBM computes a scalar energy score for each of the 25 fully concatenated input sequences, reflecting their predicted usefulness based on training-time supervision.
 
-2. **Probability Computation:**  
-   The scaled energy values are transformed into sampling probabilities using the Boltzmann distribution.
-   
+2. **Candidate Comparison via Contrastive Loss:**  
+   During training, a margin-based contrastive loss ensures that the most informative candidate (the one with the lowest energy) is separated from all other candidates by a fixed margin. This helps the model learn a meaningful energy landscape where better inputs consistently rank lower.
+
 3. **Context Selection:**  
-   Perform Monte Carlo Sampling using the computed probabilities to select a singular article to pass to the Mixture of Experts for training. Monte Carlo Sampling is performed here as opposed to something like a **greedy selection** (select context with lowest MSE) to promote diversity in context selection, thus mitigating overfitting to a specific subset of contexts.
-
-4. **Integration with Training Loop:**  
-  The selected contexts are concatenated with the input data and fed into the model during training iterations. This dynamic selection allows the model to minimize the allocation of resources towards processing the most pertinent information.
+   At inference time, the model simply selects the input with the lowest energy. This deterministic selection directly prioritizes the highest-quality context from the set of candidates without relying on probabilistic sampling.
 
 ### EBM Loss
 
-The **EBM Loss** is designed to train the Energy-Based Model to accurately predict the scaled MSE of each context tuple. By minimizing the discrepancy between the EBM's predicted energies and the actual scaled MSEs, the EBM learns to assign lower energy scores to contexts that result in better prediction performance, allowing for an alignment that ensures Monte Carlo Sampling effectively selects high-quality contexts.
+The **EBM Loss** is designed to train the Energy-Based Model to assign lower energy values to input variants that produce better predictions. Using a contrastive formulation, the loss penalizes cases where lower-quality inputs are not sufficiently separated from high-quality ones. This drives the EBM to consistently rank informative contexts at the top and discard irrelevant or noisy configurations.
 
 ## Online Learning/Catastrophic Forgetting[^11][^12]
 
