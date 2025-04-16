@@ -140,16 +140,6 @@ $E(X) = EBM(f(X))$
 
 where $f(X)$ is the attention-pooled embedding vector of the full sequence. The EBM is implemented as a simple multi-layer perceptron that maps this embedding to a single scalar value. I think it's important to note that this implementation is a relatively simple one that draws upon the basic principles of the purpose of an EBM and does not dive into more sophisticated approaches commonly seen in modern EBMs, yet it's this deliberate simplification that allows for efficient context optimization while maintaining computational tractability in optimizing performance.
 
-### Energy Computation and Scaling
-
-The energy \(E(X)\) is trained to correlate with the Mean Squared Error (MSE) of the model’s downstream prediction. Lower MSE indicates better predictions, so the EBM is optimized to assign lower energy values to more useful (i.e., more predictive) inputs. To stabilize training and standardize the energy distribution, MSE values are scaled using Min-Max Normalization:
-
-<p align="center">
-  <img src="https://latex.codecogs.com/svg.latex?\text{Scaled%20Energy}%20=%20\frac{\text{MSE}%20-%20\text{MSE}_{\text{min}}}{\text{MSE}_{\text{max}}%20-%20\text{MSE}_{\text{min}}%20+%20\epsilon}">
-</p>
-
-where $\epsilon$ is a small constant to avoid division by zero. This scaling ensures more stable energy comparisons across bootstrap samples.
-
 ### Bootstrap Comparison for Candidate Selection
 
 At inference time, for each prompt, the model generates 25 distinct versions of the full input using bootstrap sampling (e.g., selecting different subsets of supporting articles). Each version is passed through the model to produce an embedding, which is scored by the EBM:
