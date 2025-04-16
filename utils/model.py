@@ -248,6 +248,7 @@ class SparseMoELanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.ModuleList([Block(n_embed, n_head, num_experts, top_k) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embed)
+        self.attn_pool = nn.Linear(n_embed, 1, bias=False)  # new!
         self.block_size = block_size
         # Retain EBM as an argument for potential online learning or logging.
         self.ebm = EnergyBasedModel(n_embed)
@@ -336,8 +337,23 @@ class SparseMoELanguageModel(nn.Module):
             x, _ = block(x, attention_mask)
 
         x = self.ln_f(x)
+
         if pool:
-            return x.mean(dim=1)
+            # 1) compute raw scores: (B, T, 1) -> (B, T)
+            scores = self.attn_pool(x).squeeze(-1)
+
+            # 2) mask out padding tokens
+            if attention_mask is None:
+                pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+                attention_mask = (input_ids != pad_id).to(x.device)
+            scores = scores.masked_fill(~attention_mask, float("-1e9"))
+
+            # 3) softmax over T -> (B, T)
+            weights = F.softmax(scores, dim=1)
+
+            # 4) weighted sum -> (B, D)
+            return torch.einsum("btd,bt->bd", x, weights)
+
         else:
             return x
 
