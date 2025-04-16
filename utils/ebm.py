@@ -41,14 +41,3 @@ class EnergyBasedModel(nn.Module):
             logging.error("EBM forward produced Inf energies.")
 
         return energy
-
-def scale_energy(energy_values, epsilon=1e-8):
-    # energy_values: (batch_size, num_contexts)
-    min_energy = energy_values.min(dim=1, keepdim=True)[0]
-    max_energy = energy_values.max(dim=1, keepdim=True)[0]
-    scaled_energy = (energy_values - min_energy) / (max_energy - min_energy + epsilon)
-    return scaled_energy  # (batch_size, num_contexts)
-
-def compute_sampling_probabilities(scaled_energies, temperature):
-    probabilities = F.softmax(-scaled_energies / temperature, dim=1)  # softmax over contexts
-    return probabilities  # (batch_size, num_contexts)
