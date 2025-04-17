@@ -8,7 +8,8 @@ import logging
 import subprocess
 import re
 
-from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, prepare_ft_dataloader
+from utils.utils import compute_l2_loss, upload_checkpoint_to_s3
+from utils.data import prepare_ft_dataloader
 from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
@@ -18,7 +19,6 @@ from deepspeed.runtime.zero.stage3 import GatheredParameters
 # Import the helper function to update RoPE buffers.
 from utils.model import update_model_rope_for_extended_context
 
-# (Keep your extract_label_value function as is)
 def extract_label_value(decoded_text):
     """
     Extracts the numerical label following the "<30 DAY LABEL>:" marker and returns it as a float.
@@ -28,7 +28,6 @@ def extract_label_value(decoded_text):
     match = re.search(r'\<30 DAY LABEL\>:\s*([\d\.]+)', decoded_text)
     if match:
         num_str = match.group(1)
-        # Replace multiple dots with a single dot.
         num_str = re.sub(r'\.\.+', '.', num_str)
         try:
             return float(num_str)
@@ -40,7 +39,7 @@ def extract_label_value(decoded_text):
 
 def train_model(
     model,
-    optimizer,      # Single optimizer object (or dict of optimizers)
+    optimizer,      # Single optimizer for main model
     epochs,
     device,
     dataloader,
@@ -52,38 +51,30 @@ def train_model(
     use_deepspeed=False
 ):
     """
-    Training loop for next-token prediction pretraining, followed by two fine-tuning stages:
-      1. Normal pretraining phase using ft_dataset_1 (stage_1=True).
-      2. Continual pretraining (interpolation fine-tuning) phase with extended context.
-      3. Supervised fine-tuning phase using the new dataset (ft_dataset_2, stage_1=False).
+    Training loop:
+      1. Normal pretraining (ft_dataset_1)
+      2. Continual pretraining with 64k context (ft_dataset_1)
+      3. Supervised fine-tuning with Coconut (ft_dataset_2)
+      4. EBM fine-tuning on bootstrap datasets (ft_dataset_3-7) + validation on ft_dataset_8
 
-    DeepSpeed or standard PyTorch training is supported.
+    If args.stage_1_only == True, only phase 1 is run and the function returns immediately after saving.
     """
     if use_deepspeed:
-        engine = model  # DeepSpeed engine passed from main.py
+        engine = model
     else:
         adam_optimizer = optimizer
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
-    ############################################################################
-    # PHASE 1: Normal Pretraining (using ft_dataset_1)
-    ############################################################################
+    # ------------------------------------------------------------------------
+    # PHASE 1: Normal Pretraining (ft_dataset_1)
+    # ------------------------------------------------------------------------
     logging.info(f"Starting normal pretraining on rank {rank}.")
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
-    logging.info(f"Token embedding shape: {model.token_embedding_table.weight.shape}")
-
-    PRETRAIN_EPOCHS = epochs  # Using 'epochs' for normal pretraining.
-    pretrain_total_steps = len(dataloader) * PRETRAIN_EPOCHS
-
+    PRETRAIN_EPOCHS = epochs
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
         model.train()
-        logging.info(f"--- Normal Pretraining Epoch {epoch}/{PRETRAIN_EPOCHS} ---")
-        total_batches = len(dataloader)
         epoch_loss = 0.0
-        running_avg_loss = 0.0
-        alpha = 0.9
-
         for step, batch in enumerate(dataloader):
             input_ids = batch['input_ids'].to(device)
             with torch.amp.autocast('cuda', enabled=False):
@@ -91,24 +82,9 @@ def train_model(
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
                     loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
 
-            batch_loss = loss.item()
-            epoch_loss += batch_loss
-            if step == 0 and epoch == 1:
-                running_avg_loss = batch_loss
-            else:
-                running_avg_loss = alpha * running_avg_loss + (1 - alpha) * batch_loss
-
-            if step % 10 == 0:
-                logging.info(f"[Normal Pretrain] Epoch {epoch}, Batch {step + 1}/{total_batches}, "
-                             f"Loss: {batch_loss:.4f}, Running Avg Loss: {running_avg_loss:.4f}")
-                # (Optional debug block omitted here for brevity.)
-
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
-                for name, param in engine.module.named_parameters():
-                    if param.requires_grad and param.grad is None:
-                        param.grad = torch.zeros_like(param, device=device)
                 engine.step()
             else:
                 adam_optimizer.zero_grad()
@@ -116,12 +92,12 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 adam_optimizer.step()
 
-            # Optionally update online learning penalties:
+            # online learning penalties
             if args.use_si and si:
                 si.update_weights(model)
             if args.use_ewc and ewc:
-                for ewc_instance in ewc:
-                    loss += args.lambda_ewc * ewc_instance.penalty(model)
+                for ewc_inst in ewc:
+                    loss = loss + args.lambda_ewc * ewc_inst.penalty(model)
             if replay_buffer and len(replay_buffer.buffer) > 0:
                 replay_loss = replay_buffer.replay_and_calculate_loss(
                     model=model,
@@ -130,79 +106,54 @@ def train_model(
                     device=device,
                     alpha=args.replay_buffer_weight
                 )
-                loss += replay_loss
+                loss = loss + replay_loss
 
-        avg_epoch_loss = epoch_loss / total_batches
-        logging.info(f"[Normal Pretrain] Finished Epoch {epoch}, Average Loss: {avg_epoch_loss:.4f}")
+            epoch_loss += loss.item()
+        logging.info(f"[Normal Pretrain] Epoch {epoch}/{PRETRAIN_EPOCHS}, Avg Loss: {epoch_loss/len(dataloader):.4f}")
 
-    # Save checkpoint from normal pretraining
+    # save checkpoint...
     pretrain_tag = "normal_pretrained"
     pretrain_dir = os.path.join(args.save_dir, pretrain_tag)
     os.makedirs(pretrain_dir, exist_ok=True)
-    try:
-        if use_deepspeed:
-            model.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
-        else:
-            torch.save(model.state_dict(), os.path.join(pretrain_dir, "model.pth"))
-    except Exception as e:
-        raise RuntimeError(f"Rank {rank} failed to save normal pretrained checkpoint: {str(e)}")
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    if use_deepspeed and rank == 0:
-        consolidated_path = os.path.join(args.save_dir, "consolidated_" + pretrain_tag + ".pth")
-        state_dict = model.module.state_dict()
-        torch.save(state_dict, consolidated_path)
-        if os.path.exists(consolidated_path):
-            logging.info(f"Normal pretrained consolidated weights saved to {consolidated_path}")
-        else:
-            logging.error(f"Failed to save normal pretrained consolidated weights at {consolidated_path}")
-    if (not torch.distributed.is_initialized()) or (rank == 0):
-        if args.bucket:
-            upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-    logging.info("Normal pretraining phase complete.")
+    if use_deepspeed:
+        model.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
+    else:
+        torch.save(model.state_dict(), os.path.join(pretrain_dir, "model.pth"))
 
-    ############################################################################
-    # PHASE 2: Continual Pretraining (Interpolation Fine-tuning) with Extended Context
-    ############################################################################
-    logging.info("=== Starting Continual Pretraining Phase with Extended Context ===")
-    # Update configuration: set BLOCK_SIZE (and CONTEXT_WINDOW) to 65536.
+    # if only doing stage 1, exit here
+    if getattr(args, "stage_1_only", False):
+        logging.info("stage_1_only=True, exiting after phase 1 pretraining.")
+        return
+
+    # ------------------------------------------------------------------------
+    # PHASE 2: Continual Pretraining (64k context ft_dataset_1)
+    # ------------------------------------------------------------------------
+    logging.info("=== Starting Continual Pretraining with Extended Context ===")
     config.BLOCK_SIZE = 65536
-    model.tokenizer.model_max_length = config.CONTEXT_WINDOW = config.BLOCK_SIZE
-
-    # Rebuild RoPE buffers in each transformer block to handle extended context.
+    config.CONTEXT_WINDOW = 65536
+    model.tokenizer.model_max_length = config.CONTEXT_WINDOW
     update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
 
-    # Create a new dataloader for extended sequences (still using ft_dataset_1).
-    continual_dataloader = prepare_ft_dataloader(tokenizer, config.BLOCK_SIZE, shuffle=False, args=args, stage_1=True)
-
-    CONTINUAL_EPOCHS = 1
-    logging.info(f"Continual Pretraining will run for {CONTINUAL_EPOCHS} epochs, {len(continual_dataloader)} batches per epoch.")
-
-    for epoch in range(1, CONTINUAL_EPOCHS + 1):
+    continual_loader = prepare_ft_dataloader(
+        tokenizer,
+        block_size=config.BLOCK_SIZE,
+        shuffle=False,
+        args=args,
+        stage=1
+    )
+    for epoch in range(1, 2):
         model.train()
-        logging.info(f"--- Continual Epoch {epoch}/{CONTINUAL_EPOCHS} ---")
-        total_batches = len(continual_dataloader)
         epoch_loss = 0.0
-
-        for step, batch in enumerate(continual_dataloader):
+        for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
             with torch.amp.autocast('cuda', enabled=False):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
                     loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
 
-            batch_loss = loss.item()
-            epoch_loss += batch_loss
-
-            if step % 10 == 0:
-                logging.info(f"[Continual] Epoch {epoch}, Batch {step + 1}/{total_batches}, Loss: {batch_loss:.4f}")
-
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
-                for name, param in engine.module.named_parameters():
-                    if param.requires_grad and param.grad is None:
-                        param.grad = torch.zeros_like(param, device=device)
                 engine.step()
             else:
                 adam_optimizer.zero_grad()
@@ -210,149 +161,157 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 adam_optimizer.step()
 
-        avg_epoch_loss = epoch_loss / total_batches
-        logging.info(f"[Continual] Finished Epoch {epoch}, Average Loss: {avg_epoch_loss:.4f}")
+            epoch_loss += loss.item()
+        logging.info(f"[Continual] Epoch {epoch}/1, Avg Loss: {epoch_loss/len(continual_loader):.4f}")
 
-    # Save checkpoint from continual pretraining
+    # save checkpoint...
     continual_tag = "continual_pretrained_64k"
     continual_dir = os.path.join(args.save_dir, continual_tag)
     os.makedirs(continual_dir, exist_ok=True)
-    try:
-        if use_deepspeed:
-            model.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
-        else:
-            torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
-    except Exception as e:
-        raise RuntimeError(f"Rank {rank} failed to save continual pretrained checkpoint: {str(e)}")
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    if use_deepspeed and rank == 0:
-        consolidated_path = os.path.join(args.save_dir, "consolidated_" + continual_tag + ".pth")
-        state_dict = model.module.state_dict()
-        torch.save(state_dict, consolidated_path)
-        if os.path.exists(consolidated_path):
-            logging.info(f"Continual pretrained consolidated weights saved to {consolidated_path}")
-        else:
-            logging.error(f"Failed to save continual pretrained consolidated weights at {consolidated_path}")
-    if (not torch.distributed.is_initialized()) or (rank == 0):
-        if args.bucket:
-            upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-    logging.info("Continual pretraining phase complete.")
-
-############################################################################
-# PHASE 3: Supervised Fine-tuning Stage (using ft_dataset_2) with Coconut
-############################################################################
-logging.info("=== Starting Supervised Fine-tuning Stage (Coconut) ===")
-
-# We'll keep the 64k context length from the prior phase, or revert to a smaller size if you prefer.
-config.LEARNING_RATE = 1e-5
-config.LR_DECAY = 0.95
-config.DROPOUT = 0.05
-
-# We'll do 2 sub-epochs: one with gradual masking, then one with full masking
-NUM_SUPERVISED_SUB_EPOCHS = 2
-
-for sub_epoch in range(NUM_SUPERVISED_SUB_EPOCHS):
-    if sub_epoch == 0:
-        logging.info("[Stage 3 - Sub-Epoch 1] Using GRADUAL latent masking with Coconut.")
-        ft_dataloader = prepare_ft_dataloader(
-            tokenizer,
-            config.BLOCK_SIZE,
-            shuffle=True,
-            args=args,
-            stage_1=False,            # i.e., use ft_dataset_2
-            gradual_latent_mask=True,
-            full_latent_mask=False
-        )
+    if use_deepspeed:
+        model.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
     else:
-        logging.info("[Stage 3 - Sub-Epoch 2] Using FULL latent masking with Coconut.")
-        ft_dataloader = prepare_ft_dataloader(
+        torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
+
+    # ------------------------------------------------------------------------
+    # PHASE 3: Supervised Fine-Tuning with Coconut (ft_dataset_2)
+    # ------------------------------------------------------------------------
+    logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
+    config.LEARNING_RATE = 1e-5
+    config.LR_DECAY = 0.95
+    config.DROPOUT = 0.05
+
+    for sub_epoch in range(2):
+        gradual = (sub_epoch == 0)
+        ft_loader = prepare_ft_dataloader(
             tokenizer,
-            config.BLOCK_SIZE,
+            block_size=config.BLOCK_SIZE,
             shuffle=True,
             args=args,
-            stage_1=False,            # i.e., use ft_dataset_2
-            gradual_latent_mask=False,
-            full_latent_mask=True
+            stage=2,
+            gradual_latent_mask=gradual,
+            full_latent_mask=not gradual
         )
-
-    total_batches = len(ft_dataloader)
-    logging.info(f"[Stage 3 - sub_epoch {sub_epoch+1}] DataLoader has {total_batches} batches")
-
-    # We'll do exactly 1 epoch each sub-epoch. Adjust as needed.
-    SUPERVISED_EPOCHS = 1
-    for epoch in range(1, SUPERVISED_EPOCHS + 1):
         model.train()
-        logging.info(f"--- [Stage 3, Sub-Epoch {sub_epoch+1}] Pass {epoch}/{SUPERVISED_EPOCHS} ---")
         epoch_loss = 0.0
-
-        for step, batch in enumerate(ft_dataloader):
+        for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
-
-            # Because forward_coconut might need labels:
-            # We'll just do next-token prediction. So pass labels=input_ids
-            # or if you have some separate label, pass that.
             with torch.amp.autocast('cuda', enabled=False):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
                     loss = model.forward_coconut(
                         input_ids=input_ids,
                         attention_mask=None,
-                        labels=input_ids,  # For next-token prediction
+                        labels=input_ids,
                         latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
                         reduction="mean",
                         force_bf16=True
                     )
-
-            batch_loss = loss.item() if loss is not None else 0.0
-            epoch_loss += batch_loss
-
-            if step % 10 == 0:
-                logging.info(f"[Stage 3, Sub-Epoch {sub_epoch+1}] Batch {step+1}/{total_batches} - Loss: {batch_loss:.4f}")
-
-            # Gradient updates (DeepSpeed or vanilla)
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
-                for name, param in engine.module.named_parameters():
-                    if param.requires_grad and param.grad is None:
-                        param.grad = torch.zeros_like(param, device=device)
                 engine.step()
             else:
                 adam_optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 adam_optimizer.step()
+            epoch_loss += loss.item()
+        logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
 
-        avg_epoch_loss = epoch_loss / total_batches
-        logging.info(f"[Stage 3, Sub-Epoch {sub_epoch+1}] Finished - Avg Loss: {avg_epoch_loss:.4f}")
-
-# After finishing both sub-epochs, save the final checkpoint
-ft_tag = "supervised_finetuned_coconut"
-ft_dir = os.path.join(args.save_dir, ft_tag)
-os.makedirs(ft_dir, exist_ok=True)
-try:
+    # save checkpoint...
+    coconut_tag = "supervised_finetuned_coconut"
+    coconut_dir = os.path.join(args.save_dir, coconut_tag)
+    os.makedirs(coconut_dir, exist_ok=True)
     if use_deepspeed:
-        model.save_checkpoint(args.save_dir, tag=ft_tag, client_state={})
+        model.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
     else:
-        torch.save(model.state_dict(), os.path.join(ft_dir, "model.pth"))
-except Exception as e:
-    raise RuntimeError(f"Rank {rank} failed to save supervised finetuned checkpoint: {str(e)}")
+        torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth"))
 
-if torch.distributed.is_initialized():
-    torch.distributed.barrier()
+    # ------------------------------------------------------------------------
+    # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
+    # ------------------------------------------------------------------------
+    logging.info("=== Starting EBM Fine-Tuning Phase ===")
+    ebm_optimizer = torch.optim.Adam(model.ebm.parameters(), lr=args.ebm_lr)
+    margin = getattr(args, "ebm_margin", 1.0)
 
-if use_deepspeed and rank == 0:
-    consolidated_path = os.path.join(args.save_dir, "consolidated_" + ft_tag + ".pth")
-    state_dict = model.module.state_dict()
-    torch.save(state_dict, consolidated_path)
-    if os.path.exists(consolidated_path):
-        logging.info(f"Supervised finetuned consolidated weights saved to {consolidated_path}")
+    for epoch in range(1, args.ebm_epochs + 1):
+        model.ebm.train()
+        total_loss = 0.0
+        steps = 0
+
+        for stage in range(3, 8):
+            ebm_loader = prepare_ft_dataloader(
+                tokenizer,
+                block_size=config.BLOCK_SIZE,
+                shuffle=True,
+                args=args,
+                stage=stage
+            )
+            for batch in ebm_loader:
+                ids = batch['input_ids'].to(device)
+                B, K, T = ids.shape
+                flat_ids = ids.view(B*K, T)
+
+                with torch.no_grad():
+                    embs = model.get_embeddings(flat_ids, pool=True)
+                embs = embs.view(B, K, -1)
+
+                flat_embs = embs.view(B*K, -1)
+                energies = model.ebm(flat_embs).view(B, K)
+
+                pos_idx = energies.argmin(dim=1)
+                pos_en = energies[torch.arange(B), pos_idx]
+                neg_mask = torch.ones_like(energies, dtype=torch.bool)
+                neg_mask[torch.arange(B), pos_idx] = False
+                neg_en = energies[neg_mask].view(B, K-1)
+
+                loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                ebm_optimizer.zero_grad()
+                loss.backward()
+                ebm_optimizer.step()
+
+                total_loss += loss.item()
+                steps += 1
+
+        logging.info(f"[EBM FT] Epoch {epoch}/{args.ebm_epochs}, Avg Loss: {total_loss/steps:.4f}")
+
+    # validation on ft_dataset_8
+    logging.info("=== EBM Validation ===")
+    model.ebm.eval()
+    val_loader = prepare_ft_dataloader(
+        tokenizer,
+        block_size=config.BLOCK_SIZE,
+        shuffle=False,
+        args=args,
+        stage=8
+    )
+    val_loss = 0.0
+    steps = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            ids = batch['input_ids'].to(device)
+            B, K, T = ids.shape
+            flat_ids = ids.view(B*K, T)
+            embs = model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
+            energies = model.ebm(embs.view(B*K, -1)).view(B, K)
+            pos_idx = energies.argmin(dim=1)
+            pos_en = energies[torch.arange(B), pos_idx]
+            neg_mask = torch.ones_like(energies, dtype=torch.bool)
+            neg_mask[torch.arange(B), pos_idx] = False
+            neg_en = energies[neg_mask].view(B, K-1)
+            loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+            val_loss += loss.item()
+            steps += 1
+    logging.info(f"[EBM Val] Avg Loss: {val_loss/steps:.4f}")
+
+    # save final model+EBM
+    final_tag = "model_with_ebm"
+    final_dir = os.path.join(args.save_dir, final_tag)
+    os.makedirs(final_dir, exist_ok=True)
+    if use_deepspeed:
+        model.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
     else:
-        logging.error(f"Failed to save supervised finetuned consolidated weights at {consolidated_path}")
+        torch.save(model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
 
-if (not torch.distributed.is_initialized()) or (rank == 0):
-    if args.bucket:
-        upload_checkpoint_to_s3(args.save_dir, args.bucket, remote_dir="model")
-
-logging.info("Supervised fine-tuning phase with Coconut complete.")
+    logging.info("Training complete.")
