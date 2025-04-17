@@ -115,7 +115,7 @@ This combination enables the model to focus on the most relevant data within the
 
 Training proceeds in four stages:
 
-- **Pre-training**: Standard LLM pre-training with 4K block size using a Mixture of Experts transformer (4 experts, top-2 gating), trained with cut cross entropy loss function.  
+- **Pre-training**: Standard LLM pre-training with 4K block size using a Mixture of Experts transformer (4 experts, top-2 gating), trained with cut cross entropy loss.  
 - **Continuous Pre-training**: Extends context window to 64K by updating rotary positional embeddings by training on 10k long-context examples.
 - **Latent Reasoning Fine‑tuning**: Applies a two‑phase curriculum learning strategy - first partially masking explicit reasoning tokens with a special latent token, then fully masking them, so model progressively internalizes Chain‑of‑Thought in its hidden states without ever emitting the reasoning text.
 - **Energy‑Based Model (EBM) Training**: Trains a contrastive, margin‑based EBM on bootstrapped context candidates, teaching it to assign lower energy to the most informative contexts and select the optimal input at inference time.
