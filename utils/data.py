@@ -3,8 +3,9 @@ import torch
 import pandas as pd
 import logging
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, LlamaTokenizerFast
+from transformers import LlamaTokenizerFast
 from utils.config import config
+from utils.caching import hf_hub_download
 
 # Disable tokenizer parallelism to avoid warnings after fork.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -16,146 +17,193 @@ logger = logging.getLogger(__name__)
 # GLOBAL TOKENIZER SETUP
 # -------------------------------------------------------------------------
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "hf-internal-testing/llama-tokenizer")
-GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(TOKENIZER_NAME, model_max_length=config.BLOCK_SIZE)
+GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(
+    TOKENIZER_NAME,
+    model_max_length=config.BLOCK_SIZE
+)
 
 # Add special tokens
 special_tokens = {
     'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>']
 }
 GLOBAL_TOKENIZER.add_special_tokens(special_tokens)
-
-# Set pad token
+# Set pad token to eos
 GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 
 # -------------------------------------------------------------------------
 # SCHEDULING FUNCTION FOR LATENT MASKING
 # -------------------------------------------------------------------------
 def schedule_masking(input_ids_list, reasoning_start_id, reasoning_end_id, latent_token_id, gradual=True):
-    """
-    Replaces tokens in the reasoning segment with the latent token.
-    
-    Parameters:
-      input_ids_list: list of token ids (for one sample).
-      reasoning_start_id: token id for the <reasoning> marker.
-      reasoning_end_id: token id for the </reasoning> marker.
-      latent_token_id: token id to use as the latent token (e.g. '<bot>').
-      gradual (bool): if True, mask only part of the reasoning span (e.g. the first half);
-                       if False, mask the entire reasoning span.
-                       
-    Returns:
-      Modified list of token ids.
-    """
     if reasoning_start_id not in input_ids_list or reasoning_end_id not in input_ids_list:
         return input_ids_list
-
     start_idx = input_ids_list.index(reasoning_start_id)
     end_idx = input_ids_list.index(reasoning_end_id)
-    # Tokens between markers
-    reasoning_span = input_ids_list[start_idx+1 : end_idx]
-    span_length = len(reasoning_span)
-    
-    if span_length == 0:
+    span = input_ids_list[start_idx+1:end_idx]
+    L = len(span)
+    if L == 0:
         return input_ids_list
-
-    if gradual:
-        # For example, mask half of the reasoning tokens.
-        n_to_mask = span_length // 2
-    else:
-        # Mask all tokens within the reasoning span.
-        n_to_mask = span_length
-
-    # Replace the first n_to_mask tokens after <reasoning> with the latent token.
-    for i in range(start_idx + 1, start_idx + 1 + n_to_mask):
+    n = (L // 2) if gradual else L
+    for i in range(start_idx+1, start_idx+1+n):
         if i < end_idx:
             input_ids_list[i] = latent_token_id
-
     return input_ids_list
 
 # -------------------------------------------------------------------------
-# PRECOMPUTED DATASET CLASS
+# PRECOMPUTED SINGLE-TEXT DATASET
 # -------------------------------------------------------------------------
 class PrecomputedDataset(Dataset):
-    """
-    Dataset that assumes text has been precomputed and stored in a DataFrame.
-    It tokenizes the text on demand and retrieves the regression target.
-    
-    The label string is appended with a clear marker ("<STOCK PRICE 30 DAYS OUT>:").
-    
-    This updated version supports latent masking via two boolean flags:
-      - gradual_latent_mask: mask a fraction of tokens in the reasoning segment.
-      - full_latent_mask: mask the entire reasoning segment.
-    
-    Only one of these should be True at a time.
-    """
     def __init__(self, df, tokenizer, block_size, gradual_latent_mask=False, full_latent_mask=False):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.gradual_latent_mask = gradual_latent_mask
         self.full_latent_mask = full_latent_mask
-        
-        # Pre-calculate special token IDs.
-        self.latent_token_id = self.tokenizer.convert_tokens_to_ids('<bot>')
-        self.reasoning_start_id = self.tokenizer.convert_tokens_to_ids('<reasoning>')
-        self.reasoning_end_id = self.tokenizer.convert_tokens_to_ids('</reasoning>')
+        # cache token ids
+        self.latent_id = tokenizer.convert_tokens_to_ids('<bot>')
+        self.start_id = tokenizer.convert_tokens_to_ids('<reasoning>')
+        self.end_id = tokenizer.convert_tokens_to_ids('</reasoning>')
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        # Retrieve the raw text and target value.
-        text = self.df.iloc[idx].get("text", "")
-        raw_label = self.df.iloc[idx].get("weighted_avg_720_hrs", 0.0)
+        text = self.df.iloc[idx].get('text', '')
+        raw_label = self.df.iloc[idx].get('weighted_avg_720_hrs', 0.0)
         label_str = f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f}"
         new_text = text + label_str
 
-        # Set truncation side to 'left' so that the recent tokens (including the label) are retained.
         self.tokenizer.truncation_side = 'left'
-        encoding = self.tokenizer(
+        enc = self.tokenizer(
             new_text,
             truncation=True,
-            padding="max_length",
+            padding='max_length',
             max_length=self.block_size,
-            return_tensors="pt"
+            return_tensors='pt'
         )
-        input_ids = encoding["input_ids"].squeeze(0)
+        ids = enc['input_ids'].squeeze(0).tolist()
 
-        # Convert input_ids to a list for potential masking modification.
-        input_ids_list = input_ids.tolist()
-
-        # Apply latent masking if requested.
-        if self.gradual_latent_mask:
-            input_ids_list = schedule_masking(
-                input_ids_list,
-                self.reasoning_start_id,
-                self.reasoning_end_id,
-                self.latent_token_id,
-                gradual=True
+        if self.gradual_latent_mask or self.full_latent_mask:
+            ids = schedule_masking(
+                ids,
+                self.start_id, self.end_id,
+                self.latent_id,
+                gradual=self.gradual_latent_mask
             )
-        elif self.full_latent_mask:
-            input_ids_list = schedule_masking(
-                input_ids_list,
-                self.reasoning_start_id,
-                self.reasoning_end_id,
-                self.latent_token_id,
-                gradual=False
-            )
-
-        # Convert the modified list back to a tensor.
-        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
-
-        # Compute the label tensor (log-scaled) for regression evaluation.
-        label_tensor = torch.log1p(torch.tensor(raw_label, dtype=torch.float))
-
-        return {"input_ids": input_ids, "label": label_tensor}
+        input_ids = torch.tensor(ids, dtype=torch.long)
+        label = torch.log1p(torch.tensor(raw_label, dtype=torch.float))
+        return {'input_ids': input_ids, 'label': label}
 
 # -------------------------------------------------------------------------
-# CUSTOM COLLATE FUNCTION
+# PRECOMPUTED BOOTSTRAP DATASET (25 TEXT ITERATIONS)
+# -------------------------------------------------------------------------
+class PrecomputedBootstrapDataset(Dataset):
+    def __init__(self, df, tokenizer, block_size, text_columns, label_column):
+        self.df = df.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.text_cols = text_columns
+        self.label_col = label_column
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        texts = [row[col] for col in self.text_cols]
+        label = torch.log1p(torch.tensor(row[self.label_col], dtype=torch.float))
+
+        # tokenize each bootstrap text
+        all_ids = []
+        for txt in texts:
+            enc = self.tokenizer(
+                txt,
+                truncation=True,
+                padding='max_length',
+                max_length=self.block_size,
+                return_tensors='pt'
+            )
+            all_ids.append(enc['input_ids'].squeeze(0))
+        input_ids = torch.stack(all_ids, dim=0)  # (K, T)
+        return {'input_ids': input_ids, 'label': label}
+
+# -------------------------------------------------------------------------
+# CUSTOM COLLATE FUNCTIONS
 # -------------------------------------------------------------------------
 def custom_collate_fn(batch):
+    input_ids = torch.stack([b['input_ids'] for b in batch], dim=0)
+    labels = torch.stack([b['label'] for b in batch], dim=0)
+    return {'input_ids': input_ids, 'labels': labels}
+
+def bootstrap_collate_fn(batch):
+    input_ids = torch.stack([b['input_ids'] for b in batch], dim=0)  # (B,K,T)
+    labels = torch.stack([b['label'] for b in batch], dim=0)         # (B,)
+    return {'input_ids': input_ids, 'labels': labels}
+
+# -------------------------------------------------------------------------
+# DATALOADER FACTORY
+# -------------------------------------------------------------------------
+def prepare_ft_dataloader(
+    tokenizer,
+    block_size,
+    shuffle,
+    args,
+    stage: int = 1,
+    gradual_latent_mask: bool = False,
+    full_latent_mask: bool = False,
+    sampler=None
+):
     """
-    Batches input_ids and labels into tensors.
+    stage:
+      1 => ft_dataset_1.parquet       (PrecomputedDataset, no label replace)
+      2 => ft_dataset_2.parquet       (PrecomputedDataset, do label replace)
+      3-7 => ft_dataset_{stage}.parquet (PrecomputedBootstrapDataset)
+      8 => ft_dataset_8.parquet       (PrecomputedBootstrapDataset test)
     """
-    input_ids = torch.stack([item["input_ids"] for item in batch])
-    labels = torch.stack([item["label"] for item in batch])
-    return {"input_ids": input_ids, "labels": labels}
+    filename = f"ft_dataset_{stage}.parquet"
+    file_path = hf_hub_download(
+        repo_id="nbettencourt/sc454k-preprocessed-dfs",
+        filename=filename,
+        repo_type="dataset"
+    )
+    df = pd.read_parquet(file_path)
+    os.remove(file_path)
+
+    if stage in (1, 2):
+        # only for ft_dataset_2 we replace the label marker
+        if stage == 2:
+            df["text"] = df["text"].apply(
+                lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
+            )
+        dataset = PrecomputedDataset(
+            df,
+            tokenizer,
+            block_size=block_size,
+            gradual_attention_mask=gradual_latent_mask,
+            full_attention_mask=full_latent_mask
+        )
+        collate = custom_collate_fn
+        drop_last = True
+
+    else:
+        text_cols = [f"text_iteration_{i}" for i in range(1, 27)]
+        label_col = "weighted_avg_720_hrs"
+        dataset = PrecomputedBootstrapDataset(
+            df,
+            tokenizer=tokenizer,
+            block_size=block_size,
+            text_columns=text_cols,
+            label_column=label_col
+        )
+        collate = bootstrap_collate_fn
+        drop_last = (stage < 8)
+
+    return DataLoader(
+        dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=collate,
+        pin_memory=True,
+        drop_last=drop_last
+    )
