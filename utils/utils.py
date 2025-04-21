@@ -55,7 +55,7 @@ import torch.distributed as dist
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 
-from utils.ebm import EnergyBasedModel, scale_energy, compute_sampling_probabilities
+from utils.ebm import EnergyBasedModel
 
 logger = logging.getLogger(__name__)
 
