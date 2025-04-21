@@ -5,7 +5,7 @@ import logging
 from torch.utils.data import Dataset, DataLoader
 from transformers import LlamaTokenizerFast
 from utils.config import config
-from utils.caching import hf_hub_download
+from huggingface_hub import hf_hub_download
 
 # Disable tokenizer parallelism to avoid warnings after fork.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
