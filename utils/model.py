@@ -241,7 +241,7 @@ class SparseMoELanguageModel(nn.Module):
             'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>']
         }
         self.tokenizer.add_special_tokens(special_tokens)
-        self.tokenizer.pad_token = tokenizer.eos_token
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         vocab_size = self.tokenizer.vocab_size
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
