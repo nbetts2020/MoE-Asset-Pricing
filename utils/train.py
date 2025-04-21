@@ -76,6 +76,7 @@ def train_model(
         model.train()
         epoch_loss = 0.0
         for step, batch in enumerate(dataloader):
+            print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
             with torch.amp.autocast('cuda', enabled=False):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
