@@ -234,14 +234,14 @@ class SparseMoELanguageModel(nn.Module):
         super().__init__()
         # We only need components for next-token prediction.
         self.tokenizer = LlamaTokenizerFast.from_pretrained(
-        args.tokenizer_name, 
+        tokenizer_name, 
         model_max_length=config.CONTEXT_WINDOW
         )
         special_tokens = {
             'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>']
         }
-        tokenizer.add_special_tokens(special_tokens)
-        tokenizer.pad_token = tokenizer.eos_token
+        self.tokenizer.add_special_tokens(special_tokens)
+        self.tokenizer.pad_token = tokenizer.eos_token
         vocab_size = self.tokenizer.vocab_size
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
