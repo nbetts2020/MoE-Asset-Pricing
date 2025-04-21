@@ -170,10 +170,9 @@ def prepare_ft_dataloader(
 
     if stage in (1, 2):
         # only for ft_dataset_2 we replace the label marker
-        if stage == 2:
-            df["text"] = df["text"].apply(
-                lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
-            )
+        df["text"] = df["text"].apply(
+            lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
+        )
         dataset = PrecomputedDataset(
             df,
             tokenizer,
