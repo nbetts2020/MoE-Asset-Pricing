@@ -97,9 +97,10 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer('rope_cos', cos, persistent=False)
         
     def forward(self, x, return_attn_probs=False):
+        x = x.to(torch.bfloat16)
         B, T, C = x.size()
     
-        qkv = self.qkv_proj(x)
+        qkv = self.qkv_proj(x).to(torch.bfloat16)
         qkv = qkv.view(B, T, 3, self.n_head, self.head_size)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]   # [B, T, H, D]
     
@@ -112,7 +113,7 @@ class MultiHeadAttention(nn.Module):
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-    
+
         attn = ring_flash_attn_func(
             q, k, v,
             dropout_p=config.DROPOUT,
@@ -152,7 +153,7 @@ class NoisyTopkRouter(nn.Module):
 
         full_router_probs = F.softmax(noisy_logits, dim=-1)
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
-        zeros = torch.full_like(noisy_logits, float('-inf'))
+        zeros = torch.full_like(noisy_logits, -torch.inf)
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
         router_output = F.softmax(sparse_logits, dim=-1)
 
@@ -269,7 +270,7 @@ class SparseMoELanguageModel(nn.Module):
             trimmed = torch.cat([input_ids, pad], dim=1)
         return trimmed
 
-    def forward_next_token_efficient(self, input_ids, reduction="mean", attention_mask=None, force_bf16=False):
+    def forward_next_token_efficient(self, input_ids, reduction="mean", attention_mask=None):
         """
         Next-token prediction mode using Cut Cross-Entropy with built-in shift.
         If the sequence is longer than block_size, it is truncated from the right.
@@ -282,29 +283,29 @@ class SparseMoELanguageModel(nn.Module):
                 attention_mask = attention_mask[:, -self.block_size:]
             T = self.block_size
 
-        tok_emb = self.token_embedding_table(input_ids)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        tok_emb = self.token_embedding_table(input_ids).to(torch.bfloat16)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)).to(torch.bfloat16)
         x = tok_emb + pos_emb
 
         for block in self.blocks:
             x, _ = block(x, attention_mask)
 
         x = self.ln_f(x)
-        if force_bf16:
-            x = x.to(torch.bfloat16)
 
         with GatheredParameters(self.token_embedding_table.weight, modifier_rank=0):
             if hasattr(self, '_gathered_weights'):
                 classifier = self._gathered_weights
             else:
                 classifier = self.token_embedding_table.weight.data.clone().to(device)
-                if force_bf16:
-                    classifier = classifier.to(torch.bfloat16)
 
         pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+
+        x_fp32          = x.to(torch.bfloat16)
+        classifier_fp32 = classifier.to(torch.bfloat16)
+        
         loss = linear_cross_entropy(
-            x,               # Transformer outputs in BF16 if forced
-            classifier,      # Classifier weights
+            x_fp32,               # Transformer outputs in BF16 if forced
+            classifier_fp32,      # Classifier weights
             input_ids,       # Target token ids
             ignore_index=pad_id,
             reduction=reduction,
@@ -345,7 +346,7 @@ class SparseMoELanguageModel(nn.Module):
             if attention_mask is None:
                 pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
                 attention_mask = (input_ids != pad_id).to(x.device)
-            scores = scores.masked_fill(~attention_mask, float("-1e9"))
+            scores = scores.masked_fill(~attention_mask, ("-1e9"))
 
             # 3) softmax over T -> (B, T)
             weights = F.softmax(scores, dim=1)
@@ -365,8 +366,7 @@ class SparseMoELanguageModel(nn.Module):
         attention_mask=None,
         labels=None,
         latent_token_id=99998,
-        reduction="mean",
-        force_bf16=False
+        reduction="mean"
     ):
         """
         A naive Coconut-like multi-pass forward:
@@ -426,8 +426,6 @@ class SparseMoELanguageModel(nn.Module):
             for block in self.blocks:
                 x, _ = block(x, truncated_am)
             x = self.ln_f(x)
-            if force_bf16:
-                x = x.to(torch.bfloat16)
 
             # Overwrite the embedding at the latent position with the hidden state from (pos-1)
             for b_idx, lat_list in enumerate(latent_positions):
@@ -445,16 +443,12 @@ class SparseMoELanguageModel(nn.Module):
         for block in self.blocks:
             x, _ = block(x, full_am)
         x = self.ln_f(x)
-        if force_bf16:
-            x = x.to(torch.bfloat16)
 
         with GatheredParameters(self.token_embedding_table.weight, modifier_rank=0):
             if hasattr(self, '_gathered_weights'):
                 classifier = self._gathered_weights
             else:
                 classifier = self.token_embedding_table.weight.data.clone().to(device)
-                if force_bf16:
-                    classifier = classifier.to(torch.bfloat16)
 
         # Compute cross-entropy for next-token prediction
         final_loss = None
@@ -463,9 +457,12 @@ class SparseMoELanguageModel(nn.Module):
             if labels.shape[1] > Ttrim:
                 labels = labels[:, -Ttrim:]
 
+            x_fp32          = x.to(torch.bfloat16)
+            classifier_fp32 = classifier.to(torch.bfloat16)
+            
             final_loss = linear_cross_entropy(
-                x,  # (Btrim, Ttrim, n_embed)
-                classifier,
+                x_fp32,  # (Btrim, Ttrim, n_embed)
+                classifier_fp32,
                 labels,
                 ignore_index=pad_id,
                 reduction=reduction,
