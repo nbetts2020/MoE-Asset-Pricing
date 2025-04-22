@@ -226,6 +226,8 @@ def main():
         )
         print_debug_info("AFTER DEEPSPEED INIT")
 
+        engine.module.bfloat16()
+
         # Prepare data
         train_loader = prepare_dataloader(
             epoch=1,
