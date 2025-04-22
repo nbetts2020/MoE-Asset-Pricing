@@ -17,7 +17,7 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 
 # Import the helper function to update RoPE buffers.
-from utils.model import update_model_rope_for_extended_context
+from utils.model import update_model_rope_for_extended_context, expand_pos_embedding
 
 def extract_label_value(decoded_text):
     """
@@ -78,7 +78,7 @@ def train_model(
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
                     loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
@@ -133,6 +133,7 @@ def train_model(
     config.BLOCK_SIZE = 65536
     config.CONTEXT_WINDOW = 65536
     model.tokenizer.model_max_length = config.CONTEXT_WINDOW
+    expand_pos_embedding(model, new_seq_len=config.BLOCK_SIZE)
     update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
 
     continual_loader = prepare_ft_dataloader(
@@ -147,7 +148,7 @@ def train_model(
         epoch_loss = 0.0
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
                     loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
@@ -197,7 +198,7 @@ def train_model(
         epoch_loss = 0.0
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
                     loss = model.forward_coconut(
