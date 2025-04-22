@@ -177,7 +177,7 @@ def prepare_ft_dataloader(
             df,
             tokenizer,
             block_size=block_size,
-            gradual_attention_mask=gradual_latent_mask,
+            gradual_latent_mask=gradual_latent_mask,
             full_attention_mask=full_latent_mask
         )
         collate = custom_collate_fn
