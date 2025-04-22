@@ -136,6 +136,13 @@ def train_model(
     expand_pos_embedding(model, new_seq_len=config.BLOCK_SIZE)
     update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
 
+    from utils.utils import prepare_optimizer
+    new_opts = prepare_optimizer(model, args)
+    if use_deepspeed:
+        engine.optimizer = new_opts["main"]
+    else:
+        adam_optimizer  = new_opts["main"]
+
     continual_loader = prepare_ft_dataloader(
         tokenizer,
         block_size=config.BLOCK_SIZE,
