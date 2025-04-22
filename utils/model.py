@@ -6,9 +6,11 @@ from utils.config import config
 from utils.data import *
 from transformers import AutoTokenizer, LlamaTokenizerFast
 from torch.utils.checkpoint import checkpoint
-from flash_attn.flash_attn_interface import flash_attn_func
-from flash_attn.flash_attn_interface import flash_attn_unpadded_func
-from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+from ring_flash_attn.flash_attn_interface import (
+    ring_flash_attn_func,
+    ring_flash_attn_varlen_func,
+    ring_flash_attn_varlen_qkvpacked_func
+)
 from utils.ebm import EnergyBasedModel  # Still kept for potential future use
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 from cut_cross_entropy import linear_cross_entropy  # For efficient next-token loss
@@ -109,7 +111,7 @@ class MultiHeadAttention(nn.Module):
 
         cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
         max_seqlen = T
-        outputs = flash_attn_unpadded_qkvpacked_func(
+        outputs = ring_flash_attn_varlen_qkvpacked_func(
             qkv, cu_seqlens, max_seqlen,
             dropout_p=config.DROPOUT, softmax_scale=None, causal=True,
             return_attn_probs=True
