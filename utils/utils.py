@@ -880,7 +880,8 @@ def prepare_optimizer(model, args):
         return (
             'bias' in n
             or 'LayerNorm.weight' in n
-            or 'embedding_table' in n  # skip decay for embeddings
+            or 'embedding_table' in n           # skip decay for token embeddings
+            or 'position_embedding_table' in n  # skip decay for positional embeddings
         )
 
     optimizers = {}
@@ -889,88 +890,58 @@ def prepare_optimizer(model, args):
     main_param_groups = []
 
     # Embedding parameters: token and positional embeddings
-    embedding_params_with_decay = []
-    embedding_params_no_decay = []
+    emb_wd, emb_no_wd = [], []
     for name, param in (
         list(model.token_embedding_table.named_parameters()) +
         list(model.position_embedding_table.named_parameters())
     ):
-        if param.requires_grad:
-            if skip_weight_decay(name):
-                embedding_params_no_decay.append(param)
-            else:
-                embedding_params_with_decay.append(param)
-    main_param_groups.append({
-        'params': embedding_params_with_decay,
-        'lr': BASE_LR,
-        'weight_decay': weight_decay
-    })
-    main_param_groups.append({
-        'params': embedding_params_no_decay,
-        'lr': BASE_LR,
-        'weight_decay': 0.0
-    })
+        if not param.requires_grad:
+            continue
+        (emb_no_wd if skip_weight_decay(name) else emb_wd).append(param)
+
+    main_param_groups += [
+        {'params': emb_wd,    'lr': BASE_LR, 'weight_decay': weight_decay},
+        {'params': emb_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0}
+    ]
 
     # Transformer blocks with layer-wise decay
     num_blocks = len(model.blocks)
-    for layer_idx, block in enumerate(model.blocks):
-        decay_factor = (LR_DECAY ** (num_blocks - 1 - layer_idx))
-        block_lr = BASE_LR * decay_factor
-        block_params_with_decay = []
-        block_params_no_decay = []
+    for idx, block in enumerate(model.blocks):
+        decay = LR_DECAY ** (num_blocks - 1 - idx)
+        lr    = BASE_LR * decay
+        wd_params, no_wd_params = [], []
         for name, param in block.named_parameters():
-            if param.requires_grad:
-                if skip_weight_decay(name):
-                    block_params_no_decay.append(param)
-                else:
-                    block_params_with_decay.append(param)
-        main_param_groups.append({
-            'params': block_params_with_decay,
-            'lr': block_lr,
-            'weight_decay': weight_decay
-        })
-        main_param_groups.append({
-            'params': block_params_no_decay,
-            'lr': block_lr,
-            'weight_decay': 0.0
-        })
+            if not param.requires_grad:
+                continue
+            (no_wd_params if skip_weight_decay(name) else wd_params).append(param)
+        main_param_groups += [
+            {'params': wd_params,    'lr': lr, 'weight_decay': weight_decay},
+            {'params': no_wd_params, 'lr': lr, 'weight_decay': 0.0}
+        ]
 
-    # Extra module: only include the final LayerNorm (ln_f) for next-token prediction.
-    extra_params_with_decay = []
-    extra_params_no_decay = []
+    # Final LayerNorm (ln_f)
+    ln_wd, ln_no_wd = [], []
     for name, param in model.ln_f.named_parameters():
-        if param.requires_grad:
-            if skip_weight_decay(name):
-                extra_params_no_decay.append(param)
-            else:
-                extra_params_with_decay.append(param)
-    main_param_groups.append({
-        'params': extra_params_with_decay,
-        'lr': BASE_LR,
-        'weight_decay': weight_decay
-    })
-    main_param_groups.append({
-        'params': extra_params_no_decay,
-        'lr': BASE_LR,
-        'weight_decay': 0.0
-    })
+        if not param.requires_grad:
+            continue
+        (ln_no_wd if skip_weight_decay(name) else ln_wd).append(param)
+    main_param_groups += [
+        {'params': ln_wd,    'lr': BASE_LR, 'weight_decay': weight_decay},
+        {'params': ln_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0}
+    ]
 
     optimizers['main'] = DeepSpeedCPUAdam(main_param_groups)
 
     # --- EBM optimizer ---
-    ebm_params_with_decay = []
-    ebm_params_no_decay = []
+    ebm_wd, ebm_no_wd = [], []
     for name, param in model.ebm.named_parameters():
-        if param.requires_grad:
-            if skip_weight_decay(name):
-                ebm_params_no_decay.append(param)
-            else:
-                ebm_params_with_decay.append(param)
-    ebm_param_groups = [
-        {'params': ebm_params_with_decay, 'lr': BASE_LR, 'weight_decay': weight_decay},
-        {'params': ebm_params_no_decay, 'lr': BASE_LR, 'weight_decay': 0.0}
-    ]
-    optimizers['ebm'] = DeepSpeedCPUAdam(ebm_param_groups)
+        if not param.requires_grad:
+            continue
+        (ebm_no_wd if skip_weight_decay(name) else ebm_wd).append(param)
+    optimizers['ebm'] = DeepSpeedCPUAdam([
+        {'params': ebm_wd,    'lr': BASE_LR, 'weight_decay': weight_decay},
+        {'params': ebm_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0}
+    ])
 
     return optimizers
 
