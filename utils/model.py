@@ -492,3 +492,25 @@ def update_model_rope_for_extended_context(model, new_seq_len, base=500000.0):
         # Update the RoPE buffers in the MultiHeadAttention module of each block.
         block.sa.update_rope_buffers(new_seq_len, base=base)
     return model
+
+def expand_pos_embedding(model, new_seq_len):
+    """Resize model.position_embedding_table to new_seq_len in‑place."""
+    old_table = model.position_embedding_table
+    old_len, dim = old_table.weight.size()
+
+    if new_seq_len <= old_len:          # nothing to do
+        model.block_size = new_seq_len
+        return
+
+    # 1. build a bigger table
+    new_table = nn.Embedding(new_seq_len, dim).to(old_table.weight.device)
+
+    # 2. copy existing weights
+    new_table.weight.data[:old_len] = old_table.weight.data
+
+    # 3. init the extra rows (same init you used originally)
+    nn.init.normal_(new_table.weight.data[old_len:], std=0.02)
+
+    # 4. replace & update block_size
+    model.position_embedding_table = new_table
+    model.block_size = new_seq_len
