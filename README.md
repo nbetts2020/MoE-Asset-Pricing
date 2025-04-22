@@ -34,16 +34,16 @@ Scraping the non-pricing aspects of this dataset was conducted across 10 EC2 t2.
 
 Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial News Dataset in Time Series"[^4].
 
-### SC8k-R
+### SC10k-R
 
-SC8k-R is a dataset of 8k high-quality, long-context finance reasoning examples, built from SC454k, with synthetic reasoning traces from Llama 4 Maverick. Each sample includes a financial news article, as well as other relevant articles and associated pricing data, where the given task is to predict the predict the price of the stock 30 days out. The reasoning trace attempts to use logic, rather than direct historical knowledge, to draw conclusions and derive its answer. The prompt is given as:
+SC10k-R is a dataset of 8k high-quality, long-context finance reasoning examples, built from SC454k, with synthetic reasoning traces from Gemini 2.5 Flash. Each sample includes a financial news article, as well as other relevant articles and associated pricing data, where the given task is to predict the predict the price of the stock 30 days out. The reasoning trace attempts to use logic, rather than direct historical knowledge, to draw conclusions and derive its answer. The prompt is given as:
 
 ```
 You will create Chain of Thought (CoT) reasoning traces. CoT is a prompting method that encourages structured thinking about a problem. It dissects the issue into a sequence of logical reasoning steps.
 
 You will receive a series of financial news articles (all articles are not guaranteed to be relevant towards completing the task), subsequent pricing data, and a ground truth label of that stock's price 30 days out, your task is to use this context to create sound reasoning traces that will lead to what the price of the stock will be 30 days out. You will know the answer in advance (do not mention this in your output), but will be creating a plausible chain of logic that gets you to arrive at that answer (true label denoted by <30 DAY LABEL>).
 
-Based on that, your role is to break it down into a series of logical reasoning traces and you will not use any historical knowledge for reasoning, only logical steps towards deriving a reasonable answer. Here's how to do it:
+Based on that, your role is to break it down into a series of logical reasoning traces, and you will not use any historical knowledge (outside of the current context) for reasoning, only logical steps and provided context for deriving a reasonable answer. Here's how to do it:
 
 1. **Break Down the Problem**: Split the question into sub-components.
 2. **Explore Hypotheses**: Propose 3-4 approaches to solve it, including flawed ones. This means looking at context (the various articles and pricing data) and deriving various perspectives on them and what they might mean for the stock's price a month from the last given price.
@@ -76,9 +76,11 @@ Based on the hypotheses I believe that...
 The most likely is...
 </reasoning>
 
-Be sure to include specifics numbers, figures, and information from the given context in your reasoning.
+Be sure to include specific numbers, figures, and information from the given context in your reasoning.
 
-Here's the context (remember ONLY <reasoning> and </reasoning> should be in your output (if there are other tags than these in the output, there will be trouble!), <30 DAY LABEL> represents the ground truth label, and do not mention the final price in your output nor make any definitive guesses, you are only generating a plausible reasoning trace that would derive that answer (do not mention anything like I've been told to not say this or that)):
+Be verbose if the problem requires it.
+
+Here's the context (remember ONLY <reasoning> and </reasoning> should be in your output (if there are other tags than these in the output, there will be trouble!), <30 DAY LABEL> represents the ground truth label (DO NOT mention <30 DAY LABEL> in your output) - you are only generating a plausible reasoning trace that would derive that answer (do not mention anything like I've been told to not say this or that)):
 ```
 
 Inspiration for the prompt was taken from this [discussion](https://github.com/huggingface/open-r1/discussions/164) on prompting GRPO.
