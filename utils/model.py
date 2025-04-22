@@ -6,11 +6,16 @@ from utils.config import config
 from utils.data import *
 from transformers import AutoTokenizer, LlamaTokenizerFast
 from torch.utils.checkpoint import checkpoint
-from ring_flash_attn.flash_attn_interface import (
+from ring_flash_attn.ring_flash_attn import (
     ring_flash_attn_func,
-    ring_flash_attn_varlen_func,
-    ring_flash_attn_varlen_qkvpacked_func
+    ring_flash_attn_qkvpacked_func,
 )
+from ring_flash_attn.ring_flash_attn_varlen import (
+    ring_flash_attn_varlen_func,
+    ring_flash_attn_varlen_qkvpacked_func,
+)
+from ring_flash_attn.ring_flash_attn import ring_flash_attn_qkvpacked_func
+
 from utils.ebm import EnergyBasedModel  # Still kept for potential future use
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 from cut_cross_entropy import linear_cross_entropy  # For efficient next-token loss
@@ -93,38 +98,30 @@ class MultiHeadAttention(nn.Module):
         
     def forward(self, x, return_attn_probs=False):
         B, T, C = x.size()
+    
         qkv = self.qkv_proj(x)
-        qkv_reshape = qkv.view(B, T, 3, self.n_head, self.head_size)
-        q = qkv_reshape[:, :, 0, :, :]
-        k = qkv_reshape[:, :, 1, :, :]
-        v = qkv_reshape[:, :, 2, :, :]
-
-        sin_t = self.rope_sin[:T, :].to(x.device)
-        cos_t = self.rope_cos[:T, :].to(x.device)
+        qkv = qkv.view(B, T, 3, self.n_head, self.head_size)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]   # [B, T, H, D]
+    
+        # RoPE
+        sin_t = self.rope_sin[:T].to(x.device)
+        cos_t = self.rope_cos[:T].to(x.device)
         q, k = apply_rope(q, k, sin_t, cos_t)
-
-        # Update the qkv_reshape with rotated q and k
-        qkv_reshape[:, :, 0, :, :] = q
-        qkv_reshape[:, :, 1, :, :] = k
-        qkv_reshape[:, :, 2, :, :] = v
-        qkv = qkv_reshape.view(B * T, 3, self.n_head, self.head_size)
-
-        cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
-        max_seqlen = T
-        outputs = ring_flash_attn_varlen_qkvpacked_func(
-            qkv, cu_seqlens, max_seqlen,
-            dropout_p=config.DROPOUT, softmax_scale=None, causal=True,
-            return_attn_probs=True
-        )
-        attn_output, attn_probs, full_attn = outputs
-        attn_output = attn_output.view(B, T, self.n_head, self.head_size)\
-                         .permute(0, 2, 1, 3).reshape(B, T, C)
-
-        out = self.out_proj(attn_output)
-        if return_attn_probs:
-            return out, attn_probs, full_attn
-        else:
-            return out
+    
+        # **make sure the kernel gets a clean, aligned buffer**
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+    
+        attn = ring_flash_attn_func(
+            q, k, v,
+            dropout_p=config.DROPOUT,
+            softmax_scale=None,
+            causal=True
+        )                                   # [B, T, H, D]
+    
+        attn = attn.permute(0, 2, 1, 3).reshape(B, T, C)
+        return self.out_proj(attn)
 
 #############################################
 # Expert, NoisyTopkRouter, SparseMoE, Block
@@ -237,7 +234,7 @@ class SparseMoELanguageModel(nn.Module):
         # We only need components for next-token prediction.
         self.tokenizer = LlamaTokenizerFast.from_pretrained(
         tokenizer_name, 
-        model_max_length=config.CONTEXT_WINDOW
+        model_max_length=config.BLOCK_SIZE
         )
         special_tokens = {
             'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>']
