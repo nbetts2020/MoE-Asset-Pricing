@@ -36,7 +36,7 @@ Inspiration for this dataset was taken from "FNSPID: A Comprehensive Financial N
 
 ### SC10k-R
 
-SC10k-R is a dataset of 8k high-quality, long-context finance reasoning examples, built from SC454k, with synthetic reasoning traces from Gemini 2.5 Flash. Each sample includes a financial news article, as well as other relevant articles and associated pricing data, where the given task is to predict the predict the price of the stock 30 days out. The reasoning trace attempts to use logic, rather than direct historical knowledge, to draw conclusions and derive its answer. The prompt is given as:
+SC10k-R is a dataset of 8k high-quality, long-context finance reasoning examples, built from SC454k, with synthetic reasoning traces from Gemini 2.5 Flash. Each sample includes a financial news article, as well as other relevant articles and associated pricing data, where the given task is to predict the predict the price of a stock 30 days out. The reasoning trace attempts to use logic, rather than direct historical knowledge, to draw conclusions and derive its answer. The prompt is given as:
 
 ```
 You will create Chain of Thought (CoT) reasoning traces. CoT is a prompting method that encourages structured thinking about a problem. It dissects the issue into a sequence of logical reasoning steps.
