@@ -81,7 +81,7 @@ def train_model(
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
-                    loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
+                    loss = model.forward_next_token_efficient(input_ids, reduction="mean")
 
             if use_deepspeed:
                 engine.zero_grad()
@@ -158,7 +158,7 @@ def train_model(
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
-                    loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
+                    loss = model.forward_next_token_efficient(input_ids, reduction="mean")
 
             if use_deepspeed:
                 engine.zero_grad()
@@ -213,8 +213,7 @@ def train_model(
                         attention_mask=None,
                         labels=input_ids,
                         latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
-                        reduction="mean",
-                        force_bf16=True
+                        reduction="mean"
                     )
             if use_deepspeed:
                 engine.zero_grad()
