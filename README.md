@@ -101,7 +101,7 @@ This combination enables the model to focus on the most relevant data within the
 
 **Custom Training Pipeline:** Optimized for training on the NVIDIA Ampere architecture, employing techniques like mixed precision and gradient checkpointing for efficient memory utilization. DeepSpeed, Microsoft's distributed learning library, is used to scale ADAPT-1B. Stage 3 ZeRO optimization is used for full parameter and activation partitioning across GPUs, while offloading all optimizer states and operations to the CPU.
 
-**Latent Reasoning:** Drawing from Meta's Coconut framework, ADAPT-1B performs reasoning in the latent space before producing answers. In Coconut, "continuous thoughts" are hidden states recursively fed back into the model, allowing reasoning to unfold internally without emitting language tokens. ADAPT-1B extends this idea using a curriculum learning strategy inspired by iCoT, using the SC8k-R dataset to gradually replace explicit reasoning tokens with latent ones - allowing the model to internalize reasoning steps within its latent space.
+**Latent Reasoning:** Drawing from Meta's Coconut framework, ADAPT-1B performs reasoning in the latent space before producing answers. In Coconut, "continuous thoughts" are hidden states recursively fed back into the model, allowing reasoning to unfold internally without emitting language tokens. ADAPT-1B extends this idea using a curriculum learning strategy inspired by iCoT, using the SC10k-R dataset to gradually replace explicit reasoning tokens with latent ones - allowing the model to internalize reasoning steps within its latent space.
 
 **FlashAttention 2**[^9][^10]: Implemented for efficient and scalable attention computation, enabling the model to handle long sequences effectively.
 
@@ -119,7 +119,7 @@ Training proceeds in four stages:
 
 - **Pre-training**: Standard LLM pre-training with 4K block size using a Mixture of Experts transformer (4 experts, top-2 gating), trained with cut cross entropy loss.  
 - **Continuous Pre-training**: Extends context window to 64K by updating rotary positional embeddings by training on 10k long-context examples.
-- **Latent Reasoning Fine‑tuning**: Applies a two‑phase curriculum learning strategy on the SC8k-R dataset - first partially masking explicit reasoning tokens with a special latent token, then fully masking them, so model progressively internalizes Chain‑of‑Thought in its hidden states without ever emitting the reasoning text.
+- **Latent Reasoning Fine‑tuning**: Applies a two‑phase curriculum learning strategy on the SC10k-R dataset - first partially masking explicit reasoning tokens with a special latent token, then fully masking them, so model progressively internalizes Chain‑of‑Thought in its hidden states without ever emitting the reasoning text.
 - **Energy‑Based Model (EBM) Training**: Trains a contrastive, margin‑based EBM on bootstrapped context candidates on 25k long-context examples (25 bootstrapped samples per sample), teaching it to assign lower energy to the most informative contexts and select the optimal input at inference time.
 
 ### Configs
