@@ -738,30 +738,34 @@ def prepare_dataloader(epoch, window_index, tokenizer, batch_size, shuffle,
                        global_offset, global_max, args, sampler=None):
     """
     Builds a DataLoader for a given chunk based on the provided epoch and window_index.
-    Loads data via get_data(), applies PrecomputedDataset, and creates DataLoader.
-    Uses DistributedSampler only if torch.distributed is initialized.
+    Uses DistributedSampler when in a torch.distributed job so each rank sees a disjoint slice.
     """
     df = get_data(epoch, window_index, global_offset, global_max, args=args)
     dataset = PrecomputedDataset(df, tokenizer, block_size=config.BLOCK_SIZE)
 
-    # Use DistributedSampler only if the default process group is initialized.
-    # if torch.distributed.is_available() and torch.distributed.is_initialized():
-    #     sampler = DistributedSampler(dataset, shuffle=shuffle)
-    # else:
-    #     sampler = None
-    sampler = None
+    # if we're in a distributed setting, replace shuffle with a DistributedSampler
+    if torch.distributed.is_initialized():
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank(),
+            shuffle=shuffle,
+            seed=args.random_seed
+        )
+        shuffle = False   # sampler handles shuffling
+    else:
+        sampler = None
 
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(shuffle and sampler is None),
+        shuffle=shuffle and sampler is None,
         sampler=sampler,
         num_workers=0,
         collate_fn=custom_collate_fn,
         pin_memory=True,
         drop_last=True
     )
-    return dataloader
 
 def prepare_tasks(tokenizer, args, k=3):
     """
