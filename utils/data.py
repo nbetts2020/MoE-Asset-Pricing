@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import LlamaTokenizerFast
 from utils.config import config
 from huggingface_hub import hf_hub_download
+from torch.utils.data.distributed import DistributedSampler
 
 # Disable tokenizer parallelism to avoid warnings after fork.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -174,7 +175,6 @@ def prepare_ft_dataloader(
     os.remove(file_path)
 
     if stage in (1, 2):
-        # only for ft_dataset_2 we replace the label marker
         df["text"] = df["text"].apply(
             lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
         )
@@ -187,7 +187,6 @@ def prepare_ft_dataloader(
         )
         collate = custom_collate_fn
         drop_last = True
-
     else:
         text_cols = [f"text_iteration_{i}" for i in range(1, 27)]
         label_col = "weighted_avg_720_hrs"
@@ -200,6 +199,17 @@ def prepare_ft_dataloader(
         )
         collate = bootstrap_collate_fn
         drop_last = (stage < 8)
+
+    # **Add this block** to shard data across ranks
+    if torch.distributed.is_initialized() and sampler is None:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank(),
+            shuffle=shuffle,
+            seed=getattr(args, "random_seed", 42)
+        )
+        shuffle = False   # sampler will handle shuffling
 
     return DataLoader(
         dataset,
