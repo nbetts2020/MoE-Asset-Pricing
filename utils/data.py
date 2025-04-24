@@ -62,6 +62,8 @@ class PrecomputedDataset(Dataset):
         self.latent_id = tokenizer.convert_tokens_to_ids('<bot>')
         self.start_id = tokenizer.convert_tokens_to_ids('<reasoning>')
         self.end_id = tokenizer.convert_tokens_to_ids('</reasoning>')
+        # cache BOS token id (for <s>)
+        self.bos_id = tokenizer.bos_token_id
 
     def __len__(self):
         return len(self.df)
@@ -81,6 +83,9 @@ class PrecomputedDataset(Dataset):
             return_tensors='pt'
         )
         ids = enc['input_ids'].squeeze(0).tolist()
+
+        # prepend BOS (<s>) and trim to block_size
+        ids = [self.bos_id] + ids[:-1]
 
         if self.gradual_latent_mask or self.full_latent_mask:
             ids = schedule_masking(
@@ -178,7 +183,7 @@ def prepare_ft_dataloader(
             tokenizer,
             block_size=block_size,
             gradual_latent_mask=gradual_latent_mask,
-            full_attention_mask=full_latent_mask
+            full_latent_mask=full_latent_mask
         )
         collate = custom_collate_fn
         drop_last = True
