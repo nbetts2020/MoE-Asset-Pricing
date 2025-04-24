@@ -247,6 +247,7 @@ class SparseMoELanguageModel(nn.Module):
         for block in self.blocks:
             x, _ = block(x, attention_mask)
         x = self.ln_f(x)
+        x = x.half()            # <-- cast back to FP16 to match classifier
 
         with GatheredParameters(self.token_embedding_table.weight, modifier_rank=0):
             classifier = self.token_embedding_table.weight.data.clone().half()
@@ -300,6 +301,7 @@ class SparseMoELanguageModel(nn.Module):
             for block in self.blocks:
                 x, _ = block(x, truncated_am)
             x = self.ln_f(x)
+            x = x.half()            # <-- cast back to FP16 to match classifier
 
             for b, l in enumerate(latent_positions):
                 if pass_idx < len(l) and l[pass_idx] > 0:
@@ -309,6 +311,7 @@ class SparseMoELanguageModel(nn.Module):
         for block in self.blocks:
             x, _ = block(x, attention_mask[:, :Ttrim])
         x = self.ln_f(x)
+        x = x.half()            # <-- cast back to FP16 to match classifier
 
         with GatheredParameters(self.token_embedding_table.weight, modifier_rank=0):
             classifier = self.token_embedding_table.weight.data.clone().half()
