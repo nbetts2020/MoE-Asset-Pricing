@@ -219,7 +219,7 @@ class SparseMoELanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embed, dtype=torch.float32)
         self.attn_pool = nn.Linear(n_embed, 1, bias=False)
         self.block_size = block_size
-        self.ebm = EnergyBasedModel(n_emit=torch.float16)  # unchanged
+        self.ebm = EnergyBasedModel(n_embed)
 
     def preprocess_input(self, input_ids, mode='next_token'):
         device = input_ids.device
