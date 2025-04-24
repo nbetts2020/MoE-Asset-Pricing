@@ -78,11 +78,18 @@ def train_model(
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
+            local_chunk_size = input_ids.size(1)
+            rank             = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            seq_offset       = rank * local_chunk_size
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().half()
-                    loss = model.forward_next_token_efficient(input_ids, reduction="mean")
-
+                    loss = model.forward_next_token_efficient(
+                        input_ids,
+                        reduction="mean",
+                        attention_mask=None,
+                        offset=seq_offset
+                    )
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
@@ -155,11 +162,18 @@ def train_model(
         epoch_loss = 0.0
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
+            local_chunk_size = input_ids.size(1)
+            rank             = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            seq_offset       = rank * local_chunk_size
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().half()
-                    loss = model.forward_next_token_efficient(input_ids, reduction="mean")
-
+                    loss = model.forward_next_token_efficient(
+                        input_ids,
+                        reduction="mean",
+                        attention_mask=None,
+                        offset=seq_offset
+                    )
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
@@ -205,6 +219,9 @@ def train_model(
         epoch_loss = 0.0
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
+            local_chunk_size = input_ids.size(1)
+            rank             = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            seq_offset       = rank * local_chunk_size
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
                     model._gathered_weights = model.token_embedding_table.weight.clone().half()
@@ -213,7 +230,8 @@ def train_model(
                         attention_mask=None,
                         labels=input_ids,
                         latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
-                        reduction="mean"
+                        reduction="mean",
+                        offset=seq_offset
                     )
             if use_deepspeed:
                 engine.zero_grad()
@@ -262,7 +280,7 @@ def train_model(
                 flat_ids = ids.view(B*K, T)
 
                 with torch.no_grad():
-                    embs = model.get_embeddings(flat_ids, pool=True)
+                    embs = model.get_embeddings(flat_ids, pool=True, offset=seq_offset)
                 embs = embs.view(B, K, -1)
 
                 flat_embs = embs.view(B*K, -1)
