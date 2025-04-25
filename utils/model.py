@@ -1,16 +1,17 @@
 # utils/model.py
 import math
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaTokenizerFast
 from deepspeed.runtime.zero.stage3 import GatheredParameters
 from cut_cross_entropy import linear_cross_entropy
 from utils.config import config
-from utils.ebm import EnergyBasedModel   # <-- still used by training script
+from utils.ebm import EnergyBasedModel            # still used by training
 
 # ---------------------------------------------------------------------------
-#  Ring-Flash-Attention (sequence-parallel) kernel
+#  Ring-Flash-Attention kernel (from Dao et al.)
 # ---------------------------------------------------------------------------
 from ring_flash_attn.ring_flash_attn_varlen import (
     ring_flash_attn_varlen_qkvpacked_func,
@@ -19,7 +20,7 @@ from ring_flash_attn.ring_flash_attn_varlen import (
 # ────────────────────────────────────────────────────────────────────────────
 # Rotary helpers
 # ────────────────────────────────────────────────────────────────────────────
-def build_sin_cos(seq_len, dim, device, base=10_000.0):
+def build_sin_cos(seq_len: int, dim: int, device, base: float = 10_000.0):
     pos = torch.arange(seq_len, dtype=torch.float32, device=device).unsqueeze(1)
     inv = torch.exp(
         torch.arange(0, dim * 2, 2, dtype=torch.float32, device=device)
@@ -30,8 +31,12 @@ def build_sin_cos(seq_len, dim, device, base=10_000.0):
     return sin, cos
 
 
-def apply_rope(q, k, sin, cos):
-    """q,k : (B,T,H,Dh)  •  sin,cos : (T,Dh//2)"""
+def apply_rope(q: torch.Tensor, k: torch.Tensor, sin, cos):
+    """
+    q, k  : (B, T, H, Dh)
+    sin   : (T, Dh//2)
+    cos   : (T, Dh//2)
+    """
     half = q.shape[-1] // 2
     q1, q2 = q[..., :half], q[..., half:]
     k1, k2 = k[..., :half], k[..., half:]
@@ -43,77 +48,145 @@ def apply_rope(q, k, sin, cos):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Multi-Head Self-Attention (sequence parallel Ring-Flash)
+# Multi-Head Self-Attention (sequence-parallel Ring-Flash)
 # ────────────────────────────────────────────────────────────────────────────
 class MultiHeadAttention(nn.Module):
+    """
+    Implements exact ring-attention with Flash-Attention kernel.
+    Each rank receives only a *slice* of the full sequence (T_local) and
+    rotates its K/V blocks around the ring to compute the global context.
+    """
     def __init__(self, n_embed: int, n_head: int):
         super().__init__()
-        self.n_head = n_head
+        self.n_head   = n_head
         self.head_dim = n_embed // n_head
-        assert n_embed % n_head == 0
+        assert n_embed % n_head == 0, "n_embed must be divisible by n_head"
 
         self.qkv  = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed,     n_embed, bias=False)
 
+        # RoPE pre-computed trigs (CPU buffer → broadcast to GPU each call)
         self.max_seq_len = config.BLOCK_SIZE
-        sin, cos = build_sin_cos(self.max_seq_len, self.head_dim // 2, torch.device('cpu'))
+        sin, cos = build_sin_cos(
+            self.max_seq_len, self.head_dim // 2, torch.device("cpu")
+        )
         self.register_buffer("rope_sin", sin, persistent=False)
         self.register_buffer("rope_cos", cos, persistent=False)
 
-    # called from helper when context window is enlarged
+        # ring topology information (populated lazily in forward)
+        self.rank         = 0
+        self.world_size   = 1
+        self.next_rank    = 0
+        self.prev_rank    = 0
+
+    # called externally when context is enlarged
     def update_rope_buffers(self, new_len: int, base: float = 5e5):
         self.max_seq_len = new_len
-        sin, cos = build_sin_cos(new_len, self.head_dim // 2, torch.device('cpu'), base)
+        sin, cos = build_sin_cos(
+            new_len, self.head_dim // 2, torch.device("cpu"), base
+        )
         self.register_buffer("rope_sin", sin, persistent=False)
         self.register_buffer("rope_cos", cos, persistent=False)
 
+    # ------------------------------------------------------------------
+    # Fwd
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, seq_offset: int = 0):
         """
-        x         : (B,T,D)
-        seq_offset: starting position of this *local* chunk in the *global*
-                    sequence (needed for RoPE when doing sequence parallel)
+        x          : (B, T_local, D)
+        seq_offset : starting *global* position of this local chunk
+                     (needed for RoPE in sequence parallel training)
         """
-        x = x.half()                      # FP16 activations
-        B, T, D = x.shape
+        B, T_local, D = x.shape
+        x = x.half()
 
-        # ---- QKV projection -------------------------------------------------
-        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
-        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        # ---------------- distributed context -------------------------
+        if dist.is_initialized():
+            if self.world_size == 1:       # populate once per process
+                self.world_size = dist.get_world_size()
+                self.rank       = dist.get_rank()
+                self.next_rank  = (self.rank + 1) % self.world_size
+                self.prev_rank  = (self.rank - 1 + self.world_size) % self.world_size
+        else:
+            self.world_size = 1
 
-        # ---- apply RoPE -----------------------------------------------------
-        pos   = torch.arange(seq_offset, seq_offset + T, device=x.device)
+        # ---------------- QKV projection ------------------------------
+        qkv = self.qkv(x).view(B, T_local, 3, self.n_head, self.head_dim)
+        q, k_local, v_local = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+        # ---------------- RoPE ----------------------------------------
+        pos   = torch.arange(seq_offset, seq_offset + T_local, device=x.device)
         sin_t = self.rope_sin[pos]
         cos_t = self.rope_cos[pos]
-        q, k  = apply_rope(q, k, sin_t, cos_t)
+        q, k_local = apply_rope(q, k_local, sin_t, cos_t)
 
-        # ---- pack for varlen kernel ----------------------------------------
-        qkv_packed = (
-            torch.stack([q, k, v], dim=2)
-            .contiguous()
-            .view(B * T, 3, self.n_head, self.head_dim)
-        )  # (total_tokens,3,H,Dh)
-
-        cu_seqlens = torch.arange(
-            0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device
+        # ---------------- Ring pass -----------------------------------
+        # Accumulator for the context. We *sum* partial contexts, then
+        # normalise once at the end with a global softmax denominator.
+        ctx_acc = torch.zeros_like(q)       # (B, T_local, H, Dh)
+        lse_acc = torch.full(               # log-sum-exp denominator
+            (B, self.n_head, T_local), -torch.inf, device=x.device, dtype=q.dtype
         )
 
-        # ---- Ring-Flash-Attention kernel -----------------------------------
-        attn = ring_flash_attn_varlen_qkvpacked_func(
-            qkv_packed,
-            cu_seqlens,
-            max_seqlen=T,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=True,
-        )  # (total_tokens, H, Dh)
+        cur_k, cur_v = k_local, v_local     # buffers that will rotate
+        for hop in range(self.world_size):
+            # 1.  Context from current K/V block ----------------------
+            qkv_packed = (
+                torch.stack([q, cur_k, cur_v], dim=2)
+                .contiguous()
+                .view(B * T_local, 3, self.n_head, self.head_dim)
+            )
+            cu_seqlens = torch.arange(
+                0, (B + 1) * T_local, step=T_local,
+                dtype=torch.int32, device=x.device
+            )
+            # FlashAttention returns context but also log-sum-exp; we
+            # get both so we can do exact softmax across hops.
+            ctx_part, lse_part = ring_flash_attn_varlen_qkvpacked_func(
+                qkv_packed,
+                cu_seqlens,
+                max_seqlen=T_local,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=True,
+                return_log_sum_exp=True      # (total,B*H*T_local)
+            )
+            ctx_part = (
+                ctx_part.view(B, T_local, self.n_head, self.head_dim)
+            )
+            lse_part = lse_part.view(B, self.n_head, T_local)
 
-        attn = (
-            attn
-            .view(B, T, self.n_head, self.head_dim)
+            # 2.  Merge numerically-stable softmax pieces -------------
+            lse_new = torch.maximum(lse_acc, lse_part)
+            ctx_acc = (
+                ctx_acc * torch.exp(lse_acc.unsqueeze(-1) - lse_new.unsqueeze(-1))
+                + ctx_part * torch.exp(lse_part.unsqueeze(-1) - lse_new.unsqueeze(-1))
+            )
+            lse_acc = lse_new
+
+            # 3.  Rotate K/V blocks around the ring -------------------
+            if hop < self.world_size - 1:   # no need after final hop
+                send_k = cur_k.contiguous()
+                send_v = cur_v.contiguous()
+                recv_k = torch.empty_like(k_local)
+                recv_v = torch.empty_like(v_local)
+
+                # overlap comm & compute (isend / irecv)
+                req_k = dist.isend(send_k, dst=self.next_rank)
+                req_v = dist.isend(send_v, dst=self.next_rank)
+                dist.recv(recv_k, src=self.prev_rank)
+                dist.recv(recv_v, src=self.prev_rank)
+                req_k.wait(); req_v.wait()
+
+                cur_k, cur_v = recv_k, recv_v
+
+        # 4.  Final projection  ---------------------------------------
+        out = (
+            ctx_acc.view(B, T_local, self.n_head, self.head_dim)
             .permute(0, 2, 1, 3)
-            .reshape(B, T, D)
+            .reshape(B, T_local, D)
         )
-        return self.proj(attn)
+        return self.proj(out)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -141,9 +214,9 @@ class NoisyTopkRouter(nn.Module):
         self.lin_noise  = nn.Linear(d_model, n_exp)
 
     def forward(self, h):
-        logits  = self.lin_logits(h)
-        noise   = torch.randn_like(logits) * F.softplus(self.lin_noise(h))
-        noisy   = logits + noise
+        logits = self.lin_logits(h)
+        noise  = torch.randn_like(logits) * F.softplus(self.lin_noise(h))
+        noisy  = logits + noise
 
         full_p  = F.softmax(noisy, dim=-1)
         topk, ix = noisy.topk(self.top_k, dim=-1)
@@ -174,8 +247,8 @@ class SparseMoE(nn.Module):
             mask = (ix == i).any(-1).view(-1)
             sel  = torch.nonzero(mask).squeeze(-1)[:cap]
             if sel.numel():
-                out   = exp(flat_x[sel])
-                gate  = flat_p[sel, i].unsqueeze(1)
+                out  = exp(flat_x[sel])
+                gate = flat_p[sel, i].unsqueeze(1)
                 updates.index_add_(0, sel, out * gate)
 
         y = updates.view(B, T, -1)
@@ -204,38 +277,39 @@ class Block(nn.Module):
 # ────────────────────────────────────────────────────────────────────────────
 class SparseMoELanguageModel(nn.Module):
     """
-    Provides:
-      • forward_next_token_efficient   (Cut-Xent next-token loss)
-      • forward_coconut                (latent-reasoning multi-pass)
-      • get_embeddings                 (token-wise or pooled)
-    All attributes referenced elsewhere (ebm, token_embedding_table, etc.) are
-    still present.
+    forward_next_token_efficient   – Cut-Xent next-token objective
+    forward_coconut                – latent-reasoning Coconut loss
+    get_embeddings                 – token-wise or pooled
     """
 
     def __init__(
         self,
-        n_embed,
-        n_head,
-        n_layer,
-        block_size,
-        dropout,
-        num_experts,
-        top_k,
-        tokenizer_name="hf-internal-testing/llama-tokenizer",
+        n_embed: int,
+        n_head: int,
+        n_layer: int,
+        block_size: int,
+        dropout: float,
+        num_experts: int,
+        top_k: int,
+        tokenizer_name: str = "hf-internal-testing/llama-tokenizer",
     ):
         super().__init__()
 
-        # ---------------- tokenizer ----------------------------------------
+        # ---------------- tokenizer --------------------------------------
         self.tokenizer = LlamaTokenizerFast.from_pretrained(
             tokenizer_name, model_max_length=config.BLOCK_SIZE
         )
         self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": ["<bot>", "<start_latent>", "<end_latent>",
-                                           "<reasoning>", "</reasoning>"]}
+            {
+                "additional_special_tokens": [
+                    "<bot>", "<start_latent>", "<end_latent>",
+                    "<reasoning>", "</reasoning>"
+                ]
+            }
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # ---------------- embeddings ---------------------------------------
+        # ---------------- embeddings -------------------------------------
         vocab = self.tokenizer.vocab_size
         self.tok_emb = nn.Embedding(vocab, n_embed)
         self.pos_emb = nn.Embedding(block_size, n_embed)
@@ -243,7 +317,7 @@ class SparseMoELanguageModel(nn.Module):
         self.token_embedding_table    = self.tok_emb
         self.position_embedding_table = self.pos_emb
 
-        # ---------------- transformer --------------------------------------
+        # ---------------- transformer ------------------------------------
         self.blocks = nn.ModuleList(
             [Block(n_embed, n_head, num_experts, top_k) for _ in range(n_layer)]
         )
@@ -251,7 +325,7 @@ class SparseMoELanguageModel(nn.Module):
         self.attn_pool = nn.Linear(n_embed, 1, bias=False)
         self.block_size = block_size
 
-        # ---------------- integrated EBM -----------------------------------
+        # ---------------- integrated EBM ---------------------------------
         self.ebm = EnergyBasedModel(n_embed)
 
     # ======================================================================
@@ -263,17 +337,24 @@ class SparseMoELanguageModel(nn.Module):
         pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
         if T >= self.block_size:
             return ids[:, -self.block_size:]
-        pad = torch.full((B, self.block_size - T), pad_id,
-                         dtype=ids.dtype, device=ids.device)
+        pad = torch.full(
+            (B, self.block_size - T),
+            pad_id, dtype=ids.dtype, device=ids.device
+        )
         return torch.cat([ids, pad], dim=1)
 
     # ======================================================================
-    #  Next-token objective (Cut Cross Entropy)
+    #  Next-token objective (Cut Cross-Entropy)
     # ======================================================================
-    def forward_next_token_efficient(self, ids, reduction="mean",
-                                     attention_mask=None, offset=0):
+    def forward_next_token_efficient(
+        self,
+        ids,
+        reduction="mean",
+        attention_mask=None,
+        offset: int = 0,
+    ):
         """
-        ids : (B,T_local)   – *local slice* when doing sequence parallelism
+        ids : (B, T_local) – local slice in sequence-parallel mode
         """
         ids = self._pad_or_trim(ids)
         B, T = ids.shape
@@ -292,16 +373,21 @@ class SparseMoELanguageModel(nn.Module):
 
         pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
         return linear_cross_entropy(
-            x, cls_w, ids, ignore_index=pad_id,
-            reduction=reduction, shift=1
+            x, cls_w, ids,
+            ignore_index=pad_id, reduction=reduction, shift=1
         )
 
     # ======================================================================
-    #  Coconut-style latent-reasoning forward
+    #  Coconut latent-reasoning forward
     # ======================================================================
     def forward_coconut(
-        self, ids, attention_mask=None, labels=None,
-        latent_token_id=99998, reduction="mean", offset: int = 0
+        self,
+        ids,
+        attention_mask=None,
+        labels=None,
+        latent_token_id=99998,
+        reduction="mean",
+        offset: int = 0,
     ):
         device = ids.device
         ids = self._pad_or_trim(ids)
@@ -315,7 +401,7 @@ class SparseMoELanguageModel(nn.Module):
         with torch.no_grad():
             tok = self.tok_emb(ids)
             pos = self.pos_emb(torch.arange(T, device=device))
-            base = tok + pos                     # (B,T,D)
+            base = tok + pos                         # (B,T,D)
 
         # 2) locate latent tokens
         latent_pos = [
@@ -325,7 +411,7 @@ class SparseMoELanguageModel(nn.Module):
         max_lat = max((len(p) for p in latent_pos), default=0)
         embeds = base.clone().requires_grad_(True)
 
-        # 3) multi-pass
+        # 3) multi-pass latent filling
         for p in range(max_lat):
             active = [lst[p] for lst in latent_pos if p < len(lst)]
             if not active:
@@ -347,19 +433,25 @@ class SparseMoELanguageModel(nn.Module):
         x = self.ln_f(x).half()
 
         if labels is None:
-            return x  # hidden states if caller wants
+            return x
         labels = labels[:, -T:]
         with GatheredParameters(self.tok_emb.weight, modifier_rank=0):
             cls_w = self.tok_emb.weight.detach().clone().half()
         return linear_cross_entropy(
-            x, cls_w, labels, ignore_index=pad_id,
-            reduction=reduction, shift=1
+            x, cls_w, labels,
+            ignore_index=pad_id, reduction=reduction, shift=1
         )
 
     # ======================================================================
     #  Embedding extractor (token-wise or pooled)
     # ======================================================================
-    def get_embeddings(self, ids, pool=False, attention_mask=None, offset=0):
+    def get_embeddings(
+        self,
+        ids,
+        pool: bool = False,
+        attention_mask=None,
+        offset: int = 0,
+    ):
         ids = self._pad_or_trim(ids)
         B, T = ids.shape
         if attention_mask is None:
@@ -374,19 +466,19 @@ class SparseMoELanguageModel(nn.Module):
         x = self.ln_f(x)
 
         if not pool:
-            return x  # (B,T,D)
+            return x                                   # (B,T,D)
 
         # attention-pool
-        scores = self.attn_pool(x).squeeze(-1)  # (B,T)
+        scores = self.attn_pool(x).squeeze(-1)         # (B,T)
         scores = scores.masked_fill(~attention_mask, -1e9)
-        w = F.softmax(scores, dim=1)            # (B,T)
-        return torch.einsum("btd,bt->bd", x, w)  # (B,D)
+        w = F.softmax(scores, dim=1)                   # (B,T)
+        return torch.einsum("btd,bt->bd", x, w)        # (B,D)
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Helpers to extend context
 # ────────────────────────────────────────────────────────────────────────────
-def update_model_rope_for_extended_context(model, new_len, base=5e5):
+def update_model_rope_for_extended_context(model, new_len, base: float = 5e5):
     for blk in model.blocks:
         blk.attn.update_rope_buffers(new_len, base)
     return model
@@ -401,5 +493,5 @@ def expand_pos_embedding(model, new_len):
     new_emb.weight.data[:old_len] = model.pos_emb.weight.data
     nn.init.normal_(new_emb.weight.data[old_len:], std=0.02)
     model.pos_emb = new_emb
-    model.position_embedding_table = model.pos_emb  # keep alias in sync
+    model.position_embedding_table = model.pos_emb  # keep alias
     model.block_size = new_len
