@@ -32,6 +32,7 @@ from utils.utils import (
     process_run_dataset
 )
 from utils.config import config
+import torch.distributed as dist
 from pandarallel import pandarallel
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
@@ -127,6 +128,9 @@ def main():
     
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
+    if torch.cuda.is_available() and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    config.RING_GROUP = dist.new_group(backend="nccl")
 
     # Handle small/test-mode hyperparameters
     if args.test_model:
@@ -225,7 +229,7 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-
+        
         # Prepare data
         train_loader = prepare_dataloader(
             epoch=1,
@@ -291,6 +295,7 @@ def main():
             replace_method="auto",
             config=args.deepspeed_config
         )
+
         model.eval()
         logging.info(
             f"Rank {current_rank}: Main transformer model loaded from {consolidated_model_path} "
@@ -483,7 +488,6 @@ def main():
 
     # Destroy distributed process group if it was used
     if args.use_ddp:
-        import torch.distributed as dist
         dist.destroy_process_group()
 
 if __name__ == "__main__":
