@@ -7,7 +7,7 @@ class Config:
     N_EMBED = 1792        # Embedding dimension
     N_HEAD = 32          # Number of attention heads
     N_LAYER = 24         # Number of transformer blocks
-    BLOCK_SIZE = 4048    # Maximum sequence length during rl attention - not max context window
+    BLOCK_SIZE = 4096    # Maximum sequence length during rl attention - not max context window
     CONTEXT_WINDOW = 16384
     DROPOUT = 0.1        # Dropout rate
     NUM_EXPERTS = 4      # Number of experts in the MoE layer
