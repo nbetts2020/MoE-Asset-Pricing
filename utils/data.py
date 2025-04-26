@@ -49,6 +49,10 @@ def schedule_masking(input_ids_list, reasoning_start_id, reasoning_end_id, laten
             input_ids_list[i] = latent_token_id
     return input_ids_list
 
+def rreplace(s, old, new, occurrence=1):
+    parts = s.rsplit(old, occurrence)
+    return new.join(parts)
+
 # -------------------------------------------------------------------------
 # PRECOMPUTED SINGLE-TEXT DATASET
 # -------------------------------------------------------------------------
