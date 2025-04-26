@@ -78,9 +78,9 @@ def train_model(
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
-                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
+                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.float16)
                     loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
 
             if use_deepspeed:
@@ -155,9 +155,9 @@ def train_model(
         epoch_loss = 0.0
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
-                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
+                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.float16)
                     loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
 
             if use_deepspeed:
@@ -205,9 +205,9 @@ def train_model(
         epoch_loss = 0.0
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
-                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.bfloat16)
+                    model._gathered_weights = model.token_embedding_table.weight.clone().to(torch.float16)
                     loss = model.forward_coconut(
                         input_ids=input_ids,
                         attention_mask=None,
