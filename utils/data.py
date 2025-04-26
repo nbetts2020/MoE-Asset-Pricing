@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "hf-internal-testing/llama-tokenizer")
 GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(
     TOKENIZER_NAME,
-    model_max_length=config.BLOCK_SIZE
+    model_max_length=config.CONTEXT_WINDOW
 )
 
 # Add special tokens
@@ -84,7 +84,7 @@ class PrecomputedDataset(Dataset):
             new_text,
             truncation=True,
             padding='max_length',
-            max_length=self.block_size,
+            max_length=config.CONTEXT_WINDOW,
             return_tensors='pt'
         )
         ids = enc['input_ids'].squeeze(0).tolist()
@@ -129,7 +129,7 @@ class PrecomputedBootstrapDataset(Dataset):
                 txt,
                 truncation=True,
                 padding='max_length',
-                max_length=self.block_size,
+                max_length=config.CONTEXT_WINDOW,
                 return_tensors='pt'
             )
             all_ids.append(enc['input_ids'].squeeze(0))
