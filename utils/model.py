@@ -33,18 +33,27 @@ def build_sin_cos(seq_len: int, dim: int, device, base: float = 10_000.0):
 
 
 def apply_rope(q, k, sin, cos):
-    """RoPE in-place   q,k: (B,T,H,Dh)   sin,cos: (T,Dh/2)"""
+    """RoPE out-of-place  q,k: (B,T,H,Dh)   sin,cos: (T,Dh/2)"""
     half = q.size(-1) // 2
-    # guard against mismatched table width
+    # crop tables if needed
     if sin.size(-1) != half:
         sin, cos = sin[..., :half], cos[..., :half]
 
-    q1, q2 = q[..., :half], q[..., half:]
-    k1, k2 = k[..., :half], k[..., half:]
-    sin, cos = sin.unsqueeze(0).unsqueeze(2), cos.unsqueeze(0).unsqueeze(2)
-    q[..., :half], q[..., half:] = q1 * cos - q2 * sin, q2 * cos + q1 * sin
-    k[..., :half], k[..., half:] = k1 * cos - k2 * sin, k2 * cos + k1 * sin
-    return q, k
+    # reshape sin/cos to (1, T, 1, Dh/2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    cos = cos.unsqueeze(0).unsqueeze(2)
+
+    # split heads
+    q1, q2 = q.split(half, dim=-1)
+    k1, k2 = k.split(half, dim=-1)
+
+    # compute rotated embeddings out-of-place
+    q_rot = torch.cat([q1 * cos - q2 * sin,
+                       q2 * cos + q1 * sin], dim=-1)
+    k_rot = torch.cat([k1 * cos - k2 * sin,
+                       k2 * cos + k1 * sin], dim=-1)
+
+    return q_rot, k_rot
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -88,66 +97,98 @@ class MultiHeadAttention(nn.Module):
     # ------------------------------------------------------------
     def _forward_flash(self, x, return_attn_probs=False):
         B, T, _ = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
-        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
 
-        sin_t, cos_t = self.rope_sin[:T].to(x.device), self.rope_cos[:T].to(x.device)
+        # 1) project & unbind Q/K/V
+        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(2)
+
+        # 2) apply RoPE
+        sin_t = self.rope_sin[:T].to(x.device)
+        cos_t = self.rope_cos[:T].to(x.device)
         q, k = apply_rope(q, k, sin_t, cos_t)
 
-        qkv_flat = torch.stack([q, k, v], dim=2).view(B * T, 3, self.n_head, self.head_dim)
-        cu_seqlens = torch.arange(0, (B + 1) * T, T, device=x.device, dtype=torch.int32)
+        # 3) run flash-attn
+        qkv_flat  = torch.stack([q, k, v], dim=2) \
+                         .view(B * T, 3, self.n_head, self.head_dim)
+        cu_seqlens = torch.arange(0, (B + 1) * T, T,
+                                 device=x.device, dtype=torch.int32)
 
-        out, attn_probs, _ = flash_attn_unpadded_qkvpacked_func(
+        ret = flash_attn_unpadded_qkvpacked_func(
             qkv_flat, cu_seqlens, T,
             dropout_p=config.DROPOUT, softmax_scale=None,
             causal=True, return_attn_probs=return_attn_probs,
         )
-        out = out.view(B, T, self.n_head, self.head_dim).permute(0, 2, 1, 3).reshape_as(x)
+
+        if return_attn_probs:
+            # unpack only the first two outputs
+            out, attn_probs = ret[0], ret[1]
+        else:
+            # single-Tensor return
+            out = ret if isinstance(ret, torch.Tensor) else ret[0]
+            attn_probs = None
+
+        # 4) reshape & project
+        out = out.view(B, T, self.n_head, self.head_dim) \
+                 .permute(0, 2, 1, 3).reshape_as(x)
         proj = self.proj(out)
+
         return (proj, attn_probs, None) if return_attn_probs else proj
 
-    # ------------------------------------------------------------
-    # distributed Ring-Flash (NCCL all_gather, no sockets)
-    # ------------------------------------------------------------
     def _forward_ring_flash(self, x):
-        B, T_local, C = x.shape
+        B, T, C = x.shape
+        device = x.device
+        torch.cuda.reset_peak_memory_stats(device)
         world = dist.get_world_size()
-        assert T_local == config.BLOCK_SIZE, "each rank holds the same local chunk length"
+        assert T == config.BLOCK_SIZE
 
-        qkv = self.qkv(x).view(B, T_local, 3, self.n_head, self.head_dim)
-        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
-        sin_t, cos_t = self.rope_sin[:T_local].to(x.device), self.rope_cos[:T_local].to(x.device)
+        # 1) project & unbind Q/K/V
+        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(2)
+
+        # 2) apply RoPE
+        sin_t = self.rope_sin[:T].to(device)
+        cos_t = self.rope_cos[:T].to(device)
         q, k = apply_rope(q, k, sin_t, cos_t)
 
-        q, k, v = q.half(), k.half(), v.half()  # Flash kernel dtype
+        # 3) cast to half for flash kernels
+        q, k, v = q.half(), k.half(), v.half()
 
-        kv_local = torch.cat([k, v], dim=-1).contiguous()          # (B,T,H,2Dh)
-        kv_stack = torch.empty(world, *kv_local.shape,
-                               dtype=kv_local.dtype, device=kv_local.device)
-        dist.all_gather_into_tensor(kv_stack, kv_local)            # NCCL collective
+        # 4) prepare cumulative sequence lengths
+        cu_seqlens = torch.arange(0, (B + 1) * T, T,
+                                 device=device, dtype=torch.int32)
+        max_q = max_k = T
 
+        # 5) stream attention over shards
         acc = torch.zeros_like(q)
+        Dh = self.head_dim
+        kv_r = torch.empty(B, T, self.n_head, 2 * Dh,
+                               dtype=k.dtype, device=device)
         for r in range(world):
-            kv_r_tensor = kv_stack[r]                              # (B,T,H,2*Dh_r)
-            hd = kv_r_tensor.size(-1) // 2                         # derive Dh per rank
-            if hd != self.head_dim:
-                raise RuntimeError(
-                    f"Head-dim mismatch across ranks: local={self.head_dim}, rank{r}={hd}. "
-                    "Ensure all ranks use identical model hyper-parameters."
-                )
-            k_r, v_r = kv_r_tensor.split(hd, dim=-1)
-            kv_r = torch.stack([k_r, v_r], dim=2)                  # (B,T,2,H,Dh)
-            acc += flash_attn_kvpacked_func(
-                q,
-                kv_r,
+            # receive just rank-r’s KV shard
+            dist.broadcast(kv_r, src=r)
+            k_r, v_r = kv_r.split(Dh, dim=-1)
+
+            # flatten for flash-attn
+            q_flat = q.reshape(B * T, self.n_head, Dh)
+            kv_flat = torch.stack([k_r, v_r], dim=1) \
+                         .reshape(B * T, 2, self.n_head, Dh)
+
+            out = flash_attn_kvpacked_func(
+                q_flat, kv_flat,
+                cu_seqlens, cu_seqlens,
+                max_q, max_k,
                 dropout_p=config.DROPOUT,
                 softmax_scale=None,
                 causal=True,
             )
+            acc += out.view(B, T, self.n_head, Dh)
 
-        out = acc.reshape(B, T_local, C)
-        return self.proj(out)
+        # report peak memory
+        peak = torch.cuda.max_memory_allocated(device)
+        print(f"[Rank {dist.get_rank()}] peak mem: {peak/1e9:.2f} GB")
 
+        # final projection
+        return self.proj(acc.reshape(B, T, C))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MoE (unchanged)
@@ -274,7 +315,7 @@ class SparseMoELanguageModel(nn.Module):
             x, _ = blk(x, attention_mask)
         x = self.ln_f(x)
         if force_bf16:
-            x = x.to(torch.bfloat16)
+            x = x.to(torch.float16)
 
         with GatheredParameters(self.tok_emb.weight, modifier_rank=0):
             W = getattr(self, "_gathered_weights", None) or self.tok_emb.weight.clone().to(ids.device)
@@ -328,7 +369,7 @@ class SparseMoELanguageModel(nn.Module):
                 x, _ = blk(x, m)
             x = self.ln_f(x)
             if force_bf16:
-                x = x.to(torch.bfloat16)
+                x = x.to(torch.float16)
             for b, lst in enumerate(lat_pos):
                 if p < len(lst) and lst[p] > 0:
                     embeds[b, lst[p]] = x[b, lst[p] - 1]
@@ -338,7 +379,7 @@ class SparseMoELanguageModel(nn.Module):
             x, _ = blk(x, attention_mask)
         x = self.ln_f(x)
         if force_bf16:
-            x = x.to(torch.bfloat16)
+            x = x.to(torch.float16)
 
         if labels is None:
             return x
