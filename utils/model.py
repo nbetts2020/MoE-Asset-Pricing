@@ -1,6 +1,6 @@
 # utils/model.py
 # =============================================================================
-#  Ring-Flash-Attention Sparse-MoE LM
+#  Ring-Flash-Attention Sparse-MoE LM  (non-blocking Gloo ring)
 # =============================================================================
 import math
 import logging
@@ -21,24 +21,24 @@ from flash_attn.flash_attn_interface import (
     flash_attn_unpadded_kvpacked_func as flash_attn_kvpacked_func,
 )
 
-# -----------------------------------------------------------------------------
-# distributed helper: a GPU/NCCL ring Process-Group
-# -----------------------------------------------------------------------------
+import os
+os.environ.setdefault("GLOO_SOCKET_IFNAME", "ens5")
+
+# -----------------------------------------------------------------------------#
+#  Gloo ring Process-Group helper
+# -----------------------------------------------------------------------------#
 _RING_PG: Optional[dist.ProcessGroup] = None
 
 
 def get_ring_pg() -> Optional[dist.ProcessGroup]:
+    """Create a point-to-point Gloo PG connecting all ranks in a logical ring."""
     global _RING_PG
     if _RING_PG is not None or not dist.is_initialized():
         return _RING_PG
     world = dist.get_world_size()
     if world == 1:
         return None
-    # Prefer NCCL for GPU-direct non-blocking
-    if dist.is_nccl_available() and torch.cuda.is_available():
-        backend = "nccl"
-    else:
-        backend = "gloo"
+    backend = "gloo"                                   # ← force Gloo (TCP)
     ranks = list(range(world))
     group = dist.new_group(ranks=ranks, backend=backend)
     if dist.get_rank() == 0:
@@ -47,9 +47,9 @@ def get_ring_pg() -> Optional[dist.ProcessGroup]:
     return group
 
 
-# -----------------------------------------------------------------------------
-# RoPE helpers
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+#  RoPE helpers
+# -----------------------------------------------------------------------------#
 def build_sin_cos(
     seq_len: int, half_dim: int, device: torch.device, base: float = 10_000.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -65,7 +65,7 @@ def apply_rope(
     q: torch.Tensor, k: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     half = q.size(-1) // 2
-    if sin.size(-1) != half:  # crop
+    if sin.size(-1) != half:  # crop if sin/cos longer than needed
         sin, cos = sin[..., :half], cos[..., :half]
     sin = sin.unsqueeze(0).unsqueeze(2)  # (1,T,1,D/2)
     cos = cos.unsqueeze(0).unsqueeze(2)
@@ -76,9 +76,9 @@ def apply_rope(
     return q, k
 
 
-# -----------------------------------------------------------------------------
-# Multi-Head Attention
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+#  Multi-Head Attention
+# -----------------------------------------------------------------------------#
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_embed: int, n_head: int):
         super().__init__()
@@ -96,7 +96,7 @@ class MultiHeadAttention(nn.Module):
 
         self.ring_pg = get_ring_pg()
 
-    # ------------------------------------------------------------------ helpers
+    # ------------------------- helpers ------------------------- #
     def update_rope(self, new_len: int, base: float = 1e4):
         if new_len <= self.max_seq:
             return
@@ -107,13 +107,13 @@ class MultiHeadAttention(nn.Module):
         self.rope_sin = sin
         self.rope_cos = cos
 
-    # ------------------------------------------------------------------ forward
+    # ------------------------- forward ------------------------- #
     def forward(self, x: torch.Tensor, return_attn_probs: bool = False):
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return self._flash_single(x, return_attn_probs)
         return self._flash_ring(x)
 
-    # ---------- single-GPU flash-attention ------------------------------------
+    # ---------- single-GPU FlashAttention ---------- #
     def _flash_single(self, x: torch.Tensor, ret_probs: bool):
         B, T, _ = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
@@ -132,96 +132,118 @@ class MultiHeadAttention(nn.Module):
         )
         if ret_probs:
             out, attn = out
-        else:
-            attn = None
-        out = out.view(B, T, self.n_head, self.head_dim) \
-                 .permute(0, 2, 1, 3).reshape_as(x)
-        proj = self.proj(out)
+        proj = self.proj(
+            out.view(B, T, self.n_head, self.head_dim)
+               .permute(0, 2, 1, 3).reshape_as(x)
+        )
         return (proj, attn, None) if ret_probs else proj
 
-    # ---------- sequence-parallel ring flash-attention ------------------------
+    # ---------- sequence-parallel ring FlashAttention ---------- #
     def _flash_ring(self, x: torch.Tensor):
         """
-        Real ring attention: sequence (T_global) is split across ranks.
-        Each rank owns T_local = T_global / world_size tokens.
-        KV blocks move around the ring via non-blocking NCCL sends/recvs.
-        """
-        B, T_global, C = x.shape
-        world = dist.get_world_size()
-        rank = dist.get_rank()
-        device = x.device
-        Dh = self.head_dim
+        True ring Flash-Attention using a Gloo point-to-point ring.
     
-        # ─── NEW: slice off only this rank’s chunk ────────────────────────────
-        assert T_global % world == 0, "global seq length must be divisible by world_size"
-        T_local = T_global // world
-        x = x[:, rank * T_local : (rank + 1) * T_local, :]
-        # ────────────────────────────────────────────────────────────────────────
+        • Sequence is sharded once: each rank owns T_local = BLOCK_SIZE / world tokens.
+        • At hop h, rank r sends its h-th local block to r+1, receives block h from r-1,
+          appends it to its KV-cache, then runs Flash-Attention over the enlarged cache.
+        • Non-blocking isend / irecv let comm overlap compute; we never wait on the
+          send—only on the previous hop’s recv.
+        """
+        B, T_curr, C = x.shape
+        world, rank = dist.get_world_size(), dist.get_rank()
+        device, Dh = x.device, self.head_dim
+    
+        # ── shard only on the very first layer ──────────────────────────────
+        if T_curr == config.BLOCK_SIZE:
+            assert T_curr % world == 0, "seq length must divide world_size"
+            T_local = T_curr // world
+            x = x[:, rank * T_local:(rank + 1) * T_local, :]
+        else:
+            T_local = T_curr
+        # ────────────────────────────────────────────────────────────────────
     
         self.update_rope(config.BLOCK_SIZE)
     
-        # now (B, T_local, C) is local to each rank
-        qkv = self.qkv(x).view(B, T_local, 3, self.n_head, Dh)
-        q, k_local, v_local = qkv.unbind(2)
-    
+        # project full local sequence once
+        qkv = self.qkv(x).view(B, T_local * world, 3, self.n_head, Dh)
+        q_full, k_full, v_full = qkv.unbind(2)
         start = rank * T_local
-        q, k_local = apply_rope(
-            q, k_local,
-            self.rope_sin[start : start + T_local].to(device),
-            self.rope_cos[start : start + T_local].to(device),
+        q_full, k_full = apply_rope(
+            q_full, k_full,
+            self.rope_sin[start:start + T_local * world].to(device),
+            self.rope_cos[start:start + T_local * world].to(device),
         )
     
-        q = q.half(); k_local = k_local.half(); v_local = v_local.half()
+        q_full = q_full.half(); k_full = k_full.half(); v_full = v_full.half()
         cu_q = torch.arange(0, (B + 1) * T_local, T_local,
                             device=device, dtype=torch.int32)
     
-        k_cache, v_cache = k_local, v_local
-        acc = torch.zeros_like(q)
+        # first local block (hop-0 slice)
+        k_cache = k_full[:, :T_local, :]
+        v_cache = v_full[:, :T_local, :]
+        acc      = torch.zeros_like(k_cache)
     
-        pg = self.ring_pg
+        pg       = self.ring_pg
+        next_r   = (rank + 1) % world
+        prev_r   = (rank - 1 + world) % world
+        send_reqs = []
+    
+        # post first recv (will deliver prev-rank’s hop-0 block)
+        recv_k = torch.empty_like(k_cache, device="cpu")
+        recv_v = torch.empty_like(v_cache, device="cpu")
+        recv_req_k = dist.irecv(recv_k, prev_r, group=pg)
+        recv_req_v = dist.irecv(recv_v, prev_r, group=pg)
+    
         for hop in range(world):
+            # hop>0: wait for the block from prev rank and extend cache
+            if hop:
+                recv_req_k.wait(); recv_req_v.wait()
+                k_cache = torch.cat([k_cache, recv_k.to(device)], dim=1)
+                v_cache = torch.cat([v_cache, recv_v.to(device)], dim=1)
+    
+            # Flash-Attention over cache size (hop+1)*T_local
             max_k = T_local * (hop + 1)
-            q_flat = q.reshape(B * T_local, self.n_head, Dh)
             kv_flat = torch.stack([k_cache, v_cache], dim=1) \
-                        .reshape(B * max_k, 2, self.n_head, Dh)
-            cu_k = torch.arange(0, (B + 1) * max_k,
-                                max_k, device=device, dtype=torch.int32)
+                            .reshape(B * max_k, 2, self.n_head, Dh)
+            q_flat = q_full[:, :T_local, :].reshape(B * T_local, self.n_head, Dh)
+            cu_k   = torch.arange(0, (B + 1) * max_k, max_k,
+                                  device=device, dtype=torch.int32)
     
             out = flash_attn_kvpacked_func(
                 q_flat, kv_flat, cu_q, cu_k,
                 T_local, max_k,
-                dropout_p=config.DROPOUT, softmax_scale=None,
-                causal=True,
+                dropout_p=config.DROPOUT, softmax_scale=None, causal=True,
             )
             acc += out.view(B, T_local, self.n_head, Dh)
     
-            if hop == world - 1:
+            if hop == world - 1:                       # ring complete
                 break
     
-            # ---- ring non-blocking send/recv (GPU NCCL) ----------------------
-            next_r = (rank + 1) % world
-            prev_r = (rank - 1 + world) % world
+            # prepare this rank’s next block to send
+            slice_start = (hop + 1) * T_local
+            k_slice = k_full[:, slice_start:slice_start + T_local, :]
+            v_slice = v_full[:, slice_start:slice_start + T_local, :]
     
-            send_req_k = dist.isend(k_local, next_r, group=pg)
-            send_req_v = dist.isend(v_local, next_r, group=pg)
+            # non-blocking send to next rank (CPU tensors for Gloo)
+            send_reqs.append(dist.isend(k_slice.cpu(), next_r, group=pg))
+            send_reqs.append(dist.isend(v_slice.cpu(), next_r, group=pg))
     
-            recv_k = torch.empty_like(k_local)
-            recv_v = torch.empty_like(v_local)
+            # post recv for the upcoming hop
+            recv_k = torch.empty_like(k_slice, device="cpu")
+            recv_v = torch.empty_like(v_slice, device="cpu")
             recv_req_k = dist.irecv(recv_k, prev_r, group=pg)
             recv_req_v = dist.irecv(recv_v, prev_r, group=pg)
     
-            send_req_k.wait(); send_req_v.wait()
-            recv_req_k.wait(); recv_req_v.wait()
+        # ensure every outstanding send completed
+        for req in send_reqs:
+            req.wait()
     
-            k_cache = torch.cat([k_cache, recv_k], dim=1)
-            v_cache = torch.cat([v_cache, recv_v], dim=1)
-    
-        out = self.proj(acc.reshape(B, T_local, C))
-        return out
+        return self.proj(acc.reshape(B, T_local, C))
 
-# -----------------------------------------------------------------------------
-#  Mixture-of-Experts building blocks
-# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------#
+#  Mixture-of-Experts blocks (unchanged below)
+# -----------------------------------------------------------------------------#
 class Expert(nn.Module):
     def __init__(self, d: int):
         super().__init__()
@@ -295,9 +317,9 @@ class Block(nn.Module):
         return x + a + y, _
 
 
-# -----------------------------------------------------------------------------
-#  Sparse-MoE Language Model
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+#  Sparse-MoE Language Model  (unchanged)
+# -----------------------------------------------------------------------------#
 class SparseMoELanguageModel(nn.Module):
     def __init__(
         self,
@@ -319,11 +341,8 @@ class SparseMoELanguageModel(nn.Module):
         self.tokenizer.add_special_tokens(
             {
                 "additional_special_tokens": [
-                    "<bot>",
-                    "<start_latent>",
-                    "<end_latent>",
-                    "<reasoning>",
-                    "</reasoning>",
+                    "<bot>", "<start_latent>", "<end_latent>",
+                    "<reasoning>", "</reasoning>",
                 ]
             }
         )
@@ -344,7 +363,7 @@ class SparseMoELanguageModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.ebm = EnergyBasedModel(n_embed)
 
-    # ------------------------------------------------------------------ helpers
+    # ------------- helper ------------- #
     def _pad_or_trim(self, ids):
         B, T = ids.shape
         pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
@@ -355,7 +374,7 @@ class SparseMoELanguageModel(nn.Module):
         )
         return torch.cat([ids, pad], 1)
 
-    # ------------------------------------------------------------------ losses
+    # ------------- LM forward ------------- #
     def forward_next_token_efficient(
         self, input_ids, reduction="mean", attention_mask=None, force_bf16=False
     ):
@@ -369,26 +388,21 @@ class SparseMoELanguageModel(nn.Module):
             x = x.to(torch.float16)
 
         with GatheredParameters(self.tok_emb.weight, modifier_rank=0):
-            W = (
-                getattr(self, "_gathered_weights", None)
-                or self.tok_emb.weight.to(ids.device)
-            )
+            W = getattr(self, "_gathered_weights", None) or self.tok_emb.weight.to(ids.device)
 
         pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
         return linear_cross_entropy(
             x, W, ids, ignore_index=pad_id, reduction=reduction, shift=1
         )
 
-    # ------------------------------------------------------------------ embeds
+    # ------------- embeddings / pooling (unchanged) ------------- #
     def get_embeddings(self, input_ids, pool=False, attention_mask=None):
         ids = self._pad_or_trim(input_ids)
         if attention_mask is None:
             pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
             attention_mask = (ids != pad_id).to(ids.device)
 
-        x = self.tok_emb(ids) + self.pos_emb(
-            torch.arange(self.block_size, device=ids.device)
-        )
+        x = self.tok_emb(ids) + self.pos_emb(torch.arange(self.block_size, device=ids.device))
         for blk in self.blocks:
             x, _ = blk(x, attention_mask)
         x = self.ln_f(x)
@@ -399,15 +413,10 @@ class SparseMoELanguageModel(nn.Module):
         w = F.softmax(scores, 1)
         return torch.einsum("btd,bt->bd", x, w)
 
-    # ------------------------------------------------------------------ Coconut
+    # ------------- Coconut latent masking (unchanged) ------------- #
     def forward_coconut(
-        self,
-        input_ids,
-        attention_mask=None,
-        labels=None,
-        latent_token_id=99998,
-        reduction="mean",
-        force_bf16=False,
+        self, input_ids, attention_mask=None, labels=None,
+        latent_token_id=99998, reduction="mean", force_bf16=False,
     ):
         ids = self._pad_or_trim(input_ids)
         pad_id = int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
@@ -415,10 +424,7 @@ class SparseMoELanguageModel(nn.Module):
             attention_mask = (ids != pad_id).to(ids.device)
 
         B, T = ids.shape
-        base = (
-            self.tok_emb(ids)
-            + self.pos_emb(torch.arange(T, device=ids.device))
-        ).detach()
+        base = (self.tok_emb(ids) + self.pos_emb(torch.arange(T, device=ids.device))).detach()
         embeds = base.clone().requires_grad_(True)
 
         lat_pos = [
@@ -454,18 +460,15 @@ class SparseMoELanguageModel(nn.Module):
             return x
         labels = labels[:, -T:]
         with GatheredParameters(self.tok_emb.weight, modifier_rank=0):
-            W = (
-                getattr(self, "_gathered_weights", None)
-                or self.tok_emb.weight.to(ids.device)
-            )
+            W = getattr(self, "_gathered_weights", None) or self.tok_emb.weight.to(ids.device)
         return linear_cross_entropy(
             x, W, labels, ignore_index=pad_id, reduction=reduction, shift=1
         )
 
 
-# -----------------------------------------------------------------------------
-# helpers to extend context length
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+#  helpers to extend context length
+# -----------------------------------------------------------------------------#
 def update_model_rope_for_extended_context(model, new_len, base: float = 5e5):
     for blk in model.blocks:
         blk.sa.update_rope(new_len, base)
@@ -481,5 +484,4 @@ def expand_pos_embedding(model, new_len):
     new_emb.weight.data[:old_len] = model.pos_emb.weight.data
     nn.init.normal_(new_emb.weight.data[old_len:], std=0.02)
     model.pos_emb = new_emb
-    model.position_embedding_table = new_emb
     model.block_size = new_len
