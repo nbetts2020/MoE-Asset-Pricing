@@ -88,64 +88,85 @@ class MultiHeadAttention(nn.Module):
         proj_out = proj_out.view(B, T, self.n_head, self.head_dim).permute(0,2,1,3).reshape_as(x)
         return (self.proj(proj_out), attn_probs, None) if return_attn_probs else self.proj(proj_out)
 
+        # ------------------------------------------------------------------ ring-flash
     def _forward_ring_flash(self, x, return_attn_probs=False):
-        B, T_local, C = x.shape
-        device = x.device
-        rank = dist.get_rank()
-        world = dist.get_world_size()
-        T_global = T_local * world
+        """
+        True sequence-parallel “ring attention”.
 
-        # ensure RoPE covers global positions
+        Each rank owns a contiguous chunk of length T_local = T_global / world_size
+        and iteratively receives KV chunks from the previous rank while sending
+        its own chunk to the next rank in the ring.
+        """
+        B, T_local, C = x.shape
+        device   = x.device
+        rank     = dist.get_rank()
+        world_sz = dist.get_world_size()
+        T_global = T_local * world_sz
+
+        # make sure RoPE tables cover global length
         if self.rope_sin.size(0) < T_global:
             self.update_rope_buffers(T_global)
 
-        # shard input
+        # ------------------------------------------------------------------ QKV
         qkv = self.qkv(x).view(B, T_local, 3, self.n_head, self.head_dim)
         q, k, v = qkv.unbind(2)
+
         start = rank * T_local
-        sin_t = self.rope_sin[start:start+T_local].to(device)
-        cos_t = self.rope_cos[start:start+T_local].to(device)
+        sin_t = self.rope_sin[start:start + T_local].to(device)
+        cos_t = self.rope_cos[start:start + T_local].to(device)
         q, k = apply_rope(q, k, sin_t, cos_t)
 
         q, k, v = q.half(), k.half(), v.half()
-        cu_seqlens = torch.arange(0, (B+1)*T_local, T_local, device=device, dtype=torch.int32)
-        acc = torch.zeros_like(q)
-        kv_cache = [k.clone(), v.clone()]
 
-        for step in range(world):
-            curr_k, curr_v = kv_cache
+        cu_q = torch.arange(0, (B + 1) * T_local,
+                            T_local, device=device, dtype=torch.int32)
+
+        Dh = self.head_dim
+        acc = torch.zeros_like(q)
+
+        # local cache grows at every hop
+        k_cache = k.clone()
+        v_cache = v.clone()
+
+        for step in range(world_sz):
             max_k = T_local * (step + 1)
-            q_flat  = q.reshape(B*T_local, self.n_head, self.head_dim)
-            kv_flat = torch.stack([curr_k, curr_v], dim=1).reshape(B*max_k, 2, self.n_head, self.head_dim)
+
+            q_flat  = q.reshape(B * T_local, self.n_head, Dh)
+            kv_flat = torch.stack([k_cache, v_cache], dim=1) \
+                       .reshape(B * max_k, 2, self.n_head, Dh)
+            cu_k = torch.arange(0, (B + 1) * max_k,
+                                max_k, device=device, dtype=torch.int32)
+
             out = flash_attn_kvpacked_func(
-                q_flat, kv_flat,
-                cu_seqlens, torch.arange(0, (B+1)*max_k, max_k, device=device, dtype=torch.int32),
+                q_flat, kv_flat, cu_q, cu_k,
                 T_local, max_k,
-                dropout_p=config.DROPOUT, softmax_scale=None,
+                dropout_p=config.DROPOUT,
+                softmax_scale=None,
                 causal=True,
             )
-            proj_out = out[0] if return_attn_probs else out
-            acc += proj_out.view(B, T_local, self.n_head, self.head_dim)
+            acc += out.view(B, T_local, self.n_head, Dh)
 
-            if step < world - 1:
-                next_rank = (rank + 1) % world
-                prev_rank = (rank - 1) % world
-                send_k, send_v = k.clone(), v.clone()
-                rcv_k = torch.empty_like(k)
-                rcv_v = torch.empty_like(v)
-                reqs = [
-                    dist.isend(send_k, next_rank),
-                    dist.isend(send_v, next_rank),
-                    dist.irecv(rcv_k, prev_rank),
-                    dist.irecv(rcv_v, prev_rank)
-                ]
-                for r in reqs: r.wait()
-                kv_cache = [torch.cat([curr_k, rcv_k], dim=1),
-                            torch.cat([curr_v, rcv_v], dim=1)]
+            # -------------------------------------------------- ring shuffle
+            if step < world_sz - 1:
+                next_r = (rank + 1) % world_sz
+                prev_r = (rank - 1 + world_sz) % world_sz
 
-        out = acc.reshape(B, T_local, C)
-        proj = self.proj(out)
-        return (proj, out if return_attn_probs else None, None) if return_attn_probs else proj
+                # send our k,v to the next rank
+                dist.send(k, next_r)
+                dist.send(v, next_r)
+
+                # receive previous rank’s k,v
+                k_recv = torch.empty_like(k)
+                v_recv = torch.empty_like(v)
+                dist.recv(k_recv, prev_r)
+                dist.recv(v_recv, prev_r)
+
+                # append to cache for next iteration
+                k_cache = torch.cat([k_cache, k_recv], dim=1)
+                v_cache = torch.cat([v_cache, v_recv], dim=1)
+
+        proj = self.proj(acc.reshape(B, T_local, C))
+        return proj
 
 class Expert(nn.Module):
     def __init__(self, d):
