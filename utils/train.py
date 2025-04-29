@@ -14,7 +14,7 @@ from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
-from deepspeed.runtime.zero.stage3 import GatheredParameters
+from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
 # Import the helper function to update RoPE buffers.
 from utils.model import update_model_rope_for_extended_context, expand_pos_embedding
@@ -61,8 +61,11 @@ def train_model(
     """
     if use_deepspeed:
         engine = model
+        real_model = engine.module
     else:
         adam_optimizer = optimizer
+        real_model = model
+
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -73,25 +76,27 @@ def train_model(
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
     PRETRAIN_EPOCHS = epochs
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
-        model.train()
+        real_model.train()
         epoch_loss = 0.0
-        with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
-            model._gathered_weights = model.token_embedding_table.weight.to(torch.float16)
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
 
-            if use_deepspeed:
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                adam_optimizer.step()
+            with GatheredParameters([real_model.token_embedding_table.weight], modifier_rank=None):
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    loss = real_model.forward_next_token_efficient(
+                        input_ids, reduction="mean", force_bf16=True
+                    )
+            
+                if use_deepspeed:
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+                else:
+                    adam_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    adam_optimizer.step()
 
             # online learning penalties
             if args.use_si and si:
@@ -117,7 +122,7 @@ def train_model(
     pretrain_dir = os.path.join(args.save_dir, pretrain_tag)
     os.makedirs(pretrain_dir, exist_ok=True)
     if use_deepspeed:
-        model.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
+        engine.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
     else:
         torch.save(model.state_dict(), os.path.join(pretrain_dir, "model.pth"))
 
@@ -132,7 +137,7 @@ def train_model(
     logging.info("=== Starting Continual Pretraining with Extended Context ===")
     config.BLOCK_SIZE = 65536
     config.CONTEXT_WINDOW = 65536
-    model.tokenizer.model_max_length = config.CONTEXT_WINDOW
+    real_model.tokenizer.model_max_length = config.CONTEXT_WINDOW
     expand_pos_embedding(model, new_seq_len=config.BLOCK_SIZE)
     update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
 
@@ -151,24 +156,24 @@ def train_model(
         stage=1
     )
     for epoch in range(1, 2):
-        model.train()
+        real_model.train()
         epoch_loss = 0.0
-        with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
-            model._gathered_weights = model.token_embedding_table.weight.to(torch.float16)
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                loss = model.forward_next_token_efficient(input_ids, reduction="mean", force_bf16=True)
-
-            if use_deepspeed:
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                adam_optimizer.step()
+            with GatheredParameters([real_model.token_embedding_table.weight], modifier_rank=None):
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    loss = real_model.forward_next_token_efficient(
+                        input_ids, reduction="mean", force_bf16=True
+                    )
+                if use_deepspeed:
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+                else:
+                    adam_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    adam_optimizer.step()
 
             epoch_loss += loss.item()
         logging.info(f"[Continual] Epoch {epoch}/1, Avg Loss: {epoch_loss/len(continual_loader):.4f}")
@@ -178,7 +183,7 @@ def train_model(
     continual_dir = os.path.join(args.save_dir, continual_tag)
     os.makedirs(continual_dir, exist_ok=True)
     if use_deepspeed:
-        model.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
+        engine.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
     else:
         torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
 
@@ -201,14 +206,14 @@ def train_model(
             gradual_latent_mask=gradual,
             full_latent_mask=not gradual
         )
-        model.train()
+        real_model.train()
         epoch_loss = 0.0
-        with GatheredParameters(model.token_embedding_table.weight, modifier_rank=0):
-            model._gathered_weights = model.token_embedding_table.weight.to(torch.float16)
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                loss = model.forward_coconut(
+
+            with GatheredParameters([real_model.token_embedding_table.weight], modifier_rank=None):
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    loss = real_model.forward_coconut(
                     input_ids=input_ids,
                     attention_mask=None,
                     labels=input_ids,
@@ -216,15 +221,17 @@ def train_model(
                     reduction="mean",
                     force_bf16=True
                 )
-            if use_deepspeed:
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                adam_optimizer.step()
+                    
+                if use_deepspeed:
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+                else:
+                    adam_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    adam_optimizer.step()
+                    
             epoch_loss += loss.item()
         logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
 
@@ -233,7 +240,7 @@ def train_model(
     coconut_dir = os.path.join(args.save_dir, coconut_tag)
     os.makedirs(coconut_dir, exist_ok=True)
     if use_deepspeed:
-        model.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
+        engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
     else:
         torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth"))
 
@@ -245,7 +252,7 @@ def train_model(
     margin = getattr(args, "ebm_margin", 1.0)
 
     for epoch in range(1, args.ebm_epochs + 1):
-        model.ebm.train()
+        real_model.ebm.train()
         total_loss = 0.0
         steps = 0
 
@@ -263,11 +270,11 @@ def train_model(
                 flat_ids = ids.view(B*K, T)
 
                 with torch.no_grad():
-                    embs = model.get_embeddings(flat_ids, pool=True)
+                    embs = real_model.get_embeddings(flat_ids, pool=True)
                 embs = embs.view(B, K, -1)
 
                 flat_embs = embs.view(B*K, -1)
-                energies = model.ebm(flat_embs).view(B, K)
+                energies = real_model.ebm(flat_embs).view(B, K)
 
                 pos_idx = energies.argmin(dim=1)
                 pos_en = energies[torch.arange(B), pos_idx]
@@ -287,7 +294,7 @@ def train_model(
 
     # validation on ft_dataset_8
     logging.info("=== EBM Validation ===")
-    model.ebm.eval()
+    real_model.ebm.eval()
     val_loader = prepare_ft_dataloader(
         tokenizer,
         block_size=config.BLOCK_SIZE,
@@ -302,8 +309,8 @@ def train_model(
             ids = batch['input_ids'].to(device)
             B, K, T = ids.shape
             flat_ids = ids.view(B*K, T)
-            embs = model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
-            energies = model.ebm(embs.view(B*K, -1)).view(B, K)
+            embs = real_model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
+            energies = real_model.ebm(embs.view(B*K, -1)).view(B, K)
             pos_idx = energies.argmin(dim=1)
             pos_en = energies[torch.arange(B), pos_idx]
             neg_mask = torch.ones_like(energies, dtype=torch.bool)
@@ -319,7 +326,7 @@ def train_model(
     final_dir = os.path.join(args.save_dir, final_tag)
     os.makedirs(final_dir, exist_ok=True)
     if use_deepspeed:
-        model.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
+        engine.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
     else:
         torch.save(model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
 
