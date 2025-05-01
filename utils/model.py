@@ -51,16 +51,6 @@ except ImportError as e:
 
 
 import os
-# Remove setting GLOO_SOCKET_IFNAME as we aim for NCCL default group
-# os.environ.setdefault("GLOO_SOCKET_IFNAME", "ens5")
-
-# Configure basic logging if not done elsewhere
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-
-# -----------------------------------------------------------------------------#
-#  Process-Group Helper (REMOVED - Use Default Group)
-# -----------------------------------------------------------------------------#
-# Removed get_ring_pg() as ring-attention-pytorch uses the default group
 
 # -----------------------------------------------------------------------------#
 #  RoPE helpers
@@ -123,18 +113,24 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer("rope_cos", cos.float(), persistent=False)
         # No ring_pg attribute needed
 
-    def update_rope(self, new_len: int, base: float = 10_000.0):
-        """Updates RoPE buffers if new_len exceeds current max_seq."""
-        if new_len <= self.max_seq:
-            return
-        logging.info(f"Extending RoPE max sequence length from {self.max_seq} to {new_len}")
-        self.max_seq = new_len
-        # Create new buffers on CPU first for precision
-        sin, cos = build_sin_cos(
-            new_len, self.head_dim // 2, torch.device("cpu"), base=base, dtype=torch.float32
-        )
-        self.rope_sin = sin
-        self.rope_cos = cos
+        def update_rope(self, new_len: int, base: float = 10_000.0):
+            """Updates RoPE buffers if new_len exceeds current max_seq."""
+            if new_len <= self.max_seq:
+                return
+            logging.info(f"Extending RoPE max sequence length from {self.max_seq} to {new_len}")
+            self.max_seq = new_len
+    
+            # build fresh sin/cos on CPU
+            sin, cos = build_sin_cos(
+                new_len,
+                self.head_dim // 2,
+                torch.device("cpu"),
+                base=base,
+                dtype=torch.float32
+            )
+            # overwrite the existing buffers (keeps them in self.buffers())
+            self._buffers['rope_sin'] = sin.float()
+            self._buffers['rope_cos'] = cos.float()
 
     # Inside MultiHeadAttention class
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, return_attn_probs: bool = False):
@@ -167,8 +163,10 @@ class MultiHeadAttention(nn.Module):
         if is_distributed := (world_size > 1):
             attn_output = ring_flash_attn(
                 q_local_rope, k_local_rope, v_local, # Pass LOCAL tensors
-                bucket_size=config.get("RING_ATTN_BUCKET_SIZE", 512),
+                mask=mask,
+                bucket_size=512,
                 causal=True,
+                ring_reduce_col=True
                 # striped_ring_attn=...
             ) # Output is (B, T_local, H, Dh)
         else: # Single GPU fallback
@@ -191,8 +189,6 @@ class MultiHeadAttention(nn.Module):
 # -----------------------------------------------------------------------------#
 #  Mixture-of-Experts blocks (Keeping simplified version for now)
 # -----------------------------------------------------------------------------#
-# WARNING: The MoE dispatch and aux loss calculation here are placeholders
-# and likely inefficient/incorrect. Replace with optimized versions or libraries.
 class Expert(nn.Module):
     """A simple MLP Expert module."""
     def __init__(self, d: int):
@@ -280,11 +276,8 @@ class SparseMoE(nn.Module):
                 expert_output = self.experts[i](expert_input)
                 weighted_output = expert_output * probs_for_expert.unsqueeze(-1)
                 final_hidden_states.index_add_(0, idx, weighted_output)
-        # --- End of simplified dispatch ---
 
-        # Placeholder Aux Loss (replace with correct calculation)
         if self.training:
-             # Example V-MoE like loss (Needs correct inputs based on chosen dispatch)
              fraction_routed_prob = dense_router_probs.mean(dim=0) # Avg prob per expert
              fraction_tokens_routed = load / num_tokens # Use actual load after capacity
              aux_loss = self.num_experts * torch.sum(fraction_routed_prob * fraction_tokens_routed)
@@ -561,49 +554,48 @@ class SparseMoELanguageModel(nn.Module):
     
         return loss
         
-        def forward_embeddings_only(self, input_ids, attention_mask=None, force_bf16=False):
-             """ Forward pass returning final hidden states (before LM head). """
-             # Similar logic to forward_next_token_efficient but stops before LM head/loss
-             world_size = dist.get_world_size() if dist.is_initialized() else 1
-             rank = dist.get_rank() if dist.is_initialized() else 0
-             device = input_ids.device
-             current_block_size = self.block_size
-    
-             ids = self._pad_or_trim(input_ids, current_block_size)
-             B, T = ids.shape
-    
-             if attention_mask is None:
-                 pad_id = self.tokenizer.pad_token_id
-                 attention_mask = (ids != pad_id).to(device)
-             else:
-                 attention_mask = self._pad_or_trim(attention_mask.long(), current_block_size).bool()
-    
-             ids_local = ids # Ring attention works on full sequence context
-             x_local = self.token_embedding_table(ids_local)
-             x_local = self.dropout_emb(x_local)
-    
-             for blk in self.blocks:
-                 # Pass mask if needed by MoE
-                 x_local, _ = blk(x_local, mask=attention_mask) # Ignore aux loss
-    
-             x_local = self.ln_f(x_local)
-    
-             # Gather results if distributed
-             if world_size > 1:
-                 x_full_shards = [torch.empty_like(x_local) for _ in range(world_size)]
-                 dist.all_gather(x_full_shards, x_local.contiguous(), group=None)
-                 x_full = torch.cat(x_full_shards, dim=1)
-             else:
-                 x_full = x_local
-    
-             # Cast type if requested
-             target_dtype = x_full.dtype
-             if force_bf16: target_dtype = torch.bfloat16
-             elif x_full.dtype == torch.float32: target_dtype = torch.float16
-             if x_full.dtype != target_dtype: x_full = x_full.to(target_dtype)
-    
-             return x_full # Return (B, T, C) final hidden states
+    def forward_embeddings_only(self, input_ids, attention_mask=None, force_bf16=False):
+         """ Forward pass returning final hidden states (before LM head). """
+         # Similar logic to forward_next_token_efficient but stops before LM head/loss
+         world_size = dist.get_world_size() if dist.is_initialized() else 1
+         rank = dist.get_rank() if dist.is_initialized() else 0
+         device = input_ids.device
+         current_block_size = self.block_size
 
+         ids = self._pad_or_trim(input_ids, current_block_size)
+         B, T = ids.shape
+
+         if attention_mask is None:
+             pad_id = self.tokenizer.pad_token_id
+             attention_mask = (ids != pad_id).to(device)
+         else:
+             attention_mask = self._pad_or_trim(attention_mask.long(), current_block_size).bool()
+
+         ids_local = ids # Ring attention works on full sequence context
+         x_local = self.token_embedding_table(ids_local)
+         x_local = self.dropout_emb(x_local)
+
+         for blk in self.blocks:
+             # Pass mask if needed by MoE
+             x_local, _ = blk(x_local, mask=attention_mask) # Ignore aux loss
+
+         x_local = self.ln_f(x_local)
+
+         # Gather results if distributed
+         if world_size > 1:
+             x_full_shards = [torch.empty_like(x_local) for _ in range(world_size)]
+             dist.all_gather(x_full_shards, x_local.contiguous(), group=None)
+             x_full = torch.cat(x_full_shards, dim=1)
+         else:
+             x_full = x_local
+
+         # Cast type if requested
+         target_dtype = x_full.dtype
+         if force_bf16: target_dtype = torch.bfloat16
+         elif x_full.dtype == torch.float32: target_dtype = torch.float16
+         if x_full.dtype != target_dtype: x_full = x_full.to(target_dtype)
+
+         return x_full # Return (B, T, C) final hidden states
 
     # ------------- Coconut latent masking ------------- #
     def forward_coconut(self, *args, **kwargs):
