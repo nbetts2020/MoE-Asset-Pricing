@@ -203,7 +203,7 @@ class NoisyTopkRouter(nn.Module):
         return gates_values.type_as(hidden_states), indices, gates.type_as(hidden_states)
 
 class SparseMoE(nn.Module):
-    """Sparse MoE layer (Placeholder - requires efficient dispatch & correct aux loss)."""
+    """Sparse MoE layer."""
     def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1.25):
         super().__init__()
         self.router = NoisyTopkRouter(d, n_exp, top_k)
@@ -214,56 +214,80 @@ class SparseMoE(nn.Module):
         self.hidden_dim = d
 
     def forward(self, hidden_states):
-        # --- Placeholder Logic ---
-        # This needs to be replaced with efficient dispatch (e.g., Tutel)
-        # and correct aux loss calculation.
+        """
+        Forward pass for SparseMoE with capacity enforcement.
+        """
         batch_size, sequence_length, dim = hidden_states.shape
         num_tokens = batch_size * sequence_length
         flat_hidden_states = hidden_states.view(num_tokens, dim)
+        device = hidden_states.device
+        dtype = hidden_states.dtype
 
-        router_probs, selected_experts, dense_router_probs = self.router(flat_hidden_states)
+        # 1. Get Routing Info
+        top_k_gates, top_k_indices, dense_router_probs = self.router(flat_hidden_states)
 
-        # Simple pass-through for testing structure (NO MoE computation)
-        # final_hidden_states = flat_hidden_states
-        # Proper implementation requires dispatching to self.experts[i] based on
-        # selected_experts and router_probs, respecting capacity, and combining outputs.
-        # --- Start of simplified (likely incorrect/slow) dispatch ---
+        # 2. Calculate Capacity per Expert
+        capacity = max(1, math.ceil((self.capacity_factor * num_tokens) / self.num_experts))
+        logging.debug(f"MoE Capacity per expert: {capacity}")
+
+        # 3. Determine Token Dispatch & Enforce Capacity
+        expert_mask = torch.zeros(num_tokens, self.num_experts, dtype=torch.bool, device=device)
+        expert_indices = top_k_indices.T # Shape: (top_k, num_tokens)
+        token_indices_per_k = torch.arange(num_tokens, device=device).expand_as(expert_indices)
+
+        expert_mask.scatter_(1, expert_indices.T, True)
+
+        route_cumsum = torch.cumsum(expert_mask.long(), dim=0)
+        route_position = route_cumsum * expert_mask - 1 # 0-indexed position
+        keep_mask = (route_position < capacity) & expert_mask
+
+        final_route_mask = torch.zeros_like(keep_mask)
+        final_route_mask.scatter_(1, expert_indices.T, keep_mask.gather(1, expert_indices.T))
+
+        kept_expert_indices = top_k_indices.T[final_route_mask.T]
+        kept_token_indices = token_indices_per_k[final_route_mask.T]
+        kept_gate_values = top_k_gates.T[final_route_mask.T]
+
+        actual_load = final_route_mask.sum(dim=0)
+        logging.debug(f"MoE Actual Load: {actual_load.tolist()}")
+
+        # 4. Dispatch tokens to experts and compute outputs
         final_hidden_states = torch.zeros_like(flat_hidden_states)
-        capacity = max(int(self.capacity_factor * num_tokens / self.num_experts), 1)
-        load = torch.zeros(self.num_experts, device=hidden_states.device)
+
+        sorted_indices = torch.argsort(kept_expert_indices)
+        sorted_kept_expert_indices = kept_expert_indices[sorted_indices]
+        sorted_kept_token_indices = kept_token_indices[sorted_indices]
+        sorted_kept_gate_values = kept_gate_values[sorted_indices]
+
+        expert_change_indices = torch.cat([
+            torch.tensor([0], device=device),
+            torch.where(sorted_kept_expert_indices[:-1] != sorted_kept_expert_indices[1:])[0] + 1,
+            torch.tensor([len(sorted_kept_expert_indices)], device=device)
+        ])
 
         for i in range(self.num_experts):
-            expert_mask = (selected_experts == i).any(dim=1)
-            idx = torch.where(expert_mask)[0]
+            start_idx = expert_change_indices[i]
+            end_idx = expert_change_indices[i+1]
 
-            if idx.numel() == 0: continue
+            if start_idx < end_idx and sorted_kept_expert_indices[start_idx] == i:
+                current_token_indices = sorted_kept_token_indices[start_idx:end_idx]
+                current_gate_values = sorted_kept_gate_values[start_idx:end_idx].unsqueeze(1)
+                current_input_tokens = flat_hidden_states[current_token_indices]
 
-            # Apply capacity (crude truncation based on mask count)
-            actual_load = min(idx.numel(), capacity)
-            idx = idx[:actual_load]
-            load[i] = actual_load
+                expert_output = self.experts[i](current_input_tokens)
+                weighted_output = expert_output * current_gate_values
+                final_hidden_states.index_add_(0, current_token_indices, weighted_output)
 
-            if idx.numel() > 0:
-                expert_input = flat_hidden_states[idx]
-                 # Find the corresponding probability (this indexing is tricky with top-k)
-                probs_for_expert = torch.zeros(idx.numel(), device=idx.device, dtype=router_probs.dtype)
-                original_indices_mask = (selected_experts[idx] == i) # Mask within selected tokens
-                # Find which of the top_k corresponds to expert i for each token
-                k_indices = torch.where(original_indices_mask)[1]
-                # Get the probabilities using these k_indices
-                probs_for_expert = router_probs[idx, k_indices] # Get the prob for the k-th choice that was expert i
-
-                expert_output = self.experts[i](expert_input)
-                weighted_output = expert_output * probs_for_expert.unsqueeze(-1)
-                final_hidden_states.index_add_(0, idx, weighted_output)
-
+        # 5. Calculate Auxiliary Loss
         if self.training:
-             fraction_routed_prob = dense_router_probs.mean(dim=0) # Avg prob per expert
-             fraction_tokens_routed = load / num_tokens # Use actual load after capacity
-             aux_loss = self.num_experts * torch.sum(fraction_routed_prob * fraction_tokens_routed)
-             aux_loss = aux_loss * 0.01
+            fraction_tokens_routed = actual_load / num_tokens
+            fraction_prob_routed = dense_router_probs.mean(dim=0)
+            aux_loss_factor = 0.01
+            aux_loss = torch.sum(fraction_prob_routed * fraction_tokens_routed) * self.num_experts * aux_loss_factor
+            logging.debug(f"MoE Aux Loss: {aux_loss.item()}")
         else:
-             aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+            aux_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
 
         return final_hidden_states.view_as(hidden_states), aux_loss
 
@@ -497,12 +521,13 @@ class SparseMoELanguageModel(nn.Module):
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
         targets = ids.to(x_full.device)
     
-        is_zero3 = not isinstance(self.lm_head.weight, torch.nn.Parameter)
+        is_zero3 = hasattr(self.lm_head.weight, "ds_numel")
         if is_zero3:
             with GatheredParameters([self.lm_head.weight], enabled=True):
+                full_w = self.lm_head.weight.clone()
                 loss = linear_cross_entropy(
                     e=x_full,            # (B, T, C)  still float32
-                    c=self.lm_head.weight,
+                    c=full_w,
                     targets=targets,     # (B, T)
                     ignore_index=pad_id,
                     reduction=reduction,
