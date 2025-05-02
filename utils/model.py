@@ -113,24 +113,24 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer("rope_cos", cos.float(), persistent=False)
         # No ring_pg attribute needed
 
-        def update_rope(self, new_len: int, base: float = 10_000.0):
-            """Updates RoPE buffers if new_len exceeds current max_seq."""
-            if new_len <= self.max_seq:
-                return
-            logging.info(f"Extending RoPE max sequence length from {self.max_seq} to {new_len}")
-            self.max_seq = new_len
-    
-            # build fresh sin/cos on CPU
-            sin, cos = build_sin_cos(
-                new_len,
-                self.head_dim // 2,
-                torch.device("cpu"),
-                base=base,
-                dtype=torch.float32
-            )
-            # overwrite the existing buffers (keeps them in self.buffers())
-            self._buffers['rope_sin'] = sin.float()
-            self._buffers['rope_cos'] = cos.float()
+    def update_rope(self, new_len: int, base: float = 10_000.0):
+        """Updates RoPE buffers if new_len exceeds current max_seq."""
+        if new_len <= self.max_seq:
+            return
+        logging.info(f"Extending RoPE max sequence length from {self.max_seq} to {new_len}")
+        self.max_seq = new_len
+
+        # build fresh sin/cos on CPU
+        sin, cos = build_sin_cos(
+            new_len,
+            self.head_dim // 2,
+            torch.device("cpu"),
+            base=base,
+            dtype=torch.float32
+        )
+        # overwrite the existing buffers (keeps them in self.buffers())
+        self._buffers['rope_sin'] = sin.float()
+        self._buffers['rope_cos'] = cos.float()
 
     # Inside MultiHeadAttention class
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, return_attn_probs: bool = False):
