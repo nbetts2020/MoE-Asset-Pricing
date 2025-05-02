@@ -1,3 +1,31 @@
+# ------------------------------------------------------------------
+# Fix dtype mismatch in ring_flash_attention backward  (dv_chunk only)
+import site, os, re, logging, importlib
+
+for root in site.getsitepackages():
+    fn = os.path.join(root, "ring_attention_pytorch", "ring_flash_attention.py")
+    if not os.path.exists(fn):
+        continue
+    with open(fn, "r") as f:
+        code = f.read()
+
+    # add p = p.to(doc.dtype) on the previous line if not already there
+    patched_code, n = re.subn(
+        r"(?m)^(?P<indent>\s*)dv_chunk = einsum\('b h i j, b i h d -> b j h d', p, doc\)",
+        r"\g<indent>p = p.to(doc.dtype)\n\g<indent>dv_chunk = einsum('b h i j, b i h d -> b j h d', p, doc)",
+        code,
+    )
+
+    if n:
+        with open(fn, "w") as f:
+            f.write(patched_code)
+        logging.info(f"[patch] ring_flash_attention.py fixed (dv_chunk)")
+    break
+# ------------------------------------------------------------------
+
+# now import the library – it will use the patched file
+from ring_attention_pytorch import ring_flash_attn
+
 import torch
 import os
 import argparse
