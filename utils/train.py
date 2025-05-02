@@ -82,21 +82,20 @@ def train_model(
             print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
 
-            with GatheredParameters([real_model.token_embedding_table.weight], modifier_rank=None):
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    loss = real_model.forward_next_token_efficient(
-                        input_ids, reduction="mean", force_bf16=True
-                    )
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                loss = real_model.forward_next_token_efficient(
+                    input_ids, reduction="mean", force_bf16=True
+                )
             
-                if use_deepspeed:
-                    engine.zero_grad()
-                    engine.backward(loss)
-                    engine.step()
-                else:
-                    adam_optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                    adam_optimizer.step()
+            if use_deepspeed:
+                engine.zero_grad()
+                engine.backward(loss)
+                engine.step()
+            else:
+                adam_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                adam_optimizer.step()
 
             # online learning penalties
             if args.use_si and si:
@@ -160,20 +159,19 @@ def train_model(
         epoch_loss = 0.0
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
-            with GatheredParameters([real_model.token_embedding_table.weight], modifier_rank=None):
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    loss = real_model.forward_next_token_efficient(
-                        input_ids, reduction="mean", force_bf16=True
-                    )
-                if use_deepspeed:
-                    engine.zero_grad()
-                    engine.backward(loss)
-                    engine.step()
-                else:
-                    adam_optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                    adam_optimizer.step()
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                loss = real_model.forward_next_token_efficient(
+                    input_ids, reduction="mean", force_bf16=True
+                )
+            if use_deepspeed:
+                engine.zero_grad()
+                engine.backward(loss)
+                engine.step()
+            else:
+                adam_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                adam_optimizer.step()
 
             epoch_loss += loss.item()
         logging.info(f"[Continual] Epoch {epoch}/1, Avg Loss: {epoch_loss/len(continual_loader):.4f}")
@@ -211,26 +209,25 @@ def train_model(
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
 
-            with GatheredParameters([real_model.token_embedding_table.weight], modifier_rank=None):
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    loss = real_model.forward_coconut(
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    labels=input_ids,
-                    latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
-                    reduction="mean",
-                    force_bf16=True
-                )
-                    
-                if use_deepspeed:
-                    engine.zero_grad()
-                    engine.backward(loss)
-                    engine.step()
-                else:
-                    adam_optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                    adam_optimizer.step()
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                loss = real_model.forward_coconut(
+                input_ids=input_ids,
+                attention_mask=None,
+                labels=input_ids,
+                latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
+                reduction="mean",
+                force_bf16=True
+            )
+                
+            if use_deepspeed:
+                engine.zero_grad()
+                engine.backward(loss)
+                engine.step()
+            else:
+                adam_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                adam_optimizer.step()
                     
             epoch_loss += loss.item()
         logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
