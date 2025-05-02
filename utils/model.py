@@ -412,7 +412,7 @@ class SparseMoELanguageModel(nn.Module):
             padding = torch.full((B, target_length - T), pad_id, dtype=ids.dtype, device=ids.device)
             return torch.cat([padding, ids], dim=1)
 
-    def forward(self, input_ids, attention_mask=None, labels=None, reduction="mean", force_bf16=False):
+    def forward(self, input_ids, attention_mask=None, labels=None, reduction="mean"):
         """
         Main forward pass, delegates to specific methods based on needs.
         Currently set up for next token prediction loss.
@@ -424,7 +424,6 @@ class SparseMoELanguageModel(nn.Module):
                   input_ids=input_ids,
                   reduction=reduction,
                   attention_mask=attention_mask, # Pass mask along
-                  force_bf16=force_bf16,
                   labels=labels # Pass labels to calculate loss correctly
              )
         else:
@@ -433,108 +432,103 @@ class SparseMoELanguageModel(nn.Module):
              # Currently returns final hidden states before LM head
              return self.forward_embeddings_only(
                   input_ids=input_ids,
-                  attention_mask=attention_mask,
-                  force_bf16=force_bf16
+                  attention_mask=attention_mask
              )
 
 
-    # Inside SparseMoELanguageModel class
-    def forward_next_token_efficient(
-        self, input_ids, reduction="mean", attention_mask=None, force_bf16=False
-    ):
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        device = input_ids.device
-        current_block_size = self.block_size
-    
-        ids = self._pad_or_trim(input_ids, current_block_size)
-        B, T = ids.shape # T is the full block_size
-    
-        # *** Perform Sequence Splitting Explicitly ***
-        if world_size > 1:
-            if T % world_size != 0:
-                 raise ValueError(f"Block size {T} not divisible by world size {world_size}")
-            T_local = T // world_size
-            ids_local = ids[:, rank*T_local : (rank+1)*T_local]
-            # Split attention mask if provided (create default if None)
-            if attention_mask is None:
-                pad_id_mask = self.tokenizer.pad_token_id
-                local_attention_mask = (ids_local != pad_id_mask).to(device)
-            else:
-                 # Pad/trim the original mask first to match 'ids' shape
-                 padded_mask = self._pad_or_trim(attention_mask.long(), T).bool()
-                 local_attention_mask = padded_mask[:, rank*T_local : (rank+1)*T_local]
+    # inside SparseMoELanguageModel:
+
+def forward_next_token_efficient(
+    self,
+    input_ids,
+    reduction="mean",
+    attention_mask=None,
+):
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    device = input_ids.device
+    T = self.block_size
+
+    # pad/trim
+    ids = self._pad_or_trim(input_ids, T)
+    B, T = ids.shape
+
+    # split sequence for model parallel
+    if world_size > 1:
+        if T % world_size != 0:
+            raise ValueError(f"Block size {T} not divisible by world size {world_size}")
+        T_local = T // world_size
+        ids_local = ids[:, rank*T_local:(rank+1)*T_local]
+        if attention_mask is None:
+            pad_id = self.tokenizer.pad_token_id
+            local_attention_mask = (ids_local != pad_id).to(device)
         else:
-            ids_local = ids
-            T_local = T # For clarity
-            # Create mask if needed for single GPU
-            if attention_mask is None:
-                 pad_id_mask = self.tokenizer.pad_token_id
-                 local_attention_mask = (ids_local != pad_id_mask).to(device)
-            else:
-                 local_attention_mask = self._pad_or_trim(attention_mask.long(), T).bool()
-    
-    
-        # --- Embedding on LOCAL shard ---
-        x_local = self.token_embedding_table(ids_local) # (B, T_local, C)
-        x_local = self.dropout_emb(x_local)
-    
-        # --- Transformer Blocks on LOCAL shard ---
-        total_aux_loss = torch.tensor(0.0, device=device, dtype=x_local.dtype)
-        current_x_local = x_local
-        for blk in self.blocks:
-            # Pass the LOCAL shard and LOCAL mask to the block
-            current_x_local, aux_loss = blk(current_x_local, mask=local_attention_mask)
-            if aux_loss is not None and self.training:
-                 total_aux_loss = total_aux_loss + aux_loss
-        # Output from blocks is the processed LOCAL shard
-        x_processed_local = self.ln_f(current_x_local) # (B, T_local, C)
-    
-        # --- Gather For Loss ---
-        # Gather the processed local shards to reconstruct the full sequence output
-        if world_size > 1:
-            # Pre-allocate tensor for the gathered output on the correct device
-            x_full = torch.empty(B, T, self.n_embed, dtype=x_processed_local.dtype, device=device)
-            dist.all_gather_into_tensor(x_full, x_processed_local.contiguous(), group=None) # Use default NCCL group
+            padded_mask = self._pad_or_trim(attention_mask.long(), T).bool()
+            local_attention_mask = padded_mask[:, rank*T_local:(rank+1)*T_local]
+    else:
+        ids_local = ids
+        T_local = T
+        if attention_mask is None:
+            pad_id = self.tokenizer.pad_token_id
+            local_attention_mask = (ids_local != pad_id).to(device)
         else:
-            x_full = x_processed_local # (B, T, C)
-    
-        # --- Loss Calculation ---
-        target_dtype = x_full.dtype
-        if force_bf16: target_dtype = torch.float16
-        elif x_full.dtype == torch.float32: target_dtype = torch.float16
-        if x_full.dtype != target_dtype: x_full = x_full.to(target_dtype)
-    
-        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-        targets = ids.to(x_full.device) # Targets are the original full sequence ids (B, T)
-    
-        is_zero3_partitioned = not isinstance(self.lm_head.weight, torch.nn.Parameter)
-    
-        if is_zero3_partitioned:
-             with GatheredParameters([self.lm_head.weight], enabled=True):
-                  loss = linear_cross_entropy(
-                       e=x_full, # (B, T, C)
-                       c=self.lm_head.weight,
-                       targets=targets, # (B, T) - Shapes now match assertion requirement!
-                       ignore_index=pad_id, reduction=reduction, shift=1,
-                  )
-        else:
-             loss = linear_cross_entropy(
-                  e=x_full, # (B, T, C)
-                  c=self.lm_head.weight,
-                  targets=targets, # (B, T)
-                  ignore_index=pad_id, reduction=reduction, shift=1,
-             )
-    
-        if self.training and total_aux_loss.item() != 0:
-            loss = loss + total_aux_loss
-    
-        del x_full, targets, x_processed_local # Cleanup
-        if world_size > 1: del current_x_local
-    
-        return loss
+            local_attention_mask = self._pad_or_trim(attention_mask.long(), T).bool()
+
+    # embed + transformer
+    x_local = self.token_embedding_table(ids_local)
+    x_local = self.dropout_emb(x_local)
+
+    total_aux_loss = torch.tensor(0.0, device=device, dtype=x_local.dtype)
+    current_x = x_local
+    for blk in self.blocks:
+        current_x, aux_loss = blk(current_x, mask=local_attention_mask)
+        if self.training and aux_loss is not None:
+            total_aux_loss = total_aux_loss + aux_loss
+    x_processed = self.ln_f(current_x)
+
+    # gather back to full sequence
+    if world_size > 1:
+        x_full = torch.empty(B, T, self.n_embed, dtype=x_processed.dtype, device=device)
+        dist.all_gather_into_tensor(x_full, x_processed.contiguous(), group=None)
+    else:
+        x_full = x_processed
+
+    # --- LOSS (FP32 only) ---
+    pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+    targets = ids.to(x_full.device)
+
+    is_zero3 = not isinstance(self.lm_head.weight, torch.nn.Parameter)
+    if is_zero3:
+        with GatheredParameters([self.lm_head.weight], enabled=True):
+            loss = linear_cross_entropy(
+                e=x_full,            # (B, T, C)  still float32
+                c=self.lm_head.weight,
+                targets=targets,     # (B, T)
+                ignore_index=pad_id,
+                reduction=reduction,
+                shift=1,
+            )
+    else:
+        loss = linear_cross_entropy(
+            e=x_full,
+            c=self.lm_head.weight,
+            targets=targets,
+            ignore_index=pad_id,
+            reduction=reduction,
+            shift=1,
+        )
+
+    if self.training and total_aux_loss.item() != 0:
+        loss = loss + total_aux_loss
+
+    # cleanup
+    del x_full, targets, x_processed
+    if world_size > 1:
+        del current_x
+
+    return loss
         
-    def forward_embeddings_only(self, input_ids, attention_mask=None, force_bf16=False):
+    def forward_embeddings_only(self, input_ids, attention_mask=None):
          """ Forward pass returning final hidden states (before LM head). """
          # Similar logic to forward_next_token_efficient but stops before LM head/loss
          world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -568,12 +562,6 @@ class SparseMoELanguageModel(nn.Module):
              x_full = torch.cat(x_full_shards, dim=1)
          else:
              x_full = x_local
-
-         # Cast type if requested
-         target_dtype = x_full.dtype
-         if force_bf16: target_dtype = torch.bfloat16
-         elif x_full.dtype == torch.float32: target_dtype = torch.float16
-         if x_full.dtype != target_dtype: x_full = x_full.to(target_dtype)
 
          return x_full # Return (B, T, C) final hidden states
 
