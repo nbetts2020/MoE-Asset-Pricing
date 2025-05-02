@@ -23,8 +23,8 @@ from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 # Now import the (patched) flash‐attention binding
 from ring_attention_pytorch import ring_flash_attn
 from flash_attn.flash_attn_interface import (
-    flash_attn_varlen_qkvpacked_func,
-    flash_attn_varlen_kvpacked_func,
+    flash_attn_unpadded_qkvpacked_func,
+    flash_attn_unpadded_kvpacked_func,
 )
 FLASH_ATTN_AVAILABLE = True
 RING_ATTN_AVAILABLE = True
@@ -157,7 +157,7 @@ class MultiHeadAttention(nn.Module):
             cu_seqlens = torch.arange(0, (B * T_local) + 1, step=T_local, dtype=torch.int32, device=device)
 
             # --- Call the CORRECT function ---
-            attn_output_flat = flash_attn_varlen_qkvpacked_func( # <--- CORRECT NAME
+            attn_output_flat = flash_attn_unpadded_qkvpacked_func( # <--- CORRECT NAME
                 qkv_packed, # (total, 3, nheads, headdim)
                 cu_seqlens, # (batch_size + 1,)
                 T_local,    # max_seqlen
@@ -232,6 +232,8 @@ class SparseMoE(nn.Module):
 
         # 1. Get Routing Info
         top_k_gates, top_k_indices, dense_router_probs = self.router(flat_hidden_states)
+        # top_k_indices shape: (num_tokens, top_k)
+        # top_k_gates shape: (num_tokens, top_k)
 
         # 2. Calculate Capacity per Expert
         capacity = max(1, math.ceil((self.capacity_factor * num_tokens) / self.num_experts))
@@ -239,55 +241,74 @@ class SparseMoE(nn.Module):
 
         # 3. Determine Token Dispatch & Enforce Capacity
         expert_mask = torch.zeros(num_tokens, self.num_experts, dtype=torch.bool, device=device)
-        expert_indices = top_k_indices.T # Shape: (top_k, num_tokens)
-        token_indices_per_k = torch.arange(num_tokens, device=device).expand_as(expert_indices)
+        # Mark experts chosen in top-k for each token
+        expert_mask.scatter_(1, top_k_indices, True)
 
-        expert_mask.scatter_(1, expert_indices.T, True)
-
+        # Determine position of token for each expert it's routed to
         route_cumsum = torch.cumsum(expert_mask.long(), dim=0)
         route_position = route_cumsum * expert_mask - 1 # 0-indexed position
-        keep_mask = (route_position < capacity) & expert_mask
 
-        final_route_mask = torch.zeros_like(keep_mask)
-        final_route_mask.scatter_(1, expert_indices.T, keep_mask.gather(1, expert_indices.T))
+        # Keep assignments where the position is within capacity
+        keep_mask = (route_position < capacity) & expert_mask # Shape: (num_tokens, num_experts)
 
-        kept_expert_indices = top_k_indices.T[final_route_mask.T]
-        kept_token_indices = token_indices_per_k[final_route_mask.T]
-        kept_gate_values = top_k_gates.T[final_route_mask.T]
+        # --- Correctly map capacity mask back to top-k choices ---
+        # pass_cap_mask_k[n, k] is True if expert chosen as k-th choice for token n passed capacity check.
+        pass_cap_mask_k = keep_mask.gather(1, top_k_indices) # Shape: (num_tokens, top_k)
 
-        actual_load = final_route_mask.sum(dim=0)
+        # Find the indices (token_idx, k_idx) where pass_cap_mask_k is True
+        kept_indices_where = torch.where(pass_cap_mask_k)
+        kept_token_indices = kept_indices_where[0] # Token indices that have at least one valid route
+        k_for_kept_tokens = kept_indices_where[1]  # Which k-th choice was kept (0 to top_k-1)
+
+        # Retrieve the corresponding expert index and gate value using the identified indices
+        kept_expert_indices = top_k_indices[kept_token_indices, k_for_kept_tokens]
+        kept_gate_values = top_k_gates[kept_token_indices, k_for_kept_tokens]
+        # --- End mapping fix ---
+
+        # --- Calculate actual load correctly based on kept assignments ---
+        actual_load = torch.zeros(self.num_experts, device=device, dtype=torch.long)
+        if kept_expert_indices.numel() > 0:
+           actual_load.scatter_add_(0, kept_expert_indices, torch.ones_like(kept_expert_indices))
         logging.debug(f"MoE Actual Load: {actual_load.tolist()}")
 
         # 4. Dispatch tokens to experts and compute outputs
         final_hidden_states = torch.zeros_like(flat_hidden_states)
 
+        # Sort tokens by expert index
         sorted_indices = torch.argsort(kept_expert_indices)
         sorted_kept_expert_indices = kept_expert_indices[sorted_indices]
         sorted_kept_token_indices = kept_token_indices[sorted_indices]
         sorted_kept_gate_values = kept_gate_values[sorted_indices]
 
+        # Find boundaries between experts in the sorted list
         expert_change_indices = torch.cat([
             torch.tensor([0], device=device),
             torch.where(sorted_kept_expert_indices[:-1] != sorted_kept_expert_indices[1:])[0] + 1,
             torch.tensor([len(sorted_kept_expert_indices)], device=device)
         ])
 
+        # Process experts one by one
         for i in range(self.num_experts):
             start_idx = expert_change_indices[i]
             end_idx = expert_change_indices[i+1]
 
+            # Check if this segment actually corresponds to expert i and has tokens
             if start_idx < end_idx and sorted_kept_expert_indices[start_idx] == i:
                 current_token_indices = sorted_kept_token_indices[start_idx:end_idx]
                 current_gate_values = sorted_kept_gate_values[start_idx:end_idx].unsqueeze(1)
                 current_input_tokens = flat_hidden_states[current_token_indices]
 
+                # Run the expert
                 expert_output = self.experts[i](current_input_tokens)
+
+                # Combine expert output with gate values and add back
                 weighted_output = expert_output * current_gate_values
                 final_hidden_states.index_add_(0, current_token_indices, weighted_output)
 
         # 5. Calculate Auxiliary Loss
         if self.training:
-            fraction_tokens_routed = actual_load / num_tokens
+            # Use actual load and router probs for aux loss
+            fraction_tokens_routed = actual_load / max(1, num_tokens)
             fraction_prob_routed = dense_router_probs.mean(dim=0)
             aux_loss_factor = 0.01
             aux_loss = torch.sum(fraction_prob_routed * fraction_tokens_routed) * self.num_experts * aux_loss_factor
@@ -519,8 +540,9 @@ class SparseMoELanguageModel(nn.Module):
 
         # gather back to full sequence
         if world_size > 1:
-            x_full = torch.empty(B, T, self.n_embed, dtype=x_processed.dtype, device=device)
-            dist.all_gather_into_tensor(x_full, x_processed.contiguous(), group=None)
+            gather_list = [torch.empty_like(x_processed) for _ in range(world_size)]
+            dist.all_gather(gather_list, x_processed.contiguous())   # ← supports autograd
+            x_full = torch.cat(gather_list, dim=1)
         else:
             x_full = x_processed
 
