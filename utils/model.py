@@ -19,36 +19,17 @@ from utils.data import GLOBAL_TOKENIZER # Use tokenizer defined in data.py
 # Assuming this exists and works
 from cut_cross_entropy import linear_cross_entropy
 
-# Attempt to import Deepspeed GatheredParameters
-try:
-    from deepspeed.runtime.zero.partition_parameters import GatheredParameters
-except ImportError:
-    class GatheredParameters: # Dummy context manager if deepspeed not installed
-        def __init__(self, *args, **kwargs): pass
-        def __enter__(self): pass
-        def __exit__(self, *args): pass
-    logging.warning("Deepspeed not found, GatheredParameters context will be a no-op.")
+from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
-# Attempt to import ring-attention-pytorch
-try:
-    from ring_attention_pytorch import ring_flash_attn
-    # Check if flash-attn is also available (required by ring_flash_attn)
-    from flash_attn.flash_attn_interface import (
-        flash_attn_unpadded_qkvpacked_func,
-        flash_attn_unpadded_kvpacked_func,
-    )
-    FLASH_ATTN_AVAILABLE = True
-    RING_ATTN_AVAILABLE = True
-    logging.info("Successfully imported ring-attention-pytorch and flash-attn.")
-except ImportError as e:
-    logging.warning(f"Failed to import ring-attention-pytorch or flash-attn ({e}). Ring Attention will not be available.")
-    FLASH_ATTN_AVAILABLE = False
-    RING_ATTN_AVAILABLE = False
-    # Define a dummy function if import fails to avoid NameErrors later
-    def ring_flash_attn(*args, **kwargs):
-        raise NotImplementedError("ring-attention-pytorch is not installed or failed to import.")
-    flash_attn_unpadded_qkvpacked_func = None # Needed for single GPU fallback check
-
+from ring_attention_pytorch import ring_flash_attn
+# Check if flash-attn is also available (required by ring_flash_attn)
+from flash_attn.flash_attn_interface import (
+    flash_attn_unpadded_qkvpacked_func,
+    flash_attn_unpadded_kvpacked_func,
+)
+FLASH_ATTN_AVAILABLE = True
+RING_ATTN_AVAILABLE = True
+logging.info("Successfully imported ring-attention-pytorch and flash-attn.")
 
 import os
 
