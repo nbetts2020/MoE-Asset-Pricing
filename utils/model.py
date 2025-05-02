@@ -10,19 +10,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import datetime # For potential timeout in new_group
+import datetime  # For potential timeout in new_group
 
-# Assuming these exist in your project structure
+# Project imports
 from utils.config import config
-from utils.ebm import EnergyBasedModel # Assuming this is defined elsewhere
-from utils.data import GLOBAL_TOKENIZER # Use tokenizer defined in data.py
-# Assuming this exists and works
+from utils.ebm import EnergyBasedModel
+from utils.data import GLOBAL_TOKENIZER
 from cut_cross_entropy import linear_cross_entropy
 
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
+# Now import the (patched) flash‐attention binding
 from ring_attention_pytorch import ring_flash_attn
-# Check if flash-attn is also available (required by ring_flash_attn)
 from flash_attn.flash_attn_interface import (
     flash_attn_unpadded_qkvpacked_func,
     flash_attn_unpadded_kvpacked_func,
