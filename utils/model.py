@@ -23,8 +23,8 @@ from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 # Now import the (patched) flash‐attention binding
 from ring_attention_pytorch import ring_flash_attn
 from flash_attn.flash_attn_interface import (
-    flash_attn_unpadded_qkvpacked_func,
-    flash_attn_unpadded_kvpacked_func,
+    flash_attn_varlen_qkvpacked_func,
+    flash_attn_varlen_kvpacked_func,
 )
 FLASH_ATTN_AVAILABLE = True
 RING_ATTN_AVAILABLE = True
@@ -119,15 +119,15 @@ class MultiHeadAttention(nn.Module):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         device = x.device
-    
+
         if return_attn_probs: raise NotImplementedError(...)
         if not FLASH_ATTN_AVAILABLE: raise RuntimeError(...)
-    
+
         qkv_out = self.qkv(x) # B, T_local, 3*C
         qkv_reshaped = qkv_out.view(B, T_local, self.n_head, 3 * self.head_dim)
         # These are LOCAL q, k, v
         q_local, k_local, v_local = qkv_reshaped.split([self.head_dim, self.head_dim, self.head_dim], dim=-1)
-    
+
         # Apply RoPE based on GLOBAL position
         total_seq_len = T_local * world_size # Full conceptual length
         self.update_rope(total_seq_len) # Ensure buffers are large enough
@@ -138,7 +138,7 @@ class MultiHeadAttention(nn.Module):
         sin_for_local = sin[local_start : local_start + T_local]
         cos_for_local = cos[local_start : local_start + T_local]
         q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_for_local, cos_for_local)
-    
+
         # Call ring attention with LOCAL tensors
         if is_distributed := (world_size > 1):
             attn_output = ring_flash_attn(
@@ -150,18 +150,25 @@ class MultiHeadAttention(nn.Module):
                 # striped_ring_attn=...
             ) # Output is (B, T_local, H, Dh)
         else: # Single GPU fallback
-            # ... (flash_attn_unpadded_qkvpacked_func call using q_local_rope, k_local_rope, v_local) ...
-            # This part needs to be implemented correctly if you run single GPU
-             qkv_packed = torch.stack([q_local_rope, k_local_rope, v_local], dim=2).reshape(B*T_local, 3, self.n_head, self.head_dim).contiguous()
-             cu_seqlens = torch.arange(0, (B + 1) * T_local, step=T_local, dtype=torch.int32, device=x.device)
-             attn_output_flat = flash_attn_unpadded_qkvpacked_func(
-                 qkv_packed=qkv_packed, cu_seqlens=cu_seqlens, max_seqlen=T_local,
-                 dropout_p=config.DROPOUT if self.training else 0.0,
-                 softmax_scale=None, causal=True, return_attn_probs=False,
-             )
-             attn_output = attn_output_flat.view(B, T_local, self.n_head, self.head_dim)
-    
-    
+            qkv_packed = torch.stack([q_local_rope, k_local_rope, v_local], dim=3) # Stack along new dim 3
+            qkv_packed = qkv_packed.view(B * T_local, 3, self.n_head, self.head_dim).contiguous() # Reshape
+
+            # Prepare cu_seqlens
+            cu_seqlens = torch.arange(0, (B * T_local) + 1, step=T_local, dtype=torch.int32, device=device)
+
+            # --- Call the CORRECT function ---
+            attn_output_flat = flash_attn_varlen_qkvpacked_func( # <--- CORRECT NAME
+                qkv_packed, # (total, 3, nheads, headdim)
+                cu_seqlens, # (batch_size + 1,)
+                T_local,    # max_seqlen
+                dropout_p=config.DROPOUT if self.training else 0.0,
+                softmax_scale=None,
+                causal=True,
+                return_attn_probs=False,
+            )
+            # --- End correct call ---
+            attn_output = attn_output_flat.view(B, T_local, self.n_head, self.head_dim) # Reshape back
+
         attn_output_reshaped = attn_output.view(B, T_local, C)
         proj_output = self.proj(attn_output_reshaped) # (B, T_local, C)
         return proj_output
@@ -472,11 +479,11 @@ class SparseMoELanguageModel(nn.Module):
         rank = dist.get_rank() if dist.is_initialized() else 0
         device = input_ids.device
         T = self.block_size
-    
+
         # pad/trim
         ids = self._pad_or_trim(input_ids, T)
         B, T = ids.shape
-    
+
         # split sequence for model parallel
         if world_size > 1:
             if T % world_size != 0:
@@ -497,11 +504,11 @@ class SparseMoELanguageModel(nn.Module):
                 local_attention_mask = (ids_local != pad_id).to(device)
             else:
                 local_attention_mask = self._pad_or_trim(attention_mask.long(), T).bool()
-    
+
         # embed + transformer
         x_local = self.token_embedding_table(ids_local)
         x_local = self.dropout_emb(x_local)
-    
+
         total_aux_loss = torch.tensor(0.0, device=device, dtype=x_local.dtype)
         current_x = x_local
         for blk in self.blocks:
@@ -509,18 +516,18 @@ class SparseMoELanguageModel(nn.Module):
             if self.training and aux_loss is not None:
                 total_aux_loss = total_aux_loss + aux_loss
         x_processed = self.ln_f(current_x)
-    
+
         # gather back to full sequence
         if world_size > 1:
             x_full = torch.empty(B, T, self.n_embed, dtype=x_processed.dtype, device=device)
             dist.all_gather_into_tensor(x_full, x_processed.contiguous(), group=None)
         else:
             x_full = x_processed
-    
+
         # --- LOSS (FP32 only) ---
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
         targets = ids.to(x_full.device)
-    
+
         is_zero3 = hasattr(self.lm_head.weight, "ds_numel")
         if is_zero3:
             with GatheredParameters([self.lm_head.weight], enabled=True):
@@ -542,17 +549,17 @@ class SparseMoELanguageModel(nn.Module):
                 reduction=reduction,
                 shift=1,
             )
-    
+
         if self.training and total_aux_loss.item() != 0:
             loss = loss + total_aux_loss
-    
+
         # cleanup
         del x_full, targets, x_processed
         if world_size > 1:
             del current_x
 
         return loss
-        
+
     def forward_embeddings_only(self, input_ids, attention_mask=None):
          """ Forward pass returning final hidden states (before LM head). """
          # Similar logic to forward_next_token_efficient but stops before LM head/loss
