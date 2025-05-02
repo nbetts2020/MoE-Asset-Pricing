@@ -82,10 +82,9 @@ def train_model(
             print(step, len(dataloader), "progress!!")
             input_ids = batch['input_ids'].to(device)
 
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                loss = real_model.forward_next_token_efficient(
-                    input_ids, reduction="mean", force_bf16=True
-                )
+            loss = real_model.forward_next_token_efficient(
+                input_ids, reduction="mean"
+            )
             
             if use_deepspeed:
                 engine.zero_grad()
@@ -159,10 +158,9 @@ def train_model(
         epoch_loss = 0.0
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                loss = real_model.forward_next_token_efficient(
-                    input_ids, reduction="mean", force_bf16=True
-                )
+            loss = real_model.forward_next_token_efficient(
+                input_ids, reduction="mean"
+            )
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
@@ -209,14 +207,12 @@ def train_model(
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
 
-            with torch.amp.autocast('cuda', dtype=torch.float16):
-                loss = real_model.forward_coconut(
+            loss = real_model.forward_coconut(
                 input_ids=input_ids,
                 attention_mask=None,
                 labels=input_ids,
                 latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
-                reduction="mean",
-                force_bf16=True
+                reduction="mean"
             )
                 
             if use_deepspeed:
