@@ -144,7 +144,7 @@ class MultiHeadAttention(nn.Module):
             attn_output = ring_flash_attn(
                 q_local_rope, k_local_rope, v_local, # Pass LOCAL tensors
                 mask=mask,
-                bucket_size=512,
+                bucket_size=int(config.BLOCK_SIZE/world_size/2),
                 causal=True,
                 ring_reduce_col=True
                 # striped_ring_attn=...
