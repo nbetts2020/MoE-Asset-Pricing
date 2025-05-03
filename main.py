@@ -1,29 +1,68 @@
 # ------------------------------------------------------------------
-# Fix dtype mismatch in ring_flash_attention backward  (dv_chunk only)
+# Runtime patch for ring_flash_attention – make every einsum dtype‑safe
 import site, os, re, logging, importlib
 
+PATCH_DONE = False
 for root in site.getsitepackages():
     fn = os.path.join(root, "ring_attention_pytorch", "ring_flash_attention.py")
     if not os.path.exists(fn):
         continue
-    with open(fn, "r") as f:
-        code = f.read()
 
-    # add p = p.to(doc.dtype) on the previous line if not already there
-    patched_code, n = re.subn(
-        r"(?m)^(?P<indent>\s*)dv_chunk = einsum\('b h i j, b i h d -> b j h d', p, doc\)",
-        r"\g<indent>p = p.to(doc.dtype)\n\g<indent>dv_chunk = einsum('b h i j, b i h d -> b j h d', p, doc)",
-        code,
+    txt = open(fn).read()
+
+    # 1) scale → bf16 / fp16
+    txt, n1 = re.subn(
+        r"scale = \(q\.shape\[-1] \*\* -0\.5\)",
+        "scale = torch.tensor(q.shape[-1] ** -0.5, dtype=q.dtype, device=q.device)",
+        txt,
+        count=1,
     )
 
-    if n:
+    # 2) exp_weights cast just before exp_values einsum (forward pass)
+    txt, n2 = re.subn(
+        r"block_row_sums = exp_weights\.sum\([^\n]+\n\s+"
+        r"exp_values = einsum\('b h i j, b j h d -> b i h d', exp_weights, vc\)",
+        lambda m: m.group(0).replace(
+            "exp_values =",
+            "exp_weights = exp_weights.to(vc.dtype)\n" + m.group(0).split("\n")[-1].split("exp_values =")[0] + "exp_values ="
+        ),
+        txt,
+        count=1,
+    )
+
+    # 3) p → doc.dtype  (backward, dv_chunk line – you already did this once)
+    txt, n3 = re.subn(
+        r"dv_chunk = einsum\('b h i j, b i h d -> b j h d', p, doc\)",
+        "p = p.to(doc.dtype)\n" +
+        "                    dv_chunk = einsum('b h i j, b i h d -> b j h d', p, doc)",
+        txt,
+        count=1,
+    )
+
+    # 4) ds → qc.dtype  (backward, dq/dk chunks)
+    txt, n4 = re.subn(
+        r"ds = p \* scale \* \(dp - Dc\)[^\n]*\n([ \t]+)(# backwards.*\n)?"
+        r"([ \t]+)# dq and dk chunks",
+        lambda m: m.group(0) + f"\n{m.group(1)}ds = ds.to(qc.dtype)",
+        txt,
+        count=1,
+    )
+
+    if any((n1, n2, n3, n4)):
         with open(fn, "w") as f:
-            f.write(patched_code)
-        logging.info(f"[patch] ring_flash_attention.py fixed (dv_chunk)")
+            f.write(txt)
+        logging.info(
+            f"[patch] ring_flash_attention.py – "
+            f"scale:{n1}, exp_weights:{n2}, p‑cast:{n3}, ds‑cast:{n4}"
+        )
+        PATCH_DONE = True
     break
+
+if not PATCH_DONE:
+    logging.warning("ring_flash_attention.py already patched or file not found")
 # ------------------------------------------------------------------
 
-# now import the library – it will use the patched file
+# import after patching
 from ring_attention_pytorch import ring_flash_attn
 
 import torch
