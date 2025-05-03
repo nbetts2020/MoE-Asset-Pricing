@@ -100,8 +100,7 @@ class PrecomputedDataset(Dataset):
                 gradual=self.gradual_latent_mask
             )
         input_ids = torch.tensor(ids, dtype=torch.long)
-        label = torch.log1p(torch.tensor(raw_label, dtype=torch.float))
-        return {'input_ids': input_ids, 'label': label}
+        return {'input_ids': input_ids, 'label': raw_label}
 
 # -------------------------------------------------------------------------
 # PRECOMPUTED BOOTSTRAP DATASET (25 TEXT ITERATIONS)
