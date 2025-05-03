@@ -100,7 +100,7 @@ class PrecomputedDataset(Dataset):
                 gradual=self.gradual_latent_mask
             )
         input_ids = torch.tensor(ids, dtype=torch.long)
-        return {'input_ids': input_ids, 'label': raw_label}
+        return {'input_ids': input_ids, 'label': torch.tensor(raw_label, dtype=torch.float32)}
 
 # -------------------------------------------------------------------------
 # PRECOMPUTED BOOTSTRAP DATASET (25 TEXT ITERATIONS)
@@ -119,8 +119,8 @@ class PrecomputedBootstrapDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         texts = [row[col] for col in self.text_cols]
-        label = torch.log1p(torch.tensor(row[self.label_col], dtype=torch.float))
-
+        label = torch.tensor(row[self.label_col], dtype=torch.float32)
+        
         # tokenize each bootstrap text
         all_ids = []
         for txt in texts:
