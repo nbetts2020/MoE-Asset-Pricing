@@ -861,167 +861,101 @@ def prepare_optimizer(model, args):
     Prepares optimizer parameter groups for training.
     Applies layer-wise learning rate decay for transformer blocks.
     Separates parameters with and without weight decay.
-    Excludes positional embeddings if they don't exist (e.g., when using RoPE).
-    Prepares a separate optimizer for the EBM if it exists.
-
-    Parameters:
-      model: The model instance (should have attributes like token_embedding_table, blocks, ln_f, ebm).
-      args: Argument object containing hyperparameters like lambda_l2 (for weight decay), learning_rate, etc.
-
-    Returns:
-      A dictionary of optimizers, with keys like 'main' and potentially 'ebm'.
+    Adds a dedicated router group so its aux‑loss gradients aren’t swamped.
+    Also splits out the EBM into its own optimizer if present.
     """
-    # Use learning rate and decay schedule from args or config
-    # Example using config, adjust if these come from args
-    LR_DECAY = getattr(config, "LR_DECAY", 1.0) # Default to no decay if not set
-    BASE_LR = getattr(config, "LEARNING_RATE", 1e-4) # Default LR
-    weight_decay = args.lambda_l2 if hasattr(args, 'lambda_l2') and getattr(args, 'use_l2', False) else 0.0
+    # Base hyperparams
+    LR_DECAY    = getattr(config, "LR_DECAY", 1.0)
+    BASE_LR     = getattr(config, "LEARNING_RATE", 1e-4)
+    weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
 
-    logging.info(f"Preparing optimizer with Base LR: {BASE_LR}, Layer Decay: {LR_DECAY}, Weight Decay: {weight_decay}")
+    logging.info(f"Preparing optimizer: LR={BASE_LR}, decay={LR_DECAY}, wd={weight_decay}")
 
-    # Helper: decide if a parameter should skip weight decay
-    def skip_weight_decay(n):
-        # Common practice: skip biases, normalization layer parameters
-        if 'bias' in n: return True
-        if 'norm' in n: return True # Covers LayerNorm, RMSNorm etc. by convention
-        if 'ln' in n: return True # Covers LayerNorm by convention
-        # Optionally skip embedding table (common practice, can be debated)
-        if 'token_embedding_table' in n: return True
-        # ** REMOVED: Position embedding table check **
-        # if 'position_embedding_table' in n: return True
-        return False
+    def skip_wd(name):
+        return 'bias' in name or 'norm' in name or 'ln' in name or 'token_embedding_table' in name
 
-    optimizers = {}
+    optimizers    = {}
+    main_groups   = []
+    handled_params = set()
 
-    # --- Main transformer optimizer with layer-wise decay ---
-    main_param_groups = []
-    tracked_params = set() # Keep track of parameters already added
-
-    # Embedding parameters: token embeddings ONLY
-    # Check if token_embedding_table exists and has parameters
-    if hasattr(model, 'token_embedding_table') and list(model.token_embedding_table.parameters()):
+    # 1) Token embeddings
+    if hasattr(model, 'token_embedding_table'):
         emb_wd, emb_no_wd = [], []
-        for name, param in model.token_embedding_table.named_parameters():
-            if not param.requires_grad: continue
-            full_name = f"token_embedding_table.{name}" # Track full name
-            (emb_no_wd if skip_weight_decay(full_name) else emb_wd).append(param)
-            tracked_params.add(param) # Mark as handled
-        if emb_wd: main_param_groups.append({'params': emb_wd, 'lr': BASE_LR, 'weight_decay': weight_decay})
-        if emb_no_wd: main_param_groups.append({'params': emb_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
-        logging.info(f"Added {len(emb_wd)+len(emb_no_wd)} token embedding parameters to optimizer.")
-    else:
-        logging.warning("Model does not have 'token_embedding_table' or it has no parameters.")
+        for n,p in model.token_embedding_table.named_parameters():
+            if not p.requires_grad: continue
+            full = f"token_embedding_table.{n}"
+            (emb_no_wd if skip_wd(full) else emb_wd).append(p)
+            handled_params.add(p)
+        if emb_wd:     main_groups.append({'params': emb_wd,    'lr': BASE_LR, 'weight_decay': weight_decay})
+        if emb_no_wd:  main_groups.append({'params': emb_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
 
-    # ** REMOVED: Position embedding table processing block **
-    # The following block related to position_embedding_table is removed
-    # because the model uses RoPE instead.
-    # if hasattr(model, 'position_embedding_table') and list(model.position_embedding_table.parameters()):
-    #     pos_emb_wd, pos_emb_no_wd = [], []
-    #     for name, param in model.position_embedding_table.named_parameters():
-    #          if not param.requires_grad: continue
-    #          full_name = f"position_embedding_table.{name}"
-    #          (pos_emb_no_wd if skip_weight_decay(full_name) else pos_emb_wd).append(param)
-    #          tracked_params.add(param)
-    #     if pos_emb_wd: main_param_groups.append({'params': pos_emb_wd, 'lr': BASE_LR, 'weight_decay': weight_decay})
-    #     if pos_emb_no_wd: main_param_groups.append({'params': pos_emb_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
-    #     logging.info(f"Added {len(pos_emb_wd)+len(pos_emb_no_wd)} positional embedding parameters.")
-    # else:
-    #      logging.info("Model does not have 'position_embedding_table' (likely using RoPE).")
+    # 2) Transformer blocks (layer‑wise decay)
+    num_blocks = len(getattr(model, 'blocks', []))
+    for idx, block in enumerate(getattr(model, 'blocks', [])):
+        decay = LR_DECAY ** (num_blocks - 1 - idx)
+        lr    = BASE_LR * decay
+        wd_p, no_wd_p = [], []
+        for n,p in block.named_parameters():
+            if not p.requires_grad or p in handled_params: continue
+            full = f"blocks.{idx}.{n}"
+            (no_wd_p if skip_wd(full) else wd_p).append(p)
+            handled_params.add(p)
+        if wd_p:    main_groups.append({'params': wd_p,    'lr': lr, 'weight_decay': weight_decay})
+        if no_wd_p: main_groups.append({'params': no_wd_p, 'lr': lr, 'weight_decay': 0.0})
 
-
-    # Transformer blocks with layer-wise decay
-    if hasattr(model, 'blocks') and model.blocks:
-        num_blocks = len(model.blocks)
-        logging.info(f"Applying layer-wise decay (factor {LR_DECAY}) to {num_blocks} blocks.")
-        for idx, block in enumerate(model.blocks):
-            layer_decay = LR_DECAY ** (num_blocks - 1 - idx)
-            layer_lr = BASE_LR * layer_decay
-            wd_params, no_wd_params = [], []
-            for name, param in block.named_parameters():
-                if not param.requires_grad: continue
-                # Check if already handled (e.g., if embeddings were part of blocks)
-                if param in tracked_params: continue
-                full_name = f"blocks.{idx}.{name}" # Use full name for check
-                (no_wd_params if skip_weight_decay(full_name) else wd_params).append(param)
-                tracked_params.add(param)
-            if wd_params: main_param_groups.append({'params': wd_params, 'lr': layer_lr, 'weight_decay': weight_decay})
-            if no_wd_params: main_param_groups.append({'params': no_wd_params, 'lr': layer_lr, 'weight_decay': 0.0})
-    else:
-        logging.warning("Model does not have 'blocks' attribute or it's empty.")
-
-
-    # Final LayerNorm (ln_f)
-    if hasattr(model, 'ln_f') and list(model.ln_f.parameters()):
+    # 3) Final LayerNorm
+    if hasattr(model, 'ln_f'):
         ln_wd, ln_no_wd = [], []
-        for name, param in model.ln_f.named_parameters():
-            if not param.requires_grad: continue
-            if param in tracked_params: continue
-            full_name = f"ln_f.{name}"
-            (ln_no_wd if skip_weight_decay(full_name) else ln_wd).append(param)
-            tracked_params.add(param)
-        if ln_wd: main_param_groups.append({'params': ln_wd, 'lr': BASE_LR, 'weight_decay': weight_decay})
-        if ln_no_wd: main_param_groups.append({'params': ln_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
-        logging.info(f"Added {len(ln_wd)+len(ln_no_wd)} final LayerNorm parameters.")
-    else:
-         logging.warning("Model does not have 'ln_f' or it has no parameters.")
+        for n,p in model.ln_f.named_parameters():
+            if not p.requires_grad or p in handled_params: continue
+            full = f"ln_f.{n}"
+            (ln_no_wd if skip_wd(full) else ln_wd).append(p)
+            handled_params.add(p)
+        if ln_wd:    main_groups.append({'params': ln_wd,    'lr': BASE_LR, 'weight_decay': weight_decay})
+        if ln_no_wd: main_groups.append({'params': ln_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
 
-    # Add LM Head parameters (if not tied or handled elsewhere)
-    # Weight tying means lm_head.weight is the same object as token_embedding_table.weight
-    # Check if lm_head exists and has parameters *not already tracked* (bias usually)
-    if hasattr(model, 'lm_head') and list(model.lm_head.parameters()):
-        lm_wd, lm_no_wd = [], []
-        for name, param in model.lm_head.named_parameters():
-             if not param.requires_grad: continue
-             if param in tracked_params: continue # Skip if weight was tied and already added
-             full_name = f"lm_head.{name}"
-             (lm_no_wd if skip_weight_decay(full_name) else lm_wd).append(param)
-             tracked_params.add(param)
-        if lm_wd: main_param_groups.append({'params': lm_wd, 'lr': BASE_LR, 'weight_decay': weight_decay})
-        if lm_no_wd: main_param_groups.append({'params': lm_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
-        logging.info(f"Added {len(lm_wd)+len(lm_no_wd)} LM Head parameters (likely just bias).")
+    # 4) LM head (usually just bias if weight‑tied)
+    if hasattr(model, 'lm_head'):
+        head_wd, head_no_wd = [], []
+        for n,p in model.lm_head.named_parameters():
+            if not p.requires_grad or p in handled_params: continue
+            full = f"lm_head.{n}"
+            (head_no_wd if skip_wd(full) else head_wd).append(p)
+            handled_params.add(p)
+        if head_wd:    main_groups.append({'params': head_wd,    'lr': BASE_LR, 'weight_decay': weight_decay})
+        if head_no_wd: main_groups.append({'params': head_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
 
+    # 5) Router (dedicated group for stronger aux‑loss signal)
+    if hasattr(model, 'moe') and hasattr(model.moe, 'router'):
+        router_params = list(model.moe.router.parameters())
+        if router_params:
+            mult = getattr(args, "router_lr_mult", 2.0)
+            main_groups.append({
+                'params': router_params,
+                'lr':     BASE_LR * mult,
+                'weight_decay': 0.0
+            })
+            logging.info(f"Added {len(router_params)} router params at LR×{mult}")
 
-    # Check for any parameters missed
-    all_model_params = {p for p in model.parameters() if p.requires_grad}
-    unhandled_params = all_model_params - tracked_params
-    if unhandled_params:
-         logging.warning(f"Found {len(unhandled_params)} trainable parameters not assigned to optimizer groups!")
-         # Optionally add them to a default group
-         # default_group = {'params': list(unhandled_params), 'lr': BASE_LR, 'weight_decay': weight_decay}
-         # main_param_groups.append(default_group)
+    # 6) Catch any unassigned params
+    all_trainable = {p for p in model.parameters() if p.requires_grad}
+    unhandled    = all_trainable - handled_params - set(router_params if 'router_params' in locals() else [])
+    if unhandled:
+        logging.warning(f"{len(unhandled)} params unassigned to any group; adding to default")
+        main_groups.append({'params': list(unhandled), 'lr': BASE_LR, 'weight_decay': weight_decay})
 
-    # Use AdamW if DeepSpeedCPUAdam fallback is used
-    optimizer_cls = DeepSpeedCPUAdam if DeepSpeedCPUAdam != torch.optim.AdamW else torch.optim.AdamW
-    optimizers['main'] = optimizer_cls(main_param_groups, lr=BASE_LR, weight_decay=weight_decay) # LR/WD defined per group
+    # Build main optimizer
+    optimizer_cls = torch.optim.AdamW
+    optimizers['main'] = optimizer_cls(main_groups)
 
+    # 7) EBM optimizer
+    if hasattr(model, 'ebm'):
+        ebm_params = list(model.ebm.parameters())
+        if ebm_params:
+            ebm_lr = getattr(args, "ebm_lr", BASE_LR)
+            optimizers['ebm'] = optimizer_cls([{'params': ebm_params, 'lr': ebm_lr, 'weight_decay': weight_decay}])
+            logging.info("Created EBM optimizer")
 
-    # --- EBM optimizer ---
-    # Check if EBM exists and has parameters
-    if hasattr(model, 'ebm') and list(model.ebm.parameters()):
-        logging.info("Preparing separate optimizer for EBM.")
-        ebm_param_groups = []
-        ebm_wd, ebm_no_wd = [], []
-        # Use a potentially different LR for EBM if specified in args/config
-        ebm_lr = getattr(args, "ebm_lr", BASE_LR) # Default to BASE_LR if not specified
-        ebm_wd_val = getattr(args, "ebm_weight_decay", weight_decay) # Default to main WD
-
-        for name, param in model.ebm.named_parameters():
-            if not param.requires_grad: continue
-            # Apply skip logic based on name
-            (ebm_no_wd if skip_weight_decay(f"ebm.{name}") else ebm_wd).append(param)
-
-        if ebm_wd: ebm_param_groups.append({'params': ebm_wd, 'lr': ebm_lr, 'weight_decay': ebm_wd_val})
-        if ebm_no_wd: ebm_param_groups.append({'params': ebm_no_wd, 'lr': ebm_lr, 'weight_decay': 0.0})
-
-        if ebm_param_groups:
-            optimizers['ebm'] = optimizer_cls(ebm_param_groups, lr=ebm_lr, weight_decay=ebm_wd_val)
-        else:
-             logging.warning("EBM module found but has no trainable parameters.")
-    else:
-         logging.info("No EBM module found or it has no parameters, skipping EBM optimizer.")
-
-
-    logging.info(f"Optimizer preparation complete. Optimizers created: {list(optimizers.keys())}")
     return optimizers
 
 def initialize_si(model, args):
