@@ -858,44 +858,46 @@ def initialize_model(args, device, init_from_scratch=False):
 
 def prepare_optimizer(model, args):
     """
-    Prepares optimizer parameter groups for training.
-    Applies layer-wise learning rate decay for transformer blocks.
-    Separates parameters with and without weight decay.
-    Adds a dedicated router group so its aux‑loss gradients aren’t swamped.
-    Also splits out the EBM into its own optimizer if present.
+    Prepares optimizer parameter groups:
+      - Token embeddings
+      - Transformer blocks (layer‑wise decay)
+      - Final LayerNorm & LM head
+      - Dedicated router group
+      - Dedicated EBM optimizer
+      - Catch‑all for anything else *except* router & EBM
+    Always uses DeepSpeedCPUAdam under ZeRO‑Offload.
     """
-    # Base hyperparams
-    LR_DECAY    = getattr(config, "LR_DECAY", 1.0)
-    BASE_LR     = getattr(config, "LEARNING_RATE", 1e-4)
+    LR_DECAY     = getattr(config, "LR_DECAY", 1.0)
+    BASE_LR      = getattr(config, "LEARNING_RATE", 1e-4)
     weight_decay = args.lambda_l2 if getattr(args, 'use_l2', False) else 0.0
 
     logging.info(f"Preparing optimizer: LR={BASE_LR}, decay={LR_DECAY}, wd={weight_decay}")
 
     def skip_wd(name):
-        return 'bias' in name or 'norm' in name or 'ln' in name or 'token_embedding_table' in name
+        return any(tok in name for tok in ("bias", "norm", "ln", "token_embedding_table"))
 
-    optimizers    = {}
-    main_groups   = []
+    optimizers     = {}
+    main_groups    = []
     handled_params = set()
 
     # 1) Token embeddings
     if hasattr(model, 'token_embedding_table'):
-        emb_wd, emb_no_wd = [], []
-        for n,p in model.token_embedding_table.named_parameters():
+        wd_p, no_wd_p = [], []
+        for n, p in model.token_embedding_table.named_parameters():
             if not p.requires_grad: continue
             full = f"token_embedding_table.{n}"
-            (emb_no_wd if skip_wd(full) else emb_wd).append(p)
+            (no_wd_p if skip_wd(full) else wd_p).append(p)
             handled_params.add(p)
-        if emb_wd:     main_groups.append({'params': emb_wd,    'lr': BASE_LR, 'weight_decay': weight_decay})
-        if emb_no_wd:  main_groups.append({'params': emb_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
+        if wd_p:    main_groups.append({'params': wd_p,    'lr': BASE_LR, 'weight_decay': weight_decay})
+        if no_wd_p: main_groups.append({'params': no_wd_p, 'lr': BASE_LR, 'weight_decay': 0.0})
 
     # 2) Transformer blocks (layer‑wise decay)
-    num_blocks = len(getattr(model, 'blocks', []))
-    for idx, block in enumerate(getattr(model, 'blocks', [])):
-        decay = LR_DECAY ** (num_blocks - 1 - idx)
+    blocks = getattr(model, 'blocks', [])
+    for idx, block in enumerate(blocks):
+        decay = LR_DECAY ** (len(blocks) - 1 - idx)
         lr    = BASE_LR * decay
         wd_p, no_wd_p = [], []
-        for n,p in block.named_parameters():
+        for n, p in block.named_parameters():
             if not p.requires_grad or p in handled_params: continue
             full = f"blocks.{idx}.{n}"
             (no_wd_p if skip_wd(full) else wd_p).append(p)
@@ -905,27 +907,28 @@ def prepare_optimizer(model, args):
 
     # 3) Final LayerNorm
     if hasattr(model, 'ln_f'):
-        ln_wd, ln_no_wd = [], []
-        for n,p in model.ln_f.named_parameters():
+        wd_p, no_wd_p = [], []
+        for n, p in model.ln_f.named_parameters():
             if not p.requires_grad or p in handled_params: continue
             full = f"ln_f.{n}"
-            (ln_no_wd if skip_wd(full) else ln_wd).append(p)
+            (no_wd_p if skip_wd(full) else wd_p).append(p)
             handled_params.add(p)
-        if ln_wd:    main_groups.append({'params': ln_wd,    'lr': BASE_LR, 'weight_decay': weight_decay})
-        if ln_no_wd: main_groups.append({'params': ln_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
+        if wd_p:    main_groups.append({'params': wd_p,    'lr': BASE_LR, 'weight_decay': weight_decay})
+        if no_wd_p: main_groups.append({'params': no_wd_p, 'lr': BASE_LR, 'weight_decay': 0.0})
 
-    # 4) LM head (usually just bias if weight‑tied)
+    # 4) LM head
     if hasattr(model, 'lm_head'):
-        head_wd, head_no_wd = [], []
-        for n,p in model.lm_head.named_parameters():
+        wd_p, no_wd_p = [], []
+        for n, p in model.lm_head.named_parameters():
             if not p.requires_grad or p in handled_params: continue
             full = f"lm_head.{n}"
-            (head_no_wd if skip_wd(full) else head_wd).append(p)
+            (no_wd_p if skip_wd(full) else wd_p).append(p)
             handled_params.add(p)
-        if head_wd:    main_groups.append({'params': head_wd,    'lr': BASE_LR, 'weight_decay': weight_decay})
-        if head_no_wd: main_groups.append({'params': head_no_wd, 'lr': BASE_LR, 'weight_decay': 0.0})
+        if wd_p:    main_groups.append({'params': wd_p,    'lr': BASE_LR, 'weight_decay': weight_decay})
+        if no_wd_p: main_groups.append({'params': no_wd_p, 'lr': BASE_LR, 'weight_decay': 0.0})
 
-    # 5) Router (dedicated group for stronger aux‑loss signal)
+    # 5) Router group
+    router_params = []
     if hasattr(model, 'moe') and hasattr(model.moe, 'router'):
         router_params = list(model.moe.router.parameters())
         if router_params:
@@ -935,26 +938,36 @@ def prepare_optimizer(model, args):
                 'lr':     BASE_LR * mult,
                 'weight_decay': 0.0
             })
+            handled_params.update(router_params)
             logging.info(f"Added {len(router_params)} router params at LR×{mult}")
 
-    # 6) Catch any unassigned params
-    all_trainable = {p for p in model.parameters() if p.requires_grad}
-    unhandled    = all_trainable - handled_params - set(router_params if 'router_params' in locals() else [])
-    if unhandled:
-        logging.warning(f"{len(unhandled)} params unassigned to any group; adding to default")
-        main_groups.append({'params': list(unhandled), 'lr': BASE_LR, 'weight_decay': weight_decay})
-
     # Build main optimizer
-    optimizer_cls = torch.optim.AdamW
-    optimizers['main'] = optimizer_cls(main_groups)
+    optimizers['main'] = DeepSpeedCPUAdam(main_groups)
 
-    # 7) EBM optimizer
+    # 6) EBM optimizer
+    ebm_params = []
     if hasattr(model, 'ebm'):
-        ebm_params = list(model.ebm.parameters())
+        ebm_params = [p for p in model.ebm.parameters() if p.requires_grad]
         if ebm_params:
             ebm_lr = getattr(args, "ebm_lr", BASE_LR)
-            optimizers['ebm'] = optimizer_cls([{'params': ebm_params, 'lr': ebm_lr, 'weight_decay': weight_decay}])
+            optimizers['ebm'] = DeepSpeedCPUAdam([{
+                'params': ebm_params,
+                'lr':     ebm_lr,
+                'weight_decay': weight_decay
+            }])
+            handled_params.update(ebm_params)
             logging.info("Created EBM optimizer")
+
+    # 7) Catch‑all for anything left
+    all_trainable = {p for p in model.parameters() if p.requires_grad}
+    leftovers     = all_trainable - handled_params
+    if leftovers:
+        logging.warning(f"{len(leftovers)} params unassigned; adding to default group")
+        optimizers['main'].add_param_group({
+            'params': list(leftovers),
+            'lr':     BASE_LR,
+            'weight_decay': weight_decay
+        })
 
     return optimizers
 
