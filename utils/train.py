@@ -3,6 +3,7 @@ import gc
 import time
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 import logging
 import subprocess
@@ -21,11 +22,11 @@ from utils.model import update_model_rope_for_extended_context, expand_pos_embed
 
 def extract_label_value(decoded_text):
     """
-    Extracts the numerical label following the "<30 DAY LABEL>:" marker and returns it as a float.
+    Extracts the numerical label following the "<STOCK PRICE 30 DAYS OUT>>:" marker and returns it as a float.
     If multiple dots are found (e.g. "2..98"), they are replaced with a single dot.
     Returns None if extraction or conversion fails.
     """
-    match = re.search(r'\<30 DAY LABEL\>:\s*([\d\.]+)', decoded_text)
+    match = re.search(r'\<STOCK PRICE 30 DAYS OUT\>:\s*([\d\.]+)', decoded_text)
     if match:
         num_str = match.group(1)
         num_str = re.sub(r'\.\.+', '.', num_str)
@@ -36,6 +37,24 @@ def extract_label_value(decoded_text):
             return None
     else:
         return None
+
+def greedy_generate_tail(model, input_ids, max_new_tokens=20):
+    """
+    Returns only the newly generated token IDs (shape B×T_new),
+    not the entire prefix+gen sequence.
+    """
+    device = input_ids.device
+    batch = input_ids.shape[0]
+    generated = []
+    cur = input_ids
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            hs = model.forward_embeddings_only(cur)      # (B, T, C)
+            logits = model.lm_head(hs)                  # (B, T, V)
+            nxt   = logits[:, -1, :].argmax(-1, keepdim=True)  # (B,1)
+            generated.append(nxt)
+            cur = torch.cat([cur, nxt], dim=1)
+    return torch.cat(generated, dim=1)  # (B, max_new_tokens)
 
 def train_model(
     model,
@@ -80,12 +99,52 @@ def train_model(
         epoch_loss = 0.0
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
-            input_ids = batch['input_ids'].to(device)
 
+            if (step + 1) % 10 == 0:
+                try:
+                    # take a small subset of the batch
+                    sample_ids  = batch['input_ids'][:5]    # (5, T)
+                    true_prices = batch['labels'][:5].tolist()
+            
+                    # determine per‑GPU shard size
+                    world_size = dist.get_world_size() if dist.is_initialized() else 1
+                    rank       = dist.get_rank()      if dist.is_initialized() else 0
+                    T_local    = config.BLOCK_SIZE // world_size
+            
+                    # pad/trim to BLOCK_SIZE then slice out this rank's window
+                    ids = real_model._pad_or_trim(sample_ids.to(device), config.BLOCK_SIZE)  # (5, BLOCK_SIZE)
+                    ids_local = ids[:, rank * T_local : (rank + 1) * T_local]                # (5, T_local)
+            
+                    with torch.no_grad():
+                        # forward on the shard
+                        hs_local = real_model.forward_embeddings_only(ids_local)  # (5, T_local, C)
+            
+                        # gather all shards back to full sequence length
+                        shards = [torch.zeros_like(hs_local) for _ in range(world_size)]
+                        dist.all_gather(shards, hs_local)                         # shards[i] ← rank i's hs_local
+                        hs = torch.cat(shards, dim=1)                             # (5, BLOCK_SIZE, C)
+            
+                        # compute logits on the reconstructed full sequence
+                        logits  = real_model.lm_head(hs)                          # (5, BLOCK_SIZE, V)
+                        pred_ids = logits.argmax(dim=-1)                          # (5, BLOCK_SIZE)
+            
+                    # decode only the tail tokens as before
+                    tail_ids  = pred_ids[:, -20:]                                # (5, 20)
+                    tail_strs = tokenizer.batch_decode(tail_ids, skip_special_tokens=True)
+            
+                    for i, tail in enumerate(tail_strs):
+                        print(tail)
+                        pred_price = extract_label_value(tail)
+                        print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred_price}")
+            
+                except Exception as e:
+                    logging.warning(f"Batch {step+1}: debug failed: {e}")
+                            
+            input_ids = batch['input_ids'].to(device)
             loss = real_model.forward_next_token_efficient(
                 input_ids, reduction="mean"
             )
-            
+                    
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
