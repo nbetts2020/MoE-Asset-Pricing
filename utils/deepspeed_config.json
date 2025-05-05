@@ -26,7 +26,7 @@
   "gradient_checkpointing": {
     "enabled": true
   },
-  "fp16": {
+  "bf16": {
     "enabled": true
   },
   "steps_per_print": 50,
