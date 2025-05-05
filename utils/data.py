@@ -25,7 +25,7 @@ GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(
 
 # Add special tokens
 special_tokens = {
-    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>']
+    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ']
 }
 GLOBAL_TOKENIZER.add_special_tokens(special_tokens)
 # Set pad token to eos
