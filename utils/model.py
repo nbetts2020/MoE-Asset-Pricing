@@ -20,7 +20,8 @@ from cut_cross_entropy import linear_cross_entropy
 
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
-# Now import the (patched) flash‐attention binding
+import sys, os
+sys.path.insert(0, os.path.abspath("third_party"))
 from ring_attention_pytorch import ring_flash_attn
 from flash_attn.flash_attn_interface import (
     flash_attn_unpadded_qkvpacked_func,
