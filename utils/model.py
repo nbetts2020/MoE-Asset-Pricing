@@ -112,67 +112,84 @@ class MultiHeadAttention(nn.Module):
         self._buffers['rope_sin'] = sin.float()
         self._buffers['rope_cos'] = cos.float()
 
-    # Inside MultiHeadAttention class
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, return_attn_probs: bool = False):
-        # x here is the LOCAL SHARD: (B, T_local, C)
+        # x: (B, T_local, C), mask: (B, T_local) with True on real tokens
         B, T_local, C = x.shape
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        device = x.device
-
-        if return_attn_probs: raise NotImplementedError(...)
-        if not FLASH_ATTN_AVAILABLE: raise RuntimeError(...)
-
-        qkv_out = self.qkv(x) # B, T_local, 3*C
-        qkv_reshaped = qkv_out.view(B, T_local, self.n_head, 3 * self.head_dim)
-        # These are LOCAL q, k, v
-        q_local, k_local, v_local = qkv_reshaped.split([self.head_dim, self.head_dim, self.head_dim], dim=-1)
-
-        # Apply RoPE based on GLOBAL position
-        total_seq_len = T_local * world_size # Full conceptual length
-        self.update_rope(total_seq_len) # Ensure buffers are large enough
-        sin = self.rope_sin[:total_seq_len].to(device=device)
-        cos = self.rope_cos[:total_seq_len].to(device=device)
-        local_start = rank * T_local
-        # Apply RoPE using the slice corresponding to this rank's global position
-        sin_for_local = sin[local_start : local_start + T_local]
-        cos_for_local = cos[local_start : local_start + T_local]
-        q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_for_local, cos_for_local)
-
-        # Call ring attention with LOCAL tensors
-        if is_distributed := (world_size > 1):
+        rank       = dist.get_rank()        if dist.is_initialized() else 0
+        device     = x.device
+    
+        if return_attn_probs:
+            raise NotImplementedError("return_attn_probs=True not supported")
+        if not FLASH_ATTN_AVAILABLE:
+            raise RuntimeError("flash-attention not available")
+    
+        # ------------- QKV projection -------------
+        qkv = self.qkv(x).view(B, T_local, self.n_head, 3 * self.head_dim)
+        q_local, k_local, v_local = qkv.split([self.head_dim, self.head_dim, self.head_dim], dim=-1)
+    
+        # ------------- RoPE rotary embeddings -------------
+        total_seq_len = T_local * world_size
+        self.update_rope(total_seq_len)
+        sin = self.rope_sin[:total_seq_len].to(device)
+        cos = self.rope_cos[:total_seq_len].to(device)
+        start = rank * T_local
+        sin_local = sin[start:start + T_local]
+        cos_local = cos[start:start + T_local]
+        q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_local, cos_local)
+    
+        # ------------- Attention -------------
+        if world_size > 1:
+            # distributed ring‑attention branch (unchanged)
             attn_output = ring_flash_attn(
-                q_local_rope, k_local_rope, v_local, # Pass LOCAL tensors
+                q_local_rope, k_local_rope, v_local,
                 mask=mask,
-                bucket_size=int(config.BLOCK_SIZE/world_size/2),
+                bucket_size=int(config.BLOCK_SIZE / world_size / 2),
                 causal=True,
-                ring_reduce_col=True
-                # striped_ring_attn=...
-            ) # Output is (B, T_local, H, Dh)
-        else: # Single GPU fallback
-            qkv_packed = torch.stack([q_local_rope, k_local_rope, v_local], dim=3) # Stack along new dim 3
-            qkv_packed = qkv_packed.view(B * T_local, 3, self.n_head, self.head_dim).contiguous() # Reshape
-
-            # Prepare cu_seqlens
-            cu_seqlens = torch.arange(0, (B * T_local) + 1, step=T_local, dtype=torch.int32, device=device)
-
-            # --- Call the CORRECT function ---
-            attn_output_flat = flash_attn_unpadded_qkvpacked_func( # <--- CORRECT NAME
-                qkv_packed, # (total, 3, nheads, headdim)
-                cu_seqlens, # (batch_size + 1,)
-                T_local,    # max_seqlen
-                dropout_p=config.DROPOUT if self.training else 0.0,
-                softmax_scale=None,
-                causal=True,
+                ring_reduce_col=True,
+            )  # (B, T_local, H, Dh)
+        else:
+            # single‑GPU flash‑attention (unpadded) branch
+            if mask is None:
+                seqlens = torch.full((B,), T_local, dtype=torch.int32, device=device)
+            else:
+                seqlens = mask.sum(-1, dtype=torch.int32)  # (B,)
+            max_seqlen = int(seqlens.max())
+            cu_seqlens = torch.empty(B + 1, dtype=torch.int32, device=device)
+            cu_seqlens[0] = 0
+            torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])  # stays int32
+    
+            # pack only valid (non-pad) tokens
+            q_pack = torch.cat([q_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
+            k_pack = torch.cat([k_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
+            v_pack = torch.cat([v_local[i,       :seqlens[i]] for i in range(B)], dim=0)
+            qkv_packed = torch.stack([q_pack, k_pack, v_pack], dim=1)  # (total_tokens, 3, H, Dh)
+    
+            # call unpadded flash-attn
+            attn_flat = flash_attn_unpadded_qkvpacked_func(
+                qkv_packed,
+                cu_seqlens,
+                max_seqlen,
+                dropout_p    = config.DROPOUT if self.training else 0.0,
+                softmax_scale= None,
+                causal       = True,
                 return_attn_probs=False,
-            )
-            # --- End correct call ---
-            attn_output = attn_output_flat.view(B, T_local, self.n_head, self.head_dim) # Reshape back
-
-        attn_output_reshaped = attn_output.view(B, T_local, C)
-        proj_output = self.proj(attn_output_reshaped) # (B, T_local, C)
+            )  # (total_tokens, H, Dh)
+    
+            # scatter back into padded output tensor
+            attn_output = torch.zeros(B, T_local, self.n_head, self.head_dim,
+                                      device=device, dtype=attn_flat.dtype)
+            idx = 0
+            for i in range(B):
+                length = seqlens[i].item()
+                attn_output[i, :length] = attn_flat[idx:idx + length]
+                idx += length
+    
+        # ------------- Output projection -------------
+        attn_output = attn_output.view(B, T_local, C)    # (B, T_local, C)
+        proj_output = self.proj(attn_output)             # (B, T_local, C)
         return proj_output
-
+    
 # -----------------------------------------------------------------------------#
 #  Mixture-of-Experts blocks (Keeping simplified version for now)
 # -----------------------------------------------------------------------------#
@@ -211,7 +228,7 @@ class NoisyTopkRouter(nn.Module):
 
 class SparseMoE(nn.Module):
     """Sparse MoE layer."""
-    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1.25):
+    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 2):
         super().__init__()
         self.router = NoisyTopkRouter(d, n_exp, top_k)
         self.experts = nn.ModuleList([Expert(d) for _ in range(n_exp)])
@@ -219,7 +236,7 @@ class SparseMoE(nn.Module):
         self.capacity_factor = cap_factor
         self.num_experts = n_exp
         self.hidden_dim = d
-
+    
     def forward(self, hidden_states):
         """
         Forward pass for SparseMoE with capacity enforcement.
@@ -229,94 +246,87 @@ class SparseMoE(nn.Module):
         flat_hidden_states = hidden_states.view(num_tokens, dim)
         device = hidden_states.device
         dtype = hidden_states.dtype
-
+    
         # 1. Get Routing Info
         top_k_gates, top_k_indices, dense_router_probs = self.router(flat_hidden_states)
         # top_k_indices shape: (num_tokens, top_k)
-        # top_k_gates shape: (num_tokens, top_k)
-
+        # top_k_gates shape:    (num_tokens, top_k)
+    
         # 2. Calculate Capacity per Expert
         capacity = max(1, math.ceil((self.capacity_factor * num_tokens) / self.num_experts))
         logging.debug(f"MoE Capacity per expert: {capacity}")
-
+    
         # 3. Determine Token Dispatch & Enforce Capacity
         expert_mask = torch.zeros(num_tokens, self.num_experts, dtype=torch.bool, device=device)
-        # Mark experts chosen in top-k for each token
         expert_mask.scatter_(1, top_k_indices, True)
-
-        # Determine position of token for each expert it's routed to
-        route_cumsum = torch.cumsum(expert_mask.long(), dim=0)
-        route_position = route_cumsum * expert_mask - 1 # 0-indexed position
-
-        # Keep assignments where the position is within capacity
-        keep_mask = (route_position < capacity) & expert_mask # Shape: (num_tokens, num_experts)
-
-        # --- Correctly map capacity mask back to top-k choices ---
-        # pass_cap_mask_k[n, k] is True if expert chosen as k-th choice for token n passed capacity check.
-        pass_cap_mask_k = keep_mask.gather(1, top_k_indices) # Shape: (num_tokens, top_k)
-
-        # Find the indices (token_idx, k_idx) where pass_cap_mask_k is True
-        kept_indices_where = torch.where(pass_cap_mask_k)
-        kept_token_indices = kept_indices_where[0] # Token indices that have at least one valid route
-        k_for_kept_tokens = kept_indices_where[1]  # Which k-th choice was kept (0 to top_k-1)
-
-        # Retrieve the corresponding expert index and gate value using the identified indices
+    
+        route_cumsum   = torch.cumsum(expert_mask.long(), dim=0)
+        route_position = route_cumsum * expert_mask - 1  # 0-indexed
+    
+        keep_mask = (route_position < capacity) & expert_mask
+    
+        # Map capacity mask back to top‑k choices
+        pass_cap_mask_k     = keep_mask.gather(1, top_k_indices)  # (num_tokens, top_k)
+        kept_indices_where  = torch.where(pass_cap_mask_k)
+        kept_token_indices  = kept_indices_where[0]
+        k_for_kept_tokens   = kept_indices_where[1]
+    
         kept_expert_indices = top_k_indices[kept_token_indices, k_for_kept_tokens]
-        kept_gate_values = top_k_gates[kept_token_indices, k_for_kept_tokens]
-        # --- End mapping fix ---
-
-        # --- Calculate actual load correctly based on kept assignments ---
+        kept_gate_values    = top_k_gates[kept_token_indices, k_for_kept_tokens]
+    
+        # 4. Compute actual load for aux loss
         actual_load = torch.zeros(self.num_experts, device=device, dtype=torch.long)
         if kept_expert_indices.numel() > 0:
-           actual_load.scatter_add_(0, kept_expert_indices, torch.ones_like(kept_expert_indices))
+            actual_load.scatter_add_(0, kept_expert_indices, torch.ones_like(kept_expert_indices))
         logging.debug(f"MoE Actual Load: {actual_load.tolist()}")
-
-        # 4. Dispatch tokens to experts and compute outputs
+    
+        # 5. Dispatch tokens to experts and compute outputs
         final_hidden_states = torch.zeros_like(flat_hidden_states)
-
-        # Sort tokens by expert index
-        sorted_indices = torch.argsort(kept_expert_indices)
-        sorted_kept_expert_indices = kept_expert_indices[sorted_indices]
-        sorted_kept_token_indices = kept_token_indices[sorted_indices]
-        sorted_kept_gate_values = kept_gate_values[sorted_indices]
-
-        # Find boundaries between experts in the sorted list
+    
+        # Sort by expert to form contiguous segments
+        sorted_indices               = torch.argsort(kept_expert_indices)
+        sorted_kept_expert_indices   = kept_expert_indices[sorted_indices]
+        sorted_kept_token_indices    = kept_token_indices[sorted_indices]
+        sorted_kept_gate_values      = kept_gate_values[sorted_indices]
+    
+        # Find segment boundaries where expert index changes
         expert_change_indices = torch.cat([
             torch.tensor([0], device=device),
             torch.where(sorted_kept_expert_indices[:-1] != sorted_kept_expert_indices[1:])[0] + 1,
             torch.tensor([len(sorted_kept_expert_indices)], device=device)
         ])
-
-        # Process experts one by one
-        for i in range(self.num_experts):
-            start_idx = expert_change_indices[i]
-            end_idx = expert_change_indices[i+1]
-
-            # Check if this segment actually corresponds to expert i and has tokens
-            if start_idx < end_idx and sorted_kept_expert_indices[start_idx] == i:
-                current_token_indices = sorted_kept_token_indices[start_idx:end_idx]
-                current_gate_values = sorted_kept_gate_values[start_idx:end_idx].unsqueeze(1)
-                current_input_tokens = flat_hidden_states[current_token_indices]
-
-                # Run the expert
-                expert_output = self.experts[i](current_input_tokens)
-
-                # Combine expert output with gate values and add back
-                weighted_output = expert_output * current_gate_values
-                final_hidden_states.index_add_(0, current_token_indices, weighted_output)
-
-        # 5. Calculate Auxiliary Loss
+    
+        # Loop over each segment
+        num_segs = expert_change_indices.size(0) - 1
+        for seg in range(num_segs):
+            start_idx = expert_change_indices[seg].item()
+            end_idx   = expert_change_indices[seg + 1].item()
+            if start_idx >= end_idx:
+                continue
+    
+            expert_i   = sorted_kept_expert_indices[start_idx].item()
+            token_idxs = sorted_kept_token_indices[start_idx:end_idx]
+            gate_vals  = sorted_kept_gate_values[start_idx:end_idx].unsqueeze(1)
+            inputs     = flat_hidden_states[token_idxs]
+    
+            # Run the expert and scatter‐add back
+            out = self.experts[expert_i](inputs)
+            final_hidden_states.index_add_(0, token_idxs, out * gate_vals)
+    
+        # 6. Auxiliary MoE load balancing loss
         if self.training:
-            # Use actual load and router probs for aux loss
             fraction_tokens_routed = actual_load / max(1, num_tokens)
-            fraction_prob_routed = dense_router_probs.mean(dim=0)
-            aux_loss_factor = 0.01
-            aux_loss = torch.sum(fraction_prob_routed * fraction_tokens_routed) * self.num_experts * aux_loss_factor
+            fraction_prob_routed   = dense_router_probs.mean(dim=0)
+            aux_loss_factor        = 0.01
+            aux_loss = (
+                torch.sum(fraction_prob_routed * fraction_tokens_routed)
+                * self.num_experts
+                * aux_loss_factor
+            )
             logging.debug(f"MoE Aux Loss: {aux_loss.item()}")
         else:
             aux_loss = torch.tensor(0.0, device=device, dtype=dtype)
-
-
+    
         return final_hidden_states.view_as(hidden_states), aux_loss
 
 class Block(nn.Module):
@@ -359,28 +369,36 @@ class SparseMoELanguageModel(nn.Module):
         from transformers import LlamaTokenizerFast # Keep import here
 
         if tokenizer_name:
-             try:
-                  self.tokenizer = LlamaTokenizerFast.from_pretrained(
-                       tokenizer_name, model_max_length=block_size
-                  )
-             except Exception as e:
-                  logging.exception(f"Failed to load tokenizer '{tokenizer_name}'")
-                  raise
+            try:
+                self.tokenizer = LlamaTokenizerFast.from_pretrained(
+                    tokenizer_name, model_max_length=block_size
+                )
+                special_tokens = {
+                    'additional_special_tokens': [
+                        '<bot>', '<start_latent>', '<end_latent>',
+                        '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: '
+                    ]
+                }
+                self.tokenizer.add_special_tokens(special_tokens)
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            except Exception as e:
+                logging.exception(f"Failed to load tokenizer '{tokenizer_name}'")
+                raise
         else:
-             # Use tokenizer passed from data.py
-             self.tokenizer = GLOBAL_TOKENIZER
-             # Update tokenizer max length if model block size differs
-             if self.tokenizer.model_max_length != block_size:
-                  logging.warning(f"Updating tokenizer model_max_length from {self.tokenizer.model_max_length} to {block_size}")
-                  self.tokenizer.model_max_length = block_size
+            # Use tokenizer passed from data.py
+            self.tokenizer = GLOBAL_TOKENIZER
+            # Update tokenizer max length if model block size differs
+            if self.tokenizer.model_max_length != block_size:
+                logging.warning(f"Updating tokenizer model_max_length from {self.tokenizer.model_max_length} to {block_size}")
+                self.tokenizer.model_max_length = block_size
 
         # Ensure pad token is set
         if self.tokenizer.pad_token_id is None:
-             if self.tokenizer.eos_token_id is not None:
-                  self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                  logging.info(f"Set pad_token_id to eos_token_id ({self.tokenizer.pad_token_id})")
-             else:
-                  raise ValueError("Tokenizer must have a pad_token_id or eos_token_id")
+            if self.tokenizer.eos_token_id is not None:
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                logging.info(f"Set pad_token_id to eos_token_id ({self.tokenizer.pad_token_id})")
+            else:
+                raise ValueError("Tokenizer must have a pad_token_id or eos_token_id")
 
         vocab_size = len(self.tokenizer) # Get vocab size *after* potential token additions
         self.n_embed = n_embed
@@ -405,7 +423,7 @@ class SparseMoELanguageModel(nn.Module):
         num_params = self.get_num_params() # Calculate after init
         logging.info(f"Initialized SparseMoELanguageModel with {num_params / 1e6:.2f}M parameters.")
         if not isinstance(self.lm_head.weight, torch.nn.Parameter):
-             logging.info("Model parameters appear to be partitioned (ZeRO Stage 3 detected).")
+            logging.info("Model parameters appear to be partitioned (ZeRO Stage 3 detected).")
 
     def _init_weights(self, module):
         """Initializes weights using standard Transformer practices."""
