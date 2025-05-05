@@ -199,8 +199,9 @@ class RingFlashAttentionFunction(Function):
                     if exists(col_mask):
                         exp_weights = exp_weights.masked_fill(~col_mask_unsqueezed, 0.)
 
-                    block_row_sums = (exp_weights.to(torch.float32).sum(dim = -1, keepdims=True).clamp(min = EPSILON).to(q.dtype)
-
+                    block_row_sums = (exp_weights.to(torch.float32).sum(dim = -1, keepdims=True).clamp(min = EPSILON).to(q.dtype))
+                                      
+                    exp_weights = exp_weights.to(vc.dtype)      # <- add this
                     exp_values = einsum('b h i j, b j h d -> b i h d', exp_weights, vc)
 
                     exp_row_max_diff = torch.exp(row_maxes - new_row_maxes)
