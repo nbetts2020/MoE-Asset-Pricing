@@ -252,7 +252,7 @@ def main():
     model_max_length=config.CONTEXT_WINDOW
     )
     special_tokens = {
-        'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>']
+        'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ']
     }
     tokenizer.add_special_tokens(special_tokens)
     tokenizer.pad_token = tokenizer.eos_token
