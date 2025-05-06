@@ -20,9 +20,10 @@ from cut_cross_entropy import linear_cross_entropy
 
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
-import sys, os
-sys.path.insert(0, os.path.abspath("third_party"))
-from ring_attention_pytorch import ring_flash_attn
+# pull the Triton / CUDA kernel instead of the pure‑Python fallback
+from ring_attention_pytorch.ring_flash_attention_cuda import (
+    ring_flash_attn_cuda as ring_flash_attn,   # keep the same symbol everywhere else
+)
 from flash_attn.flash_attn_interface import (
     flash_attn_unpadded_qkvpacked_func,
     flash_attn_unpadded_kvpacked_func,
@@ -119,16 +120,16 @@ class MultiHeadAttention(nn.Module):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank       = dist.get_rank()        if dist.is_initialized() else 0
         device     = x.device
-    
+
         if return_attn_probs:
             raise NotImplementedError("return_attn_probs=True not supported")
         if not FLASH_ATTN_AVAILABLE:
             raise RuntimeError("flash-attention not available")
-    
+
         # ------------- QKV projection -------------
         qkv = self.qkv(x).view(B, T_local, self.n_head, 3 * self.head_dim)
         q_local, k_local, v_local = qkv.split([self.head_dim, self.head_dim, self.head_dim], dim=-1)
-    
+
         # ------------- RoPE rotary embeddings -------------
         total_seq_len = T_local * world_size
         self.update_rope(total_seq_len)
@@ -138,16 +139,19 @@ class MultiHeadAttention(nn.Module):
         sin_local = sin[start:start + T_local]
         cos_local = cos[start:start + T_local]
         q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_local, cos_local)
-    
+
         # ------------- Attention -------------
         if world_size > 1:
             # distributed ring‑attention branch (unchanged)
             attn_output = ring_flash_attn(
                 q_local_rope, k_local_rope, v_local,
                 mask=mask,
-                bucket_size=int(config.BLOCK_SIZE / world_size / 2),
+                bucket_size=int(config.BLOCK_SIZE // world_size // 8),
                 causal=True,
-                ring_reduce_col=True,
+                ring_reduce_col=False,
+                striped_ring_attn=True,
+                softclamp_qk_sim=True,
+                softclamp_value =20.0
             )  # (B, T_local, H, Dh)
         else:
             # single‑GPU flash‑attention (unpadded) branch
@@ -159,13 +163,13 @@ class MultiHeadAttention(nn.Module):
             cu_seqlens = torch.empty(B + 1, dtype=torch.int32, device=device)
             cu_seqlens[0] = 0
             torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])  # stays int32
-    
+
             # pack only valid (non-pad) tokens
             q_pack = torch.cat([q_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
             k_pack = torch.cat([k_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
             v_pack = torch.cat([v_local[i,       :seqlens[i]] for i in range(B)], dim=0)
             qkv_packed = torch.stack([q_pack, k_pack, v_pack], dim=1)  # (total_tokens, 3, H, Dh)
-    
+
             # call unpadded flash-attn
             attn_flat = flash_attn_unpadded_qkvpacked_func(
                 qkv_packed,
@@ -176,7 +180,7 @@ class MultiHeadAttention(nn.Module):
                 causal       = True,
                 return_attn_probs=False,
             )  # (total_tokens, H, Dh)
-    
+
             # scatter back into padded output tensor
             attn_output = torch.zeros(B, T_local, self.n_head, self.head_dim,
                                       device=device, dtype=attn_flat.dtype)
@@ -185,12 +189,12 @@ class MultiHeadAttention(nn.Module):
                 length = seqlens[i].item()
                 attn_output[i, :length] = attn_flat[idx:idx + length]
                 idx += length
-    
+
         # ------------- Output projection -------------
         attn_output = attn_output.view(B, T_local, C)    # (B, T_local, C)
         proj_output = self.proj(attn_output)             # (B, T_local, C)
         return proj_output
-    
+
 # -----------------------------------------------------------------------------#
 #  Mixture-of-Experts blocks (Keeping simplified version for now)
 # -----------------------------------------------------------------------------#
@@ -237,7 +241,7 @@ class SparseMoE(nn.Module):
         self.capacity_factor = cap_factor
         self.num_experts = n_exp
         self.hidden_dim = d
-    
+
     def forward(self, hidden_states):
         """
         Forward pass for SparseMoE with capacity enforcement.
@@ -247,56 +251,56 @@ class SparseMoE(nn.Module):
         flat_hidden_states = hidden_states.view(num_tokens, dim)
         device = hidden_states.device
         dtype = hidden_states.dtype
-    
+
         # 1. Get Routing Info
         top_k_gates, top_k_indices, dense_router_probs = self.router(flat_hidden_states)
         # top_k_indices shape: (num_tokens, top_k)
         # top_k_gates shape:    (num_tokens, top_k)
-    
+
         # 2. Calculate Capacity per Expert
         capacity = max(1, math.ceil((self.capacity_factor * num_tokens) / self.num_experts))
         logging.debug(f"MoE Capacity per expert: {capacity}")
-    
+
         # 3. Determine Token Dispatch & Enforce Capacity
         expert_mask = torch.zeros(num_tokens, self.num_experts, dtype=torch.bool, device=device)
         expert_mask.scatter_(1, top_k_indices, True)
-    
+
         route_cumsum   = torch.cumsum(expert_mask.long(), dim=0)
         route_position = route_cumsum * expert_mask - 1  # 0-indexed
-    
+
         keep_mask = (route_position < capacity) & expert_mask
-    
+
         # Map capacity mask back to top‑k choices
         pass_cap_mask_k     = keep_mask.gather(1, top_k_indices)  # (num_tokens, top_k)
         kept_indices_where  = torch.where(pass_cap_mask_k)
         kept_token_indices  = kept_indices_where[0]
         k_for_kept_tokens   = kept_indices_where[1]
-    
+
         kept_expert_indices = top_k_indices[kept_token_indices, k_for_kept_tokens]
         kept_gate_values    = top_k_gates[kept_token_indices, k_for_kept_tokens]
-    
+
         # 4. Compute actual load for aux loss
         actual_load = torch.zeros(self.num_experts, device=device, dtype=torch.long)
         if kept_expert_indices.numel() > 0:
             actual_load.scatter_add_(0, kept_expert_indices, torch.ones_like(kept_expert_indices))
         logging.debug(f"MoE Actual Load: {actual_load.tolist()}")
-    
+
         # 5. Dispatch tokens to experts and compute outputs
         final_hidden_states = torch.zeros_like(flat_hidden_states)
-    
+
         # Sort by expert to form contiguous segments
         sorted_indices               = torch.argsort(kept_expert_indices)
         sorted_kept_expert_indices   = kept_expert_indices[sorted_indices]
         sorted_kept_token_indices    = kept_token_indices[sorted_indices]
         sorted_kept_gate_values      = kept_gate_values[sorted_indices]
-    
+
         # Find segment boundaries where expert index changes
         expert_change_indices = torch.cat([
             torch.tensor([0], device=device),
             torch.where(sorted_kept_expert_indices[:-1] != sorted_kept_expert_indices[1:])[0] + 1,
             torch.tensor([len(sorted_kept_expert_indices)], device=device)
         ])
-    
+
         # Loop over each segment
         num_segs = expert_change_indices.size(0) - 1
         for seg in range(num_segs):
@@ -304,16 +308,16 @@ class SparseMoE(nn.Module):
             end_idx   = expert_change_indices[seg + 1].item()
             if start_idx >= end_idx:
                 continue
-    
+
             expert_i   = sorted_kept_expert_indices[start_idx].item()
             token_idxs = sorted_kept_token_indices[start_idx:end_idx]
             gate_vals  = sorted_kept_gate_values[start_idx:end_idx].unsqueeze(1)
             inputs     = flat_hidden_states[token_idxs]
-    
+
             # Run the expert and scatter‐add back
             out = self.experts[expert_i](inputs)
             final_hidden_states.index_add_(0, token_idxs, out * gate_vals)
-    
+
         # 6. Auxiliary MoE load balancing loss
         if self.training:
             fraction_tokens_routed = actual_load / max(1, num_tokens)
@@ -327,7 +331,7 @@ class SparseMoE(nn.Module):
             logging.debug(f"MoE Aux Loss: {aux_loss.item()}")
         else:
             aux_loss = torch.tensor(0.0, device=device, dtype=dtype)
-    
+
         return final_hidden_states.view_as(hidden_states), aux_loss
 
 class Block(nn.Module):
@@ -590,7 +594,7 @@ class SparseMoELanguageModel(nn.Module):
                 reduction=reduction,
                 shift=1,
             )
-
+        print(loss, total_aux_loss, "loss!!")
         if self.training and total_aux_loss.item() != 0:
             loss = loss + total_aux_loss
 
