@@ -87,13 +87,28 @@ def train_model(
 
     If args.stage_1_only == True, only phase 1 is run and the function returns immediately after saving.
     """
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    T_local    = config.BLOCK_SIZE // world_size
+
+    def pad_to_global(ids: torch.Tensor) -> torch.Tensor:
+        B, T = ids.shape
+        target = world_size * T_local
+        if T < target:
+            pad = torch.full((B, target - T),
+                             model.tokenizer.pad_token_id,
+                             device=ids.device, dtype=ids.dtype)
+            return torch.cat([ids, pad], dim=1)
+        else:
+            # trim any over‑long sequence from the left
+            return ids[:, -target:]
+
     if use_deepspeed:
         engine = model
         real_model = engine.module
     else:
         adam_optimizer = optimizer
         real_model = model
-
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -147,6 +162,7 @@ def train_model(
                     logging.warning(f"Batch {step+1}: debug failed: {e}")
 
             input_ids = batch['input_ids'].to(device)
+            input_ids = pad_to_global(input_ids)
             loss = real_model.forward_next_token_efficient(
                 input_ids, reduction="mean"
             )
@@ -223,6 +239,7 @@ def train_model(
         epoch_loss = 0.0
         for batch in continual_loader:
             input_ids = batch['input_ids'].to(device)
+            input_ids = pad_to_global(input_ids)
             loss = real_model.forward_next_token_efficient(
                 input_ids, reduction="mean"
             )
@@ -271,6 +288,7 @@ def train_model(
         epoch_loss = 0.0
         for batch in ft_loader:
             input_ids = batch['input_ids'].to(device)
+            input_ids = pad_to_global(input_ids)
 
             loss = real_model.forward_coconut(
                 input_ids=input_ids,
@@ -324,6 +342,7 @@ def train_model(
             )
             for batch in ebm_loader:
                 ids = batch['input_ids'].to(device)
+                ids = pad_to_global(input_ids)
                 B, K, T = ids.shape
                 flat_ids = ids.view(B*K, T)
 
@@ -365,6 +384,7 @@ def train_model(
     with torch.no_grad():
         for batch in val_loader:
             ids = batch['input_ids'].to(device)
+            ids = pad_to_global(ids)
             B, K, T = ids.shape
             flat_ids = ids.view(B*K, T)
             embs = real_model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
