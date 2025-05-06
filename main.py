@@ -1,3 +1,15 @@
+import os, sys
+
+BASEDIR = os.path.dirname(__file__)
+LOCAL   = os.path.join(BASEDIR, "third_party", "ring_attention_pytorch")
+sys.path.insert(0, LOCAL)
+
+# pull in the CUDA‐accelerated kernel instead of the Python fallback
+from ring_attention_pytorch.ring_flash_attention_cuda import ring_flash_attn_cuda as ring_flash_attn
+
+import ring_attention_pytorch
+print("Loaded ring‑attn from:", ring_attention_pytorch.__file__)
+
 import torch
 import os
 import argparse
