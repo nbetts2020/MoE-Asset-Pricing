@@ -56,6 +56,15 @@ def greedy_generate_tail(model, input_ids, max_new_tokens=20):
             cur = torch.cat([cur, nxt], dim=1)
     return torch.cat(generated, dim=1)  # (B, max_new_tokens)
 
+@torch.no_grad()
+def local_logits(model, ids_local, mask_local):
+    x = model.token_embedding_table(ids_local)
+    x = model.dropout_emb(x)
+    for blk in model.blocks:
+        x, _ = blk(x, mask=mask_local)      # ignore MoE aux‑loss
+    x = model.ln_f(x)
+    return model.lm_head(x)                 # (B, T_local, vocab)
+
 def train_model(
     model,
     optimizer,      # Single optimizer for main model
@@ -102,49 +111,46 @@ def train_model(
 
             if (step + 1) % 10 == 0:
                 try:
-                    # take a small subset of the batch
-                    sample_ids  = batch['input_ids'][:5]    # (5, T)
-                    true_prices = batch['labels'][:5].tolist()
-            
-                    # determine per‑GPU shard size
-                    world_size = dist.get_world_size() if dist.is_initialized() else 1
-                    rank       = dist.get_rank()      if dist.is_initialized() else 0
-                    T_local    = config.BLOCK_SIZE // world_size
-            
-                    # pad/trim to BLOCK_SIZE then slice out this rank's window
-                    ids = real_model._pad_or_trim(sample_ids.to(device), config.BLOCK_SIZE)  # (5, BLOCK_SIZE)
-                    ids_local = ids[:, rank * T_local : (rank + 1) * T_local]                # (5, T_local)
-            
-                    with torch.no_grad():
-                        # forward on the shard
-                        hs_local = real_model.forward_embeddings_only(ids_local)  # (5, T_local, C)
-            
-                        # gather all shards back to full sequence length
-                        shards = [torch.zeros_like(hs_local) for _ in range(world_size)]
-                        dist.all_gather(shards, hs_local)                         # shards[i] ← rank i's hs_local
-                        hs = torch.cat(shards, dim=1)                             # (5, BLOCK_SIZE, C)
-            
-                        # compute logits on the reconstructed full sequence
-                        logits  = real_model.lm_head(hs)                          # (5, BLOCK_SIZE, V)
-                        pred_ids = logits.argmax(dim=-1)                          # (5, BLOCK_SIZE)
-            
-                    # decode only the tail tokens as before
-                    tail_ids  = pred_ids[:, -20:]                                # (5, 20)
-                    tail_strs = tokenizer.batch_decode(tail_ids, skip_special_tokens=True)
-            
-                    for i, tail in enumerate(tail_strs):
-                        print(tail)
-                        pred_price = extract_label_value(tail)
+                    # ----- prepare a tiny batch ---------------------------------
+                    sample_ids  = batch["input_ids"][:5].to(device)      # (5, T)
+                    true_prices = batch["labels"][:5].tolist()
+
+                    world_size  = dist.get_world_size() if dist.is_initialized() else 1
+                    rank        = dist.get_rank()       if dist.is_initialized() else 0
+                    T_local     = config.BLOCK_SIZE // world_size        # e.g. 2048
+
+                    # pad/trim only to the *local* length – no 4 k → 8 k bump
+                    ids_local   = real_model._pad_or_trim(sample_ids, T_local)  # (5, T_local)
+                    pad_id      = real_model.tokenizer.pad_token_id
+                    mask_local  = (ids_local != pad_id)
+
+                    # ----- forward just this shard -------------------------------
+                    logits_local = local_logits(real_model, ids_local, mask_local)  # (5, T_local, V)
+
+                    # ----- gather shards and decode tail --------------------------
+                    if world_size > 1:
+                        tmp = [torch.empty_like(logits_local) for _ in range(world_size)]
+                        dist.all_gather(tmp, logits_local)
+                        logits_full = torch.cat(tmp, dim=1)             # (5, BLOCK_SIZE, V)
+                    else:
+                        logits_full = logits_local
+
+                    tail_ids  = logits_full.argmax(-1)[:, -20:]         # (5, 20)
+                    tail_text = tokenizer.batch_decode(tail_ids, skip_special_tokens=True)
+
+                    for i, txt in enumerate(tail_text):
+                        print(txt)
+                        pred_price = extract_label_value(txt)
                         print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred_price}")
-            
+
                 except Exception as e:
                     logging.warning(f"Batch {step+1}: debug failed: {e}")
-                            
+
             input_ids = batch['input_ids'].to(device)
             loss = real_model.forward_next_token_efficient(
                 input_ids, reduction="mean"
             )
-                    
+
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
@@ -273,7 +279,7 @@ def train_model(
                 latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
                 reduction="mean"
             )
-                
+
             if use_deepspeed:
                 engine.zero_grad()
                 engine.backward(loss)
@@ -283,7 +289,7 @@ def train_model(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
                 adam_optimizer.step()
-                    
+
             epoch_loss += loss.item()
         logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
 
