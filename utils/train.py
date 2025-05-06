@@ -118,6 +118,10 @@ def train_model(
     logging.info(f"Starting normal pretraining on rank {rank}.")
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
     PRETRAIN_EPOCHS = epochs
+
+    marker_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>:", add_special_tokens=False).input_ids
+    m_len      = len(marker_ids)
+
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
         real_model.train()
         epoch_loss = 0.0
@@ -126,38 +130,50 @@ def train_model(
 
             if (step + 1) % 10 == 0:
                 try:
-                    # ----- prepare a tiny batch ---------------------------------
-                    sample_ids  = batch["input_ids"][:5].to(device)      # (5, T)
+                    sample_ids  = batch["input_ids"][:5].to(device)         # (5, T)
                     true_prices = batch["labels"][:5].tolist()
-
-                    world_size  = dist.get_world_size() if dist.is_initialized() else 1
-                    rank        = dist.get_rank()       if dist.is_initialized() else 0
-                    T_local     = config.BLOCK_SIZE // world_size        # e.g. 2048
-
-                    # pad/trim only to the *local* length – no 4 k → 8 k bump
+            
+                    # ----- split to local shard & forward --------------------------------
                     ids_local   = real_model._pad_or_trim(sample_ids, T_local)  # (5, T_local)
                     pad_id      = real_model.tokenizer.pad_token_id
                     mask_local  = (ids_local != pad_id)
-
-                    # ----- forward just this shard -------------------------------
+            
                     logits_local = local_logits(real_model, ids_local, mask_local)  # (5, T_local, V)
-
-                    # ----- gather shards and decode tail --------------------------
+            
+                    # ----- gather shards so we have complete sequences -------------------
                     if world_size > 1:
-                        tmp = [torch.empty_like(logits_local) for _ in range(world_size)]
-                        dist.all_gather(tmp, logits_local)
-                        logits_full = torch.cat(tmp, dim=1)             # (5, BLOCK_SIZE, V)
+                        tmp_logits = [torch.empty_like(logits_local) for _ in range(world_size)]
+                        tmp_ids    = [torch.empty_like(ids_local)    for _ in range(world_size)]
+                        dist.all_gather(tmp_logits, logits_local)
+                        dist.all_gather(tmp_ids,    ids_local)
+                        logits_full = torch.cat(tmp_logits, dim=1)   # (5, BLOCK_SIZE, V)
+                        ids_full    = torch.cat(tmp_ids,    dim=1)   # (5, BLOCK_SIZE)
                     else:
-                        logits_full = logits_local
-
-                    tail_ids  = logits_full.argmax(-1)[:, -20:]         # (5, 20)
-                    tail_text = tokenizer.batch_decode(tail_ids, skip_special_tokens=True)
-
-                    for i, txt in enumerate(tail_text):
-                        print(txt)
-                        pred_price = extract_label_value(txt)
-                        print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred_price}")
-
+                        logits_full = logits_local                   # single‑GPU
+                        ids_full    = ids_local
+            
+                    # ----- pick the logit right after the marker -------------------------
+                    preds = []
+                    for b in range(ids_full.size(0)):
+                        seq = ids_full[b].tolist()
+            
+                        # find last occurrence of the marker
+                        try:
+                            pos = max(i for i in range(len(seq)-m_len+1)
+                                      if seq[i:i+m_len] == marker_ids)
+                        except ValueError:
+                            preds.append(None)            # marker not found
+                            continue
+            
+                        price_tok_logits = logits_full[b, pos + m_len - 1, :]  # logit *before* price
+                        pred_id  = price_tok_logits.argmax().item()
+                        pred_tok = tokenizer.decode([pred_id]).strip()
+                        preds.append(pred_tok)
+            
+                    # ----- debug print ----------------------------------------------------
+                    for i, p in enumerate(preds):
+                        print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred token → {p}")
+            
                 except Exception as e:
                     logging.warning(f"Batch {step+1}: debug failed: {e}")
 
