@@ -20,12 +20,17 @@ from cut_cross_entropy import linear_cross_entropy
 
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
-# always use ring‑flash‑attention for both single‑GPU and multi‑GPU
-from ring_flash_attn import ring_flash_attn_func as ring_flash_attn
-
-FLASH_ATTN_AVAILABLE = False
-RING_ATTN_AVAILABLE  = True
-logging.info("Using ring‑flash‑attention for all attention calls.")
+# pull the Triton / CUDA kernel instead of the pure‑Python fallback
+from ring_attention_pytorch.ring_flash_attention_cuda import (
+    ring_flash_attn_cuda as ring_flash_attn,   # keep the same symbol everywhere else
+)
+from flash_attn.flash_attn_interface import (
+    flash_attn_unpadded_qkvpacked_func,
+    flash_attn_unpadded_kvpacked_func,
+)
+FLASH_ATTN_AVAILABLE = True
+RING_ATTN_AVAILABLE = True
+logging.info("Successfully imported ring-attention-pytorch and flash-attn.")
 
 import os
 
@@ -109,43 +114,86 @@ class MultiHeadAttention(nn.Module):
         self._buffers['rope_sin'] = sin.float()
         self._buffers['rope_cos'] = cos.float()
 
-    def forward(
-        self,
-        x: torch.Tensor,                   # (B, T_local, C)
-        mask: Optional[torch.Tensor] = None,
-        return_attn_probs: bool = False
-    ):
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, return_attn_probs: bool = False):
+        # x: (B, T_local, C), mask: (B, T_local) with True on real tokens
         B, T_local, C = x.shape
-        device = x.device
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank       = dist.get_rank()        if dist.is_initialized() else 0
+        device     = x.device
 
-        # compute Q/K/V
+        if return_attn_probs:
+            raise NotImplementedError("return_attn_probs=True not supported")
+        if not FLASH_ATTN_AVAILABLE:
+            raise RuntimeError("flash-attention not available")
+
+        # ------------- QKV projection -------------
         qkv = self.qkv(x).view(B, T_local, self.n_head, 3 * self.head_dim)
-        q_local, k_local, v_local = qkv.split([self.head_dim] * 3, dim=-1)
+        q_local, k_local, v_local = qkv.split([self.head_dim, self.head_dim, self.head_dim], dim=-1)
 
-        # apply RoPE
-        self.update_rope(T_local)
-        sin = self.rope_sin[:T_local].to(device).unsqueeze(0).unsqueeze(2)  # (1, T, 1, D/2)
-        cos = self.rope_cos[:T_local].to(device).unsqueeze(0).unsqueeze(2)
-        q_local, k_local = apply_rope(q_local, k_local, sin, cos)
+        # ------------- RoPE rotary embeddings -------------
+        total_seq_len = T_local * world_size
+        self.update_rope(total_seq_len)
+        sin = self.rope_sin[:total_seq_len].to(device)
+        cos = self.rope_cos[:total_seq_len].to(device)
+        start = rank * T_local
+        sin_local = sin[start:start + T_local]
+        cos_local = cos[start:start + T_local]
+        q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_local, cos_local)
 
-        # ring‑flash‑attention (single code path)
-        attn_output = ring_flash_attn(
-            q_local,                        # (B, T_local, H, Dh)
-            k_local,
-            v_local,
-            dropout_p         = config.DROPOUT if self.training else 0.0,
-            softmax_scale     = None,       # defaults to 1/sqrt(Dh)
-            causal            = True,
-            window_size       = (-1, -1),
-            alibi_slopes      = None,
-            deterministic     = True,
-            return_attn_probs = False,
-            group             = None        # no all‑reduce on 1 GPU
-        )  # ⇒ (B, T_local, H, Dh)
+        # ------------- Attention -------------
+        if world_size > 1:
+            # distributed ring‑attention branch (unchanged)
+            attn_output = ring_flash_attn(
+                q_local_rope, k_local_rope, v_local,
+                mask=mask,
+                bucket_size=int(config.BLOCK_SIZE // world_size // 8),
+                causal=True,
+                ring_reduce_col=False,
+                striped_ring_attn=True,
+                softclamp_qk_sim=True,
+                softclamp_value =20.0
+            )  # (B, T_local, H, Dh)
+        else:
+            # single‑GPU flash‑attention (unpadded) branch
+            if mask is None:
+                seqlens = torch.full((B,), T_local, dtype=torch.int32, device=device)
+            else:
+                seqlens = mask.sum(-1, dtype=torch.int32)  # (B,)
+            max_seqlen = int(seqlens.max())
+            cu_seqlens = torch.empty(B + 1, dtype=torch.int32, device=device)
+            cu_seqlens[0] = 0
+            torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])  # stays int32
 
-        # output projection
-        attn_output = attn_output.view(B, T_local, C)   # flatten heads
-        return self.proj(attn_output)                   # (B, T_local, C)
+            # pack only valid (non-pad) tokens
+            q_pack = torch.cat([q_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
+            k_pack = torch.cat([k_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
+            v_pack = torch.cat([v_local[i,       :seqlens[i]] for i in range(B)], dim=0)
+            qkv_packed = torch.stack([q_pack, k_pack, v_pack], dim=1)  # (total_tokens, 3, H, Dh)
+
+            # call unpadded flash-attn
+            attn_flat = flash_attn_unpadded_qkvpacked_func(
+                qkv_packed,
+                cu_seqlens,
+                max_seqlen,
+                dropout_p    = config.DROPOUT if self.training else 0.0,
+                softmax_scale= None,
+                causal       = True,
+                return_attn_probs=False,
+            )  # (total_tokens, H, Dh)
+
+            # scatter back into padded output tensor
+            attn_output = torch.zeros(B, T_local, self.n_head, self.head_dim,
+                                      device=device, dtype=attn_flat.dtype)
+            idx = 0
+            for i in range(B):
+                length = seqlens[i].item()
+                attn_output[i, :length] = attn_flat[idx:idx + length]
+                idx += length
+
+        # ------------- Output projection -------------
+        attn_output = attn_output.view(B, T_local, C)    # (B, T_local, C)
+        proj_output = self.proj(attn_output)             # (B, T_local, C)
+        return proj_output
 
 # -----------------------------------------------------------------------------#
 #  Mixture-of-Experts blocks (Keeping simplified version for now)
