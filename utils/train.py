@@ -129,53 +129,29 @@ def train_model(
             print(step, len(dataloader), "progress!!")
 
             if (step + 1) % 10 == 0:
-                try:
-                    sample_ids  = batch["input_ids"][:5].to(device)         # (5, T)
-                    true_prices = batch["labels"][:5].tolist()
+                # take the first 5 examples in this batch as independent prompts
+                sample_ids  = batch["input_ids"][:5].to(device)    # (5, T)
+                true_prices = batch["labels"][:5].tolist()
             
-                    # ----- split to local shard & forward --------------------------------
-                    ids_local   = real_model._pad_or_trim(sample_ids, T_local)  # (5, T_local)
-                    pad_id      = real_model.tokenizer.pad_token_id
-                    mask_local  = (ids_local != pad_id)
+                # generate up to EOS (stops when eos_token_id is produced)
+                with torch.no_grad():
+                    outputs = real_model.generate(
+                        input_ids=sample_ids,
+                        max_new_tokens=10,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
             
-                    logits_local = local_logits(real_model, ids_local, mask_local)  # (5, T_local, V)
+                # strip off the prompt prefix and decode each separately
+                gen_tokens = outputs[:, sample_ids.size(1):]       # shape (5, ≤10)
+                preds = [
+                    tokenizer.decode(g, skip_special_tokens=True).strip()
+                    for g in gen_tokens
+                ]
             
-                    # ----- gather shards so we have complete sequences -------------------
-                    if world_size > 1:
-                        tmp_logits = [torch.empty_like(logits_local) for _ in range(world_size)]
-                        tmp_ids    = [torch.empty_like(ids_local)    for _ in range(world_size)]
-                        dist.all_gather(tmp_logits, logits_local)
-                        dist.all_gather(tmp_ids,    ids_local)
-                        logits_full = torch.cat(tmp_logits, dim=1)   # (5, BLOCK_SIZE, V)
-                        ids_full    = torch.cat(tmp_ids,    dim=1)   # (5, BLOCK_SIZE)
-                    else:
-                        logits_full = logits_local                   # single‑GPU
-                        ids_full    = ids_local
-            
-                    # ----- pick the logit right after the marker -------------------------
-                    preds = []
-                    for b in range(ids_full.size(0)):
-                        seq = ids_full[b].tolist()
-            
-                        # find last occurrence of the marker
-                        try:
-                            pos = max(i for i in range(len(seq)-m_len+1)
-                                      if seq[i:i+m_len] == marker_ids)
-                        except ValueError:
-                            preds.append(None)            # marker not found
-                            continue
-            
-                        price_tok_logits = logits_full[b, pos + m_len - 1, :]  # logit *before* price
-                        pred_id  = price_tok_logits.argmax().item()
-                        pred_tok = tokenizer.decode([pred_id]).strip()
-                        preds.append(pred_tok)
-            
-                    # ----- debug print ----------------------------------------------------
-                    for i, p in enumerate(preds):
-                        print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred token → {p}")
-            
-                except Exception as e:
-                    logging.warning(f"Batch {step+1}: debug failed: {e}")
+                # print true vs. predicted price‐string
+                for i, p in enumerate(preds):
+                    print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {p or '〈empty〉'}")
 
             input_ids = batch['input_ids'].to(device)
             input_ids = pad_to_global(input_ids)
