@@ -1,7 +1,8 @@
 # utils/model.py
 # =============================================================================
-#  Sequence-Parallel Ring Flash-Attention Sparse-MoE LM
+#  Sequence-Parallel Unified‑SP (YunChang) Attention + Sparse‑MoE LM
 # =============================================================================
+
 import math
 import logging
 from typing import Tuple, Optional
@@ -10,29 +11,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import datetime  # For potential timeout in new_group
 
 # Project imports
 from utils.config import config
 from utils.ebm import EnergyBasedModel
 from utils.data import GLOBAL_TOKENIZER
 from cut_cross_entropy import linear_cross_entropy
-
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
-# pull the Triton / CUDA kernel instead of the pure‑Python fallback
-from ring_attention_pytorch.ring_flash_attention_cuda import (
-    ring_flash_attn_cuda as ring_flash_attn,   # keep the same symbol everywhere else
-)
-from flash_attn.flash_attn_interface import (
-    flash_attn_unpadded_qkvpacked_func,
-    flash_attn_unpadded_kvpacked_func,
-)
-FLASH_ATTN_AVAILABLE = True
-RING_ATTN_AVAILABLE = True
-logging.info("Successfully imported ring-attention-pytorch and flash-attn.")
+# --------------------------------------------------------------------
+# Monkey‑patch FlashAttention v2+ to satisfy YunChang’s imports
+# --------------------------------------------------------------------
+import flash_attn.flash_attn_interface as _fai
+import flash_attn as _fa
 
-import os
+# alias the v2 “varlen qkv‑packed” routines under the old names
+_fai.flash_attn_func             = _fai.flash_attn_varlen_qkvpacked_func
+_fai._flash_attn_varlen_forward  = _fai.flash_attn_varlen_qkvpacked_func
+_fai._flash_attn_varlen_backward = _fai.flash_attn_varlen_qkvpacked_func
+
+# also patch the top‑level module symbol
+_fa.flash_attn_func              = _fai.flash_attn_varlen_qkvpacked_func
+
+# Now YunChang’s code will find exactly the names it expects:
+from yunchang import set_seq_parallel_pg, LongContextAttention, EXTRACT_FUNC_DICT
+from yunchang.kernels import AttnType
+
+# ----------------------------------------------------------------------------
+# …and the rest of your model definition follows unchanged…
+# ----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------#
 #  RoPE helpers
@@ -42,7 +49,9 @@ def build_sin_cos(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Builds sinusoidal and cosinusoidal positional embeddings."""
     pos = torch.arange(seq_len, dtype=dtype, device=device).unsqueeze(1)
-    inv_freq = 1.0 / (base ** (torch.arange(0, half_dim * 2, 2, dtype=dtype, device=device) / (half_dim * 2)))
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, half_dim * 2, 2, dtype=dtype, device=device) / (half_dim * 2))
+    )
     angles = pos * inv_freq
     return torch.sin(angles), torch.cos(angles)
 
@@ -74,7 +83,7 @@ def apply_rope(
     return q_rotated, k_rotated
 
 # -----------------------------------------------------------------------------#
-#  Multi-Head Attention (Using ring_flash_attn)
+#  Multi-Head Attention (Using YunChang USP)
 # -----------------------------------------------------------------------------#
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_embed: int, n_head: int):
@@ -87,116 +96,81 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed, bias=False)
 
-        self.max_seq = config.BLOCK_SIZE # Initial max sequence length for RoPE
-        # Initialize RoPE buffers on CPU with float32 for precision
-        # *** Fixed TypeError Here ***
+        # RoPE buffers
+        self.max_seq = config.BLOCK_SIZE  # initial max seq length
         sin, cos = build_sin_cos(self.max_seq, self.head_dim // 2, torch.device("cpu"))
         self.register_buffer("rope_sin", sin.float(), persistent=False)
         self.register_buffer("rope_cos", cos.float(), persistent=False)
-        # No ring_pg attribute needed
+
+        # set up sequence-parallel process groups
+        if dist.is_initialized():
+            set_seq_parallel_pg(
+                config.SP_ULYSSES_DEGREE,
+                config.SP_RING_DEGREE,
+                dist.get_rank(),
+                dist.get_world_size()
+            )
+
+        # Unified Sequence-Parallel Attention
+        self.usp_attn = LongContextAttention(
+            scatter_idx=2,            # optional, defaults to 2
+            gather_idx=1,             # optional, defaults to 1
+            ring_impl_type="zigzag",
+            use_pack_qkv=False,
+            use_sync=False,
+            attn_type=AttnType.FA,
+            attn_processor=None,      # leave as default unless you have a custom processor
+        )
 
     def update_rope(self, new_len: int, base: float = 10_000.0):
-        """Updates RoPE buffers if new_len exceeds current max_seq."""
+        """Extends RoPE buffers if needed."""
         if new_len <= self.max_seq:
             return
         logging.info(f"Extending RoPE max sequence length from {self.max_seq} to {new_len}")
         self.max_seq = new_len
-
-        # build fresh sin/cos on CPU
-        sin, cos = build_sin_cos(
-            new_len,
-            self.head_dim // 2,
-            torch.device("cpu"),
-            base=base,
-            dtype=torch.float32
-        )
-        # overwrite the existing buffers (keeps them in self.buffers())
+        sin, cos = build_sin_cos(new_len, self.head_dim // 2, torch.device("cpu"), base=base)
         self._buffers['rope_sin'] = sin.float()
         self._buffers['rope_cos'] = cos.float()
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, return_attn_probs: bool = False):
-        # x: (B, T_local, C), mask: (B, T_local) with True on real tokens
+        # x: (B, T_local, C)
         B, T_local, C = x.shape
+        device = x.device
+        rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank       = dist.get_rank()        if dist.is_initialized() else 0
-        device     = x.device
 
-        if return_attn_probs:
-            raise NotImplementedError("return_attn_probs=True not supported")
-        if not FLASH_ATTN_AVAILABLE:
-            raise RuntimeError("flash-attention not available")
-
-        # ------------- QKV projection -------------
+        # 1) Project to QKV
         qkv = self.qkv(x).view(B, T_local, self.n_head, 3 * self.head_dim)
-        q_local, k_local, v_local = qkv.split([self.head_dim, self.head_dim, self.head_dim], dim=-1)
+        q_local, k_local, v_local = qkv.split(self.head_dim, dim=-1)
 
-        # ------------- RoPE rotary embeddings -------------
-        total_seq_len = T_local * world_size
-        self.update_rope(total_seq_len)
-        sin = self.rope_sin[:total_seq_len].to(device)
-        cos = self.rope_cos[:total_seq_len].to(device)
+        # 2) Apply RoPE
+        total_seq = T_local * world_size
+        self.update_rope(total_seq)
+        sin = self.rope_sin[:total_seq].to(device)
+        cos = self.rope_cos[:total_seq].to(device)
         start = rank * T_local
-        sin_local = sin[start:start + T_local]
-        cos_local = cos[start:start + T_local]
-        q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_local, cos_local)
+        sin_l = sin[start:start + T_local]
+        cos_l = cos[start:start + T_local]
+        q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_l, cos_l)
 
-        # ------------- Attention -------------
-        if world_size > 1:
-            # distributed ring‑attention branch (unchanged)
-            attn_output = ring_flash_attn(
-                q_local_rope, k_local_rope, v_local,
-                mask=mask,
-                bucket_size=int(config.BLOCK_SIZE // world_size // 8),
-                causal=True,
-                ring_reduce_col=False,
-                striped_ring_attn=True,
-                softclamp_qk_sim=True,
-                softclamp_value =20.0
-            )  # (B, T_local, H, Dh)
-        else:
-            # single‑GPU flash‑attention (unpadded) branch
-            if mask is None:
-                seqlens = torch.full((B,), T_local, dtype=torch.int32, device=device)
-            else:
-                seqlens = mask.sum(-1, dtype=torch.int32)  # (B,)
-            max_seqlen = int(seqlens.max())
-            cu_seqlens = torch.empty(B + 1, dtype=torch.int32, device=device)
-            cu_seqlens[0] = 0
-            torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])  # stays int32
-
-            # pack only valid (non-pad) tokens
-            q_pack = torch.cat([q_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
-            k_pack = torch.cat([k_local_rope[i, :seqlens[i]] for i in range(B)], dim=0)
-            v_pack = torch.cat([v_local[i,       :seqlens[i]] for i in range(B)], dim=0)
-            qkv_packed = torch.stack([q_pack, k_pack, v_pack], dim=1)  # (total_tokens, 3, H, Dh)
-
-            # call unpadded flash-attn
-            attn_flat = flash_attn_unpadded_qkvpacked_func(
-                qkv_packed,
-                cu_seqlens,
-                max_seqlen,
-                dropout_p    = config.DROPOUT if self.training else 0.0,
-                softmax_scale= None,
-                causal       = True,
-                return_attn_probs=False,
-            )  # (total_tokens, H, Dh)
-
-            # scatter back into padded output tensor
-            attn_output = torch.zeros(B, T_local, self.n_head, self.head_dim,
-                                      device=device, dtype=attn_flat.dtype)
-            idx = 0
-            for i in range(B):
-                length = seqlens[i].item()
-                attn_output[i, :length] = attn_flat[idx:idx + length]
-                idx += length
-
-        # ------------- Output projection -------------
-        attn_output = attn_output.view(B, T_local, C)    # (B, T_local, C)
-        proj_output = self.proj(attn_output)             # (B, T_local, C)
-        return proj_output
+        # 3) USP attention call
+        out = self.usp_attn(
+            q_local, k_local, v_local,
+            dropout_p = config.DROPOUT if self.training else 0.0,
+            softmax_scale=None,
+            causal=True,
+            window_size=(-1,-1),
+            softcap=0.0,
+            alibi_slopes=None,
+            deterministic=True,
+            return_attn_probs=False,
+        )
+        attn_out = out.reshape(B, T_local, C)
+        # 4) Final projection
+        return self.proj(attn_out)
 
 # -----------------------------------------------------------------------------#
-#  Mixture-of-Experts blocks (Keeping simplified version for now)
+#  Mixture-of-Experts blocks
 # -----------------------------------------------------------------------------#
 class Expert(nn.Module):
     """A simple MLP Expert module."""
@@ -212,7 +186,7 @@ class Expert(nn.Module):
     def forward(self, x): return self.net(x)
 
 class NoisyTopkRouter(nn.Module):
-    """Noisy Top-k Router (Placeholder - check efficient implementations)."""
+    """Noisy Top-k Router."""
     def __init__(self, d: int, n_exp: int, top_k: int):
         super().__init__()
         self.top_k = top_k
@@ -223,13 +197,11 @@ class NoisyTopkRouter(nn.Module):
     def forward(self, hidden_states):
         logits = self.gate_proj(hidden_states).float()
         if self.training:
-            noise_level = self.noise_proj(hidden_states).float()
-            noise = torch.randn_like(logits) * F.softplus(noise_level)
+            noise = torch.randn_like(logits) * F.softplus(self.noise_proj(hidden_states).float())
             logits = logits + noise
         gates = F.softmax(logits, dim=-1)
-        gates_values, indices = torch.topk(gates, self.top_k, dim=-1, sorted=False)
-        # Return dense gates needed for typical aux loss
-        return gates_values.type_as(hidden_states), indices, gates.type_as(hidden_states)
+        vals, inds = torch.topk(gates, self.top_k, dim=-1, sorted=False)
+        return vals.type_as(hidden_states), inds, gates.type_as(hidden_states)
 
 class SparseMoE(nn.Module):
     """Sparse MoE layer."""
@@ -238,166 +210,149 @@ class SparseMoE(nn.Module):
         self.router = NoisyTopkRouter(d, n_exp, top_k)
         self.experts = nn.ModuleList([Expert(d) for _ in range(n_exp)])
         self.top_k = top_k
-        self.capacity_factor = cap_factor
+        self.cap_factor = cap_factor
         self.num_experts = n_exp
-        self.hidden_dim = d
 
     def forward(self, hidden_states):
         """
-        Forward pass for SparseMoE with capacity enforcement.
+        hidden_states: (B, T, d)
+        returns: (B, T, d), aux_loss
         """
-        batch_size, sequence_length, dim = hidden_states.shape
-        num_tokens = batch_size * sequence_length
-        flat_hidden_states = hidden_states.view(num_tokens, dim)
-        device = hidden_states.device
-        dtype = hidden_states.dtype
-
-        # 1. Get Routing Info
-        top_k_gates, top_k_indices, dense_router_probs = self.router(flat_hidden_states)
-        # top_k_indices shape: (num_tokens, top_k)
-        # top_k_gates shape:    (num_tokens, top_k)
-
-        # 2. Calculate Capacity per Expert
-        capacity = max(1, math.ceil((self.capacity_factor * num_tokens) / self.num_experts))
-        logging.debug(f"MoE Capacity per expert: {capacity}")
-
-        # 3. Determine Token Dispatch & Enforce Capacity
-        expert_mask = torch.zeros(num_tokens, self.num_experts, dtype=torch.bool, device=device)
-        expert_mask.scatter_(1, top_k_indices, True)
-
-        route_cumsum   = torch.cumsum(expert_mask.long(), dim=0)
-        route_position = route_cumsum * expert_mask - 1  # 0-indexed
-
-        keep_mask = (route_position < capacity) & expert_mask
-
-        # Map capacity mask back to top‑k choices
-        pass_cap_mask_k     = keep_mask.gather(1, top_k_indices)  # (num_tokens, top_k)
-        kept_indices_where  = torch.where(pass_cap_mask_k)
-        kept_token_indices  = kept_indices_where[0]
-        k_for_kept_tokens   = kept_indices_where[1]
-
-        kept_expert_indices = top_k_indices[kept_token_indices, k_for_kept_tokens]
-        kept_gate_values    = top_k_gates[kept_token_indices, k_for_kept_tokens]
-
-        # 4. Compute actual load for aux loss
-        actual_load = torch.zeros(self.num_experts, device=device, dtype=torch.long)
-        if kept_expert_indices.numel() > 0:
-            actual_load.scatter_add_(0, kept_expert_indices, torch.ones_like(kept_expert_indices))
-        logging.debug(f"MoE Actual Load: {actual_load.tolist()}")
-
-        # 5. Dispatch tokens to experts and compute outputs
-        final_hidden_states = torch.zeros_like(flat_hidden_states)
-
-        # Sort by expert to form contiguous segments
-        sorted_indices               = torch.argsort(kept_expert_indices)
-        sorted_kept_expert_indices   = kept_expert_indices[sorted_indices]
-        sorted_kept_token_indices    = kept_token_indices[sorted_indices]
-        sorted_kept_gate_values      = kept_gate_values[sorted_indices]
-
-        # Find segment boundaries where expert index changes
-        expert_change_indices = torch.cat([
-            torch.tensor([0], device=device),
-            torch.where(sorted_kept_expert_indices[:-1] != sorted_kept_expert_indices[1:])[0] + 1,
-            torch.tensor([len(sorted_kept_expert_indices)], device=device)
+        B, T, d = hidden_states.shape
+        num_tokens = B * T
+        flat = hidden_states.view(num_tokens, d)
+    
+        # 1) Routing
+        top_vals, top_inds, dense_probs = self.router(flat)
+    
+        # Debug: check that top_inds is in [0, num_experts)
+        print(
+            f"[MoE DEBUG] top_inds: min={top_inds.min().item()}, "
+            f"max={top_inds.max().item()}, num_experts={self.num_experts}",
+            flush=True
+        )
+    
+        # 2) Compute capacity and mask
+        capacity = max(1, math.ceil(self.cap_factor * num_tokens / self.num_experts))
+        print(f"[MoE DEBUG] capacity per expert: {capacity}", flush=True)
+    
+        mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
+        mask.scatter_(1, top_inds, True)
+    
+        # 3) Enforce capacity
+        cumsum = torch.cumsum(mask.long(), dim=0)
+        position = cumsum * mask - 1
+        keep = (position < capacity) & mask
+        kept = torch.where(keep)
+        tok_idx, exp_slot = kept  # exp_slot is which expert slot
+    
+        print(f"[MoE DEBUG] total kept tokens: {tok_idx.numel()}", flush=True)
+    
+        # 4) Gather expert indices & weights
+        exp_idx = top_inds[tok_idx, exp_slot]
+        gate_vals = top_vals[tok_idx, exp_slot].unsqueeze(1)
+    
+        print(
+            f"[MoE DEBUG] exp_idx: min={exp_idx.min().item()}, max={exp_idx.max().item()}, "
+            f"count={exp_idx.numel()}",
+            flush=True
+        )
+    
+        # 5) Dispatch to experts in sorted order for efficiency
+        final = torch.zeros_like(flat)
+        sorted_idx = torch.argsort(exp_idx)
+        print(
+            f"[MoE DEBUG] sorted_idx: min={sorted_idx.min().item()}, "
+            f"max={sorted_idx.max().item()}, len={sorted_idx.numel()}",
+            flush=True
+        )
+    
+        seg_boundaries = torch.cat([
+            torch.tensor([0], device=flat.device),
+            torch.where(exp_idx[sorted_idx][:-1] != exp_idx[sorted_idx][1:])[0] + 1,
+            torch.tensor([sorted_idx.numel()], device=flat.device),
         ])
-
-        # Loop over each segment
-        num_segs = expert_change_indices.size(0) - 1
-        for seg in range(num_segs):
-            start_idx = expert_change_indices[seg].item()
-            end_idx   = expert_change_indices[seg + 1].item()
-            if start_idx >= end_idx:
+        print(f"[MoE DEBUG] seg_boundaries: {seg_boundaries[:8].cpu().tolist()} ...", flush=True)
+    
+        for i in range(len(seg_boundaries) - 1):
+            s = seg_boundaries[i].item()
+            e = seg_boundaries[i + 1].item()
+            if s >= e:
                 continue
-
-            expert_i   = sorted_kept_expert_indices[start_idx].item()
-            token_idxs = sorted_kept_token_indices[start_idx:end_idx]
-            gate_vals  = sorted_kept_gate_values[start_idx:end_idx].unsqueeze(1)
-            inputs     = flat_hidden_states[token_idxs]
-
-            # Run the expert and scatter‐add back
-            out = self.experts[expert_i](inputs)
-            final_hidden_states.index_add_(0, token_idxs, out * gate_vals)
-
-        # 6. Auxiliary MoE load balancing loss
+            expert_i = exp_idx[sorted_idx[s]].item()
+            idxs = tok_idx[sorted_idx[s:e]]
+            gv = gate_vals[sorted_idx[s:e]]
+            out = self.experts[expert_i](flat[idxs])
+            final.index_add_(0, idxs, out * gv)
+    
+        # 6) Compute auxiliary load‐balancing loss
+        aux_loss = torch.tensor(0.0, device=flat.device)
         if self.training:
-            fraction_tokens_routed = actual_load / max(1, num_tokens)
-            fraction_prob_routed   = dense_router_probs.mean(dim=0)
-            aux_loss_factor        = 0.01
-            aux_loss = (
-                torch.sum(fraction_prob_routed * fraction_tokens_routed)
-                * self.num_experts
-                * aux_loss_factor
-            )
-            logging.debug(f"MoE Aux Loss: {aux_loss.item()}")
-        else:
-            aux_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
+            frac_probs = dense_probs.mean(dim=0)
+            aux_loss = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
+            print(f"[MoE DEBUG] aux_loss: {aux_loss.item()}", flush=True)
+    
+        # 7) Reshape back to (B, T, d)
+        return final.view(B, T, d), aux_loss
 
-        return final_hidden_states.view_as(hidden_states), aux_loss
 
 class Block(nn.Module):
-    """Transformer block using Ring Attention and SparseMoE FFN."""
+    """Transformer block using USP Attention and SparseMoE FFN."""
     def __init__(self, d: int, n_head: int, n_exp: int, top_k: int):
         super().__init__()
         self.ln1 = nn.LayerNorm(d)
-        self.sa = MultiHeadAttention(d, n_head) # Now uses ring_flash_attn internally
+        self.sa = MultiHeadAttention(d, n_head)
         self.ln2 = nn.LayerNorm(d)
         self.moe = SparseMoE(d, n_exp, top_k)
 
-    # Inside Block class
-    def forward(self, x_local, mask=None): # Input x_local is (B, T_local, C)
-        # Pass the local shard to attention
-        attn_output = self.sa(self.ln1(x_local), mask=mask) # Input/Output is (B, T_local, C)
-        x_local = x_local + attn_output
-        # MoE operates on the local shard
-        moe_out, aux_loss = self.moe(self.ln2(x_local)) # Input/Output is (B, T_local, C)
-        out_local = x_local + moe_out
-        return out_local, aux_loss # Return local shard output
+    def forward(self, x_local, mask=None):
+        attn_out = self.sa(self.ln1(x_local), mask=mask)
+        x = x_local + attn_out
+        moe_out, aux_loss = self.moe(self.ln2(x))
+        return x + moe_out, aux_loss
 
 # -----------------------------------------------------------------------------#
-#  Sparse-MoE Language Model (using ring_flash_attn)
+#  Sparse-MoE Language Model
 # -----------------------------------------------------------------------------#
 class SparseMoELanguageModel(nn.Module):
-    """Sparse MoE Transformer Language Model with Ring Attention."""
+    """Sparse MoE Transformer Language Model with USP Attention."""
     def __init__(
         self,
         n_embed,
         n_head,
         n_layer,
-        block_size, # Max context window size
+        block_size,
         dropout,
         num_experts,
         top_k,
-        tokenizer_name=None, # Allow passing tokenizer object directly
-        # tokenizer_name="hf-internal-testing/llama-tokenizer",
+        tokenizer_name=None,
     ):
         super().__init__()
-        from transformers import LlamaTokenizerFast # Keep import here
+        from transformers import LlamaTokenizerFast
 
+        # Tokenizer setup
         if tokenizer_name:
-            try:
-                self.tokenizer = LlamaTokenizerFast.from_pretrained(
-                    tokenizer_name, model_max_length=block_size
-                )
-                special_tokens = {
-                    'additional_special_tokens': [
-                        '<bot>', '<start_latent>', '<end_latent>',
-                        '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: '
-                    ]
-                }
-                self.tokenizer.add_special_tokens(special_tokens)
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            except Exception as e:
-                logging.exception(f"Failed to load tokenizer '{tokenizer_name}'")
-                raise
+            self.tokenizer = LlamaTokenizerFast.from_pretrained(
+                tokenizer_name, model_max_length=block_size
+            )
+            special = {
+                'additional_special_tokens': [
+                    '<bot>', '<start_latent>', '<end_latent>',
+                    '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>:'
+                ]
+            }
+            self.tokenizer.add_special_tokens(special)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
-            # Use tokenizer passed from data.py
             self.tokenizer = GLOBAL_TOKENIZER
-            # Update tokenizer max length if model block size differs
             if self.tokenizer.model_max_length != block_size:
-                logging.warning(f"Updating tokenizer model_max_length from {self.tokenizer.model_max_length} to {block_size}")
+                logging.warning(
+                    f"Updating tokenizer model_max_length from "
+                    f"{self.tokenizer.model_max_length} to {block_size}"
+                )
                 self.tokenizer.model_max_length = block_size
 
-        # Ensure pad token is set
         if self.tokenizer.pad_token_id is None:
             if self.tokenizer.eos_token_id is not None:
                 self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -405,12 +360,14 @@ class SparseMoELanguageModel(nn.Module):
             else:
                 raise ValueError("Tokenizer must have a pad_token_id or eos_token_id")
 
-        vocab_size = len(self.tokenizer) # Get vocab size *after* potential token additions
+        vocab_size = len(self.tokenizer)
         self.n_embed = n_embed
         self.block_size = block_size
 
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed, padding_idx=self.tokenizer.pad_token_id)
-        self.dropout_emb = nn.Dropout(dropout) # Use config dropout value
+        self.token_embedding_table = nn.Embedding(
+            vocab_size, n_embed, padding_idx=self.tokenizer.pad_token_id
+        )
+        self.dropout_emb = nn.Dropout(dropout)
 
         self.blocks = nn.ModuleList(
             [Block(n_embed, n_head, num_experts, top_k) for _ in range(n_layer)]
@@ -421,59 +378,58 @@ class SparseMoELanguageModel(nn.Module):
         # Weight tying
         self.token_embedding_table.weight = self.lm_head.weight
 
-        # EBM component (assuming definition exists)
+        # EBM component
         self.ebm = EnergyBasedModel(n_embed)
 
         self.apply(self._init_weights)
-        num_params = self.get_num_params() # Calculate after init
-        logging.info(f"Initialized SparseMoELanguageModel with {num_params / 1e6:.2f}M parameters.")
-        if not isinstance(self.lm_head.weight, torch.nn.Parameter):
-            logging.info("Model parameters appear to be partitioned (ZeRO Stage 3 detected).")
+        num_params = self.get_num_params()
+        logging.info(f"Initialized SparseMoELanguageModel with {num_params/1e6:.2f}M parameters.")
 
     def _init_weights(self, module):
         """Initializes weights using standard Transformer practices."""
         if isinstance(module, nn.Linear):
             std_dev = 0.02
-            # Apply scaling for residual connections (common practice)
             if hasattr(module, 'is_residual_proj') and module.is_residual_proj:
-                 std_dev = std_dev / math.sqrt(2 * len(self.blocks))
+                std_dev = std_dev / math.sqrt(2 * len(self.blocks))
             torch.nn.init.normal_(module.weight, mean=0.0, std=std_dev)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.padding_idx is not None:
-                 with torch.no_grad(): module.weight[module.padding_idx].zero_()
+                with torch.no_grad():
+                    module.weight[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
-             module.bias.data.zero_()
-             module.weight.data.fill_(1.0)
-        # Mark residual projection layers? (Optional, for scaled init)
-        # if isinstance(module, Block):
-        #      if hasattr(module.sa, 'proj'): module.sa.proj.is_residual_proj = True
-        #      if hasattr(module.moe, ...): # If MoE has a final projection
-        #           module.moe.final_proj.is_residual_proj = True # Example
-
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
     def get_num_params(self, non_embedding=True):
-        """ Calculates the number of parameters in the model, attempting to handle DeepSpeed ZeRO3. """
+        """Calculates the number of parameters, adjusting for ZeRO3 embeddings."""
         if isinstance(self.lm_head.weight, torch.nn.Parameter):
             params = list(self.parameters())
             is_zero3 = False
-        else: # Assume ZeRO3 partitioning
+        else:
             params = []
             for p in self.parameters():
-                if hasattr(p, 'ds_numel'): params.append(p)
-                elif torch.is_tensor(p): params.append(p)
+                if hasattr(p, 'ds_numel'):
+                    params.append(p)
+                elif torch.is_tensor(p):
+                    params.append(p)
             is_zero3 = True
 
-        n_params = sum(p.ds_numel if hasattr(p,'ds_numel') else p.numel() for p in params)
-
+        n_params = sum(
+            p.ds_numel if hasattr(p, 'ds_numel') else p.numel() for p in params
+        )
         if non_embedding:
-             if is_zero3:
-                  emb_numel = self.token_embedding_table.weight.ds_numel if hasattr(self.token_embedding_table.weight, 'ds_numel') else 0
-             else:
-                  emb_numel = self.token_embedding_table.weight.numel()
-             n_params -= emb_numel # Subtract tied embedding weight only once
+            if is_zero3:
+                emb_numel = (
+                    self.token_embedding_table.weight.ds_numel
+                    if hasattr(self.token_embedding_table.weight, 'ds_numel')
+                    else 0
+                )
+            else:
+                emb_numel = self.token_embedding_table.weight.numel()
+            n_params -= emb_numel
         return n_params
 
     def _pad_or_trim(self, ids, target_length):
@@ -481,43 +437,33 @@ class SparseMoELanguageModel(nn.Module):
         B, T = ids.shape
         pad_id = self.tokenizer.pad_token_id
         assert pad_id is not None, "Tokenizer must have a pad_token_id"
-        if T == target_length: return ids
-        elif T > target_length: return ids[:, -target_length:]
+        if T == target_length:
+            return ids
+        elif T > target_length:
+            return ids[:, -target_length:]
         else:
-            padding = torch.full((B, target_length - T), pad_id, dtype=ids.dtype, device=ids.device)
+            padding = torch.full(
+                (B, target_length - T), pad_id, dtype=ids.dtype, device=ids.device
+            )
             return torch.cat([padding, ids], dim=1)
 
     def forward(self, input_ids, attention_mask=None, labels=None, reduction="mean"):
-        """
-        Main forward pass, delegates to specific methods based on needs.
-        Currently set up for next token prediction loss.
-        """
-        # Use the efficient forward for training/loss calculation
-        # Assuming labels signify training objective
+        """Main forward pass; uses efficient next-token loss if labels provided."""
         if labels is not None:
-             return self.forward_next_token_efficient(
-                  input_ids=input_ids,
-                  reduction=reduction,
-                  attention_mask=attention_mask, # Pass mask along
-                  labels=labels # Pass labels to calculate loss correctly
-             )
+            return self.forward_next_token_efficient(
+                input_ids=input_ids,
+                reduction=reduction,
+                attention_mask=attention_mask,
+                labels=labels
+            )
         else:
-             # Handle inference or cases where only embeddings are needed
-             # This part needs careful implementation if used for generation
-             # Currently returns final hidden states before LM head
-             return self.forward_embeddings_only(
-                  input_ids=input_ids,
-                  attention_mask=attention_mask
-             )
-
-
-    # inside SparseMoELanguageModel:
+            return self.forward_embeddings_only(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
 
     def forward_next_token_efficient(
-        self,
-        input_ids,
-        reduction="mean",
-        attention_mask=None,
+        self, input_ids, reduction="mean", attention_mask=None, labels=None
     ):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -528,144 +474,126 @@ class SparseMoELanguageModel(nn.Module):
         ids = self._pad_or_trim(input_ids, T)
         B, T = ids.shape
 
-        # split sequence for model parallel
+        # split for SP
         if world_size > 1:
             if T % world_size != 0:
                 raise ValueError(f"Block size {T} not divisible by world size {world_size}")
             T_local = T // world_size
-            ids_local = ids[:, rank*T_local:(rank+1)*T_local]
+            ids_local = ids[:, rank * T_local:(rank + 1) * T_local]
             if attention_mask is None:
                 pad_id = self.tokenizer.pad_token_id
-                local_attention_mask = (ids_local != pad_id).to(device)
+                local_mask = (ids_local != pad_id).to(device)
             else:
-                padded_mask = self._pad_or_trim(attention_mask.long(), T).bool()
-                local_attention_mask = padded_mask[:, rank*T_local:(rank+1)*T_local]
+                padded = self._pad_or_trim(attention_mask.long(), T).bool()
+                local_mask = padded[:, rank * T_local:(rank + 1) * T_local]
         else:
             ids_local = ids
             T_local = T
-            if attention_mask is None:
-                pad_id = self.tokenizer.pad_token_id
-                local_attention_mask = (ids_local != pad_id).to(device)
-            else:
-                local_attention_mask = self._pad_or_trim(attention_mask.long(), T).bool()
+            local_mask = (
+                (ids_local != self.tokenizer.pad_token_id).to(device)
+                if attention_mask is None
+                else self._pad_or_trim(attention_mask.long(), T).bool()
+            )
 
-        # embed + transformer
+        # embedding + transformer
         x_local = self.token_embedding_table(ids_local)
         x_local = self.dropout_emb(x_local)
 
-        total_aux_loss = torch.tensor(0.0, device=device, dtype=x_local.dtype)
+        total_aux = torch.tensor(0.0, device=device, dtype=x_local.dtype)
         current_x = x_local
         for blk in self.blocks:
-            current_x, aux_loss = blk(current_x, mask=local_attention_mask)
-            if self.training and aux_loss is not None:
-                total_aux_loss = total_aux_loss + aux_loss
+            current_x, aux_loss = blk(current_x, mask=local_mask)
+            if self.training:
+                total_aux = total_aux + aux_loss
         x_processed = self.ln_f(current_x)
 
-        # gather back to full sequence
+        # gather back
         if world_size > 1:
-            gather_list = [torch.empty_like(x_processed) for _ in range(world_size)]
-            dist.all_gather(gather_list, x_processed.contiguous())   # ← supports autograd
-            x_full = torch.cat(gather_list, dim=1)
+            shards = [torch.empty_like(x_processed) for _ in range(world_size)]
+            dist.all_gather(shards, x_processed.contiguous())
+            x_full = torch.cat(shards, dim=1)
         else:
             x_full = x_processed
 
-        # --- LOSS (FP32 only) ---
+        # compute loss
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
         targets = ids.to(x_full.device)
-
         is_zero3 = hasattr(self.lm_head.weight, "ds_numel")
         if is_zero3:
             with GatheredParameters([self.lm_head.weight], enabled=True):
-                full_w = self.lm_head.weight.clone()
+                w = self.lm_head.weight.clone()
                 loss = linear_cross_entropy(
-                    e=x_full,            # (B, T, C)  still float32
-                    c=full_w,
-                    targets=targets,     # (B, T)
-                    ignore_index=pad_id,
-                    reduction=reduction,
-                    shift=1,
+                    e=x_full, c=w, targets=targets,
+                    ignore_index=pad_id, reduction=reduction, shift=1
                 )
         else:
             loss = linear_cross_entropy(
-                e=x_full,
-                c=self.lm_head.weight,
-                targets=targets,
-                ignore_index=pad_id,
-                reduction=reduction,
-                shift=1,
+                e=x_full, c=self.lm_head.weight, targets=targets,
+                ignore_index=pad_id, reduction=reduction, shift=1
             )
-        print(loss, total_aux_loss, "loss!!")
-        if self.training and total_aux_loss.item() != 0:
-            loss = loss + total_aux_loss
+
+        if self.training and total_aux.item() != 0:
+            loss = loss + total_aux
 
         # cleanup
         del x_full, targets, x_processed
         if world_size > 1:
             del current_x
-
         return loss
 
     def forward_embeddings_only(self, input_ids, attention_mask=None):
-         """ Forward pass returning final hidden states (before LM head). """
-         # Similar logic to forward_next_token_efficient but stops before LM head/loss
-         world_size = dist.get_world_size() if dist.is_initialized() else 1
-         rank = dist.get_rank() if dist.is_initialized() else 0
-         device = input_ids.device
-         current_block_size = self.block_size
+        """Forward pass returning final hidden states (before LM head)."""
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        device = input_ids.device
+        T = self.block_size
 
-         ids = self._pad_or_trim(input_ids, current_block_size)
-         B, T = ids.shape
+        ids = self._pad_or_trim(input_ids, T)
+        B, _ = ids.shape
 
-         if attention_mask is None:
-             pad_id = self.tokenizer.pad_token_id
-             attention_mask = (ids != pad_id).to(device)
-         else:
-             attention_mask = self._pad_or_trim(attention_mask.long(), current_block_size).bool()
+        if attention_mask is None:
+            pad_id = self.tokenizer.pad_token_id
+            mask = (ids != pad_id).to(device)
+        else:
+            mask = self._pad_or_trim(attention_mask.long(), T).bool()
 
-         ids_local = ids # Ring attention works on full sequence context
-         x_local = self.token_embedding_table(ids_local)
-         x_local = self.dropout_emb(x_local)
+        # ring attention works on full context, so no split
+        x = self.token_embedding_table(ids)
+        x = self.dropout_emb(x)
 
-         for blk in self.blocks:
-             # Pass mask if needed by MoE
-             x_local, _ = blk(x_local, mask=attention_mask) # Ignore aux loss
+        for blk in self.blocks:
+            x, _ = blk(x, mask=mask)
 
-         x_local = self.ln_f(x_local)
+        x = self.ln_f(x)
 
-         # Gather results if distributed
-         if world_size > 1:
-             x_full_shards = [torch.empty_like(x_local) for _ in range(world_size)]
-             dist.all_gather(x_full_shards, x_local.contiguous(), group=None)
-             x_full = torch.cat(x_full_shards, dim=1)
-         else:
-             x_full = x_local
+        if world_size > 1:
+            shards = [torch.empty_like(x) for _ in range(world_size)]
+            dist.all_gather(shards, x.contiguous())
+            x_full = torch.cat(shards, dim=1)
+        else:
+            x_full = x
+        return x_full
 
-         return x_full # Return (B, T, C) final hidden states
-
-    # ------------- Coconut latent masking ------------- #
     def forward_coconut(self, *args, **kwargs):
-        """ Placeholder for official COCONUT mechanism. Requires implementation. """
+        """ Placeholder for COCONUT multi-pass logic. """
         logging.error("`forward_coconut` called, but official COCONUT logic is not implemented yet.")
-        raise NotImplementedError("Implement official COCONUT multi-pass forward logic here.")
+        raise NotImplementedError("Implement official COCONUT logic here.")
 
     def get_embeddings(self, input_ids, pool=True):
-         """ Gets final layer embeddings, handles pooling & sequence parallelism. """
-         # Uses forward_embeddings_only to get final states
-         x = self.forward_embeddings_only(input_ids, attention_mask=None) # Assumes no mask needed here
-         B, T, C = x.shape
-         device = x.device
+        """Gets final layer embeddings, with optional mean pooling."""
+        x = self.forward_embeddings_only(input_ids, attention_mask=None)
+        B, T, C = x.shape
+        device = x.device
 
-         if pool:
-              # Need original padded ids to create correct mask for pooling
-              ids = self._pad_or_trim(input_ids, T) # Ensure ids match sequence length T
-              pad_id = self.tokenizer.pad_token_id
-              pad_mask = (ids != pad_id).float().unsqueeze(-1).to(device) # (B, T, 1)
-              masked_sum = (x * pad_mask).sum(dim=1) # (B, C)
-              num_non_padding = pad_mask.sum(dim=1).clamp(min=1e-6)
-              pooled_embeddings = masked_sum / num_non_padding
-              return pooled_embeddings
-         else:
-              return x # Return full sequence embeddings (B, T, C)
+        if pool:
+            ids = self._pad_or_trim(input_ids, T)
+            pad_id = self.tokenizer.pad_token_id
+            mask = (ids != pad_id).float().unsqueeze(-1).to(device)
+            summed = (x * mask).sum(dim=1)
+            count = mask.sum(dim=1).clamp(min=1e-6)
+            return summed / count
+        else:
+            return x
 
 # -----------------------------------------------------------------------------#
 #  helpers to extend context length
@@ -673,37 +601,30 @@ class SparseMoELanguageModel(nn.Module):
 def update_model_rope_for_extended_context(model, new_seq_len, base: float = 10_000.0):
     """Updates RoPE parameters in all attention layers for a new sequence length."""
     if not hasattr(model, 'blocks'):
-         logging.warning("Model does not have 'blocks' attribute, cannot update RoPE.")
-         return model
+        logging.warning("Model has no 'blocks'; cannot update RoPE.")
+        return model
 
-    logging.info(f"Updating RoPE for new max sequence length: {new_seq_len}, base: {base}")
     updated = False
     current_max = 0
-    for i, blk in enumerate(model.blocks):
-        if hasattr(blk, 'sa') and hasattr(blk.sa, 'update_rope'):
+    for blk in model.blocks:
+        if hasattr(blk.sa, 'update_rope'):
             blk.sa.update_rope(new_seq_len, base)
             current_max = max(current_max, blk.sa.max_seq)
             updated = True
-        # else: logging.warning(...) # Optional warning if layer doesn't have update_rope
 
     if updated and hasattr(model, 'block_size'):
-        new_model_block_size = current_max # Set based on actual buffer size
-        if new_model_block_size != model.block_size:
-             model.block_size = new_model_block_size
-             logging.info(f"Model block_size updated to {model.block_size}")
-    elif updated:
-         logging.warning("Model block_size attribute not found, RoPE updated but model size not tracked.")
+        if current_max != model.block_size:
+            model.block_size = current_max
+            logging.info(f"Model block_size updated to {model.block_size}")
 
-    # Update tokenizer max length if model block size changed
     if hasattr(model, 'tokenizer') and hasattr(model, 'block_size'):
-         if model.tokenizer.model_max_length != model.block_size:
-              logging.info(f"Updating tokenizer model_max_length to {model.block_size}")
-              model.tokenizer.model_max_length = model.block_size
+        if model.tokenizer.model_max_length != model.block_size:
+            model.tokenizer.model_max_length = model.block_size
+            logging.info(f"Tokenizer max_length updated to {model.block_size}")
 
     return model
 
-
 def expand_pos_embedding(*args, **kwargs):
-    """ Deprecated function - No longer needed with RoPE. """
-    logging.warning("`expand_pos_embedding` is deprecated and does nothing when using RoPE.")
+    """Deprecated: no-op when using RoPE."""
+    logging.warning("expand_pos_embedding is deprecated and does nothing.")
     pass
