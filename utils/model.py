@@ -3,43 +3,56 @@
 #  Sequence-Parallel Unified‑SP (YunChang) Attention + Sparse‑MoE LM
 # =============================================================================
 
-import math
-import logging
+import torch
+torch.Tensor.continous = torch.Tensor.contiguous
+
+import yunchang.hybrid.attn_layer as _yc_attn
+
+_SeqApply_orig = _yc_attn.SeqAllToAll4D.apply
+def _SeqApply_shim(*args, **kwargs):
+    # drop any kwargs and forward to real apply
+    if kwargs:
+        return _SeqApply_orig(*args)
+    return _SeqApply_orig(*args)
+_yc_attn.SeqAllToAll4D.apply = _SeqApply_shim
+
+import sys
+sys.path.insert(0, "/home/ubuntu/MoE-Asset-Pricing/flash-attention")
+
+import flash_attn.flash_attn_interface as _fai
+import flash_attn                       as _fa
+
+_fai.flash_attn_func        = _fai.flash_attn_qkvpacked_func
+_fa .flash_attn_func        = _fai.flash_attn_qkvpacked_func
+_fai.flash_attn_varlen_func = _fai.flash_attn_varlen_qkvpacked_func
+_fa .flash_attn_varlen_func = _fai.flash_attn_varlen_qkvpacked_func
+
+_fai._flash_attn_forward         = _fai._flash_attn_forward
+_fai._flash_attn_backward        = _fai._flash_attn_backward
+_fai._flash_attn_varlen_forward  = _fai._flash_attn_varlen_forward
+_fai._flash_attn_varlen_backward = _fai._flash_attn_varlen_backward
+
+torch.ops.flash_attn._flash_attn_forward         = _fai._flash_attn_forward
+torch.ops.flash_attn._flash_attn_backward        = _fai._flash_attn_backward
+torch.ops.flash_attn._flash_attn_varlen_forward  = _fai._flash_attn_varlen_forward
+torch.ops.flash_attn._flash_attn_varlen_backward = _fai._flash_attn_varlen_backward
+
+import math, logging
 from typing import Tuple, Optional
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-# Project imports
+# project‑local imports … ------------------------------------------------------
 from utils.config import config
-from utils.ebm import EnergyBasedModel
-from utils.data import GLOBAL_TOKENIZER
+from utils.ebm    import EnergyBasedModel
+from utils.data   import GLOBAL_TOKENIZER
 from cut_cross_entropy import linear_cross_entropy
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
-# --------------------------------------------------------------------
-# Monkey‑patch FlashAttention v2+ to satisfy YunChang’s imports
-# --------------------------------------------------------------------
-import flash_attn.flash_attn_interface as _fai
-import flash_attn as _fa
-
-# alias the v2 “varlen qkv‑packed” routines under the old names
-_fai.flash_attn_func             = _fai.flash_attn_varlen_qkvpacked_func
-_fai._flash_attn_varlen_forward  = _fai.flash_attn_varlen_qkvpacked_func
-_fai._flash_attn_varlen_backward = _fai.flash_attn_varlen_qkvpacked_func
-
-# also patch the top‑level module symbol
-_fa.flash_attn_func              = _fai.flash_attn_varlen_qkvpacked_func
-
-# Now YunChang’s code will find exactly the names it expects:
 from yunchang import set_seq_parallel_pg, LongContextAttention, EXTRACT_FUNC_DICT
 from yunchang.kernels import AttnType
-
-# ----------------------------------------------------------------------------
-# …and the rest of your model definition follows unchanged…
-# ----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------#
 #  RoPE helpers
@@ -116,7 +129,7 @@ class MultiHeadAttention(nn.Module):
             scatter_idx=2,            # optional, defaults to 2
             gather_idx=1,             # optional, defaults to 1
             ring_impl_type="zigzag",
-            use_pack_qkv=False,
+            use_pack_qkv=True,
             use_sync=False,
             attn_type=AttnType.FA,
             attn_processor=None,      # leave as default unless you have a custom processor
@@ -221,59 +234,37 @@ class SparseMoE(nn.Module):
         B, T, d = hidden_states.shape
         num_tokens = B * T
         flat = hidden_states.view(num_tokens, d)
-    
+
         # 1) Routing
         top_vals, top_inds, dense_probs = self.router(flat)
-    
-        # Debug: check that top_inds is in [0, num_experts)
-        print(
-            f"[MoE DEBUG] top_inds: min={top_inds.min().item()}, "
-            f"max={top_inds.max().item()}, num_experts={self.num_experts}",
-            flush=True
-        )
-    
+
         # 2) Compute capacity and mask
         capacity = max(1, math.ceil(self.cap_factor * num_tokens / self.num_experts))
-        print(f"[MoE DEBUG] capacity per expert: {capacity}", flush=True)
-    
+
         mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
         mask.scatter_(1, top_inds, True)
-    
+
         # 3) Enforce capacity
         cumsum = torch.cumsum(mask.long(), dim=0)
         position = cumsum * mask - 1
         keep = (position < capacity) & mask
         kept = torch.where(keep)
         tok_idx, exp_slot = kept  # exp_slot is which expert slot
-    
-        print(f"[MoE DEBUG] total kept tokens: {tok_idx.numel()}", flush=True)
-    
+
         # 4) Gather expert indices & weights
-        exp_idx = top_inds[tok_idx, exp_slot]
-        gate_vals = top_vals[tok_idx, exp_slot].unsqueeze(1)
-    
-        print(
-            f"[MoE DEBUG] exp_idx: min={exp_idx.min().item()}, max={exp_idx.max().item()}, "
-            f"count={exp_idx.numel()}",
-            flush=True
-        )
-    
+        exp_idx = exp_slot
+        gate_vals = dense_probs[tok_idx, exp_slot].unsqueeze(1)
+
         # 5) Dispatch to experts in sorted order for efficiency
         final = torch.zeros_like(flat)
         sorted_idx = torch.argsort(exp_idx)
-        print(
-            f"[MoE DEBUG] sorted_idx: min={sorted_idx.min().item()}, "
-            f"max={sorted_idx.max().item()}, len={sorted_idx.numel()}",
-            flush=True
-        )
-    
+
         seg_boundaries = torch.cat([
             torch.tensor([0], device=flat.device),
             torch.where(exp_idx[sorted_idx][:-1] != exp_idx[sorted_idx][1:])[0] + 1,
             torch.tensor([sorted_idx.numel()], device=flat.device),
         ])
-        print(f"[MoE DEBUG] seg_boundaries: {seg_boundaries[:8].cpu().tolist()} ...", flush=True)
-    
+
         for i in range(len(seg_boundaries) - 1):
             s = seg_boundaries[i].item()
             e = seg_boundaries[i + 1].item()
@@ -284,15 +275,14 @@ class SparseMoE(nn.Module):
             gv = gate_vals[sorted_idx[s:e]]
             out = self.experts[expert_i](flat[idxs])
             final.index_add_(0, idxs, out * gv)
-    
+
         # 6) Compute auxiliary load‐balancing loss
         aux_loss = torch.tensor(0.0, device=flat.device)
         if self.training:
             frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
             frac_probs = dense_probs.mean(dim=0)
             aux_loss = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
-            print(f"[MoE DEBUG] aux_loss: {aux_loss.item()}", flush=True)
-    
+
         # 7) Reshape back to (B, T, d)
         return final.view(B, T, d), aux_loss
 
@@ -531,7 +521,7 @@ class SparseMoELanguageModel(nn.Module):
                 e=x_full, c=self.lm_head.weight, targets=targets,
                 ignore_index=pad_id, reduction=reduction, shift=1
             )
-
+        print(loss, "loss!!")
         if self.training and total_aux.item() != 0:
             loss = loss + total_aux
 
