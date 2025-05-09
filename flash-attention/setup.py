@@ -218,7 +218,7 @@ setup(
     name                 = PACKAGE_NAME,
     version              = get_version(),
     description          = "FlashAttention — head-dim = 64-only build",
-    long_description     = (this_dir / "README.md").read_text(encoding="utf-8"),
+    long_description     = "",
     long_description_content_type = "text/markdown",
     author               = "Tri Dao",
     author_email         = "tri@tridao.me",
