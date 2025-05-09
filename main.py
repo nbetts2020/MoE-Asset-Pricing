@@ -1,14 +1,9 @@
+# main.py (very top)
 import os, sys
 
-BASEDIR = os.path.dirname(__file__)
-LOCAL   = os.path.join(BASEDIR, "third_party", "ring_attention_pytorch")
-sys.path.insert(0, LOCAL)
-
-# pull in the CUDA‐accelerated kernel instead of the Python fallback
-from ring_attention_pytorch.ring_flash_attention_cuda import ring_flash_attn_cuda as ring_flash_attn
-
-import ring_attention_pytorch
-print("Loaded ring‑attn from:", ring_attention_pytorch.__file__)
+# 1) make sure we load your local flash-attention build first
+FLASH_PATH = os.path.expanduser("~/MoE-Asset-Pricing/flash-attention")
+sys.path.insert(0, FLASH_PATH)
 
 import torch
 import os
