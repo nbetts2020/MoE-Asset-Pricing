@@ -128,30 +128,30 @@ def train_model(
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
 
-            if (step + 1) % 10 == 0:
-                # take the first 5 examples in this batch as independent prompts
-                sample_ids  = batch["input_ids"][:5].to(device)    # (5, T)
-                true_prices = batch["labels"][:5].tolist()
+            # if (step + 1) % 10 == 0:
+            #     # take the first 5 examples in this batch as independent prompts
+            #     sample_ids  = batch["input_ids"][:5].to(device)    # (5, T)
+            #     true_prices = batch["labels"][:5].tolist()
             
-                # generate up to EOS (stops when eos_token_id is produced)
-                with torch.no_grad():
-                    outputs = real_model.generate(
-                        input_ids=sample_ids,
-                        max_new_tokens=10,
-                        eos_token_id=tokenizer.eos_token_id,
-                        pad_token_id=tokenizer.eos_token_id
-                    )
+            #     # generate up to EOS (stops when eos_token_id is produced)
+            #     with torch.no_grad():
+            #         outputs = real_model.generate(
+            #             input_ids=sample_ids,
+            #             max_new_tokens=10,
+            #             eos_token_id=tokenizer.eos_token_id,
+            #             pad_token_id=tokenizer.eos_token_id
+            #         )
             
-                # strip off the prompt prefix and decode each separately
-                gen_tokens = outputs[:, sample_ids.size(1):]       # shape (5, ≤10)
-                preds = [
-                    tokenizer.decode(g, skip_special_tokens=True).strip()
-                    for g in gen_tokens
-                ]
+            #     # strip off the prompt prefix and decode each separately
+            #     gen_tokens = outputs[:, sample_ids.size(1):]       # shape (5, ≤10)
+            #     preds = [
+            #         tokenizer.decode(g, skip_special_tokens=True).strip()
+            #         for g in gen_tokens
+            #     ]
             
-                # print true vs. predicted price‐string
-                for i, p in enumerate(preds):
-                    print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {p or '〈empty〉'}")
+            #     # print true vs. predicted price‐string
+            #     for i, p in enumerate(preds):
+            #         print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {p or '〈empty〉'}")
 
             input_ids = batch['input_ids'].to(device)
             input_ids = pad_to_global(input_ids)
