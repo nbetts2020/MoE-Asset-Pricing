@@ -130,7 +130,7 @@ class MultiHeadAttention(nn.Module):
             gather_idx=1,             # optional, defaults to 1
             ring_impl_type="zigzag",
             use_pack_qkv=True,
-            use_sync=False,
+            use_sync=True,
             attn_type=AttnType.FA,
             attn_processor=None,      # leave as default unless you have a custom processor
         )
@@ -205,20 +205,35 @@ class NoisyTopkRouter(nn.Module):
         self.top_k = top_k
         self.gate_proj = nn.Linear(d, n_exp, bias=False)
         self.noise_proj = nn.Linear(d, n_exp, bias=False)
+        self.register_buffer("router_step", torch.zeros((), dtype=torch.int64))
         with torch.no_grad(): self.noise_proj.weight.normal_(0, 0.01)
 
     def forward(self, hidden_states):
         logits = self.gate_proj(hidden_states).float()
+
         if self.training:
-            noise = torch.randn_like(logits) * F.softplus(self.noise_proj(hidden_states).float())
-            logits = logits + noise
+            # seed off the per‑module counter
+            g = torch.Generator(device=logits.device)
+            g.manual_seed(int(self.router_step.item()))
+
+            # draw fresh noise each forward
+            noise = torch.empty_like(logits)
+            noise.normal_(mean=0.0, std=1.0, generator=g)
+            noise = noise * F.softplus(self.noise_proj(hidden_states).float())
+
+            # bump the counter for next time
+            self.router_step += 1
+        else:
+            noise = torch.zeros_like(logits)
+
+        logits = logits + noise
         gates = F.softmax(logits, dim=-1)
         vals, inds = torch.topk(gates, self.top_k, dim=-1, sorted=False)
         return vals.type_as(hidden_states), inds, gates.type_as(hidden_states)
 
 class SparseMoE(nn.Module):
     """Sparse MoE layer."""
-    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 2):
+    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1e9):
         super().__init__()
         self.router = NoisyTopkRouter(d, n_exp, top_k)
         self.experts = nn.ModuleList([Expert(d) for _ in range(n_exp)])
@@ -239,7 +254,9 @@ class SparseMoE(nn.Module):
         top_vals, top_inds, dense_probs = self.router(flat)
 
         # 2) Compute capacity and mask
-        capacity = max(1, math.ceil(self.cap_factor * num_tokens / self.num_experts))
+        global_tokens = torch.tensor(B*T, device=flat.device)
+        dist.all_reduce(global_tokens)        # now equals B*T
+        capacity = math.ceil(self.cap_factor * global_tokens.item() / self.num_experts)
 
         mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
         mask.scatter_(1, top_inds, True)
@@ -453,83 +470,81 @@ class SparseMoELanguageModel(nn.Module):
             )
 
     def forward_next_token_efficient(
-        self, input_ids, reduction="mean", attention_mask=None, labels=None
-    ):
+            self, input_ids, reduction="mean", attention_mask=None, labels=None
+        ):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        device = input_ids.device
-        T = self.block_size
-
-        # pad/trim
+        rank       = dist.get_rank()      if dist.is_initialized() else 0
+        device     = input_ids.device
+        T          = self.block_size
+    
+        # 1. pad/trim to fixed context
         ids = self._pad_or_trim(input_ids, T)
         B, T = ids.shape
-
-        # split for SP
+    
+        # 2. split across ranks
         if world_size > 1:
             if T % world_size != 0:
                 raise ValueError(f"Block size {T} not divisible by world size {world_size}")
-            T_local = T // world_size
-            ids_local = ids[:, rank * T_local:(rank + 1) * T_local]
+            T_local   = T // world_size
+            ids_local = ids[:, rank*T_local:(rank+1)*T_local]
             if attention_mask is None:
-                pad_id = self.tokenizer.pad_token_id
+                pad_id     = self.tokenizer.pad_token_id
                 local_mask = (ids_local != pad_id).to(device)
             else:
-                padded = self._pad_or_trim(attention_mask.long(), T).bool()
-                local_mask = padded[:, rank * T_local:(rank + 1) * T_local]
+                padded     = self._pad_or_trim(attention_mask.long(), T).bool()
+                local_mask = padded[:, rank*T_local:(rank+1)*T_local]
         else:
-            ids_local = ids
-            T_local = T
+            ids_local  = ids
+            T_local    = T
             local_mask = (
                 (ids_local != self.tokenizer.pad_token_id).to(device)
                 if attention_mask is None
                 else self._pad_or_trim(attention_mask.long(), T).bool()
             )
-
-        # embedding + transformer
-        x_local = self.token_embedding_table(ids_local)
-        x_local = self.dropout_emb(x_local)
-
+    
+        # 3. embed + transformer (including MoE aux accumulation)
+        x_local   = self.dropout_emb(self.token_embedding_table(ids_local))
         total_aux = torch.tensor(0.0, device=device, dtype=x_local.dtype)
-        current_x = x_local
+        cur       = x_local
         for blk in self.blocks:
-            current_x, aux_loss = blk(current_x, mask=local_mask)
+            cur, aux = blk(cur, mask=local_mask)
             if self.training:
-                total_aux = total_aux + aux_loss
-        x_processed = self.ln_f(current_x)
-
-        # gather back
+                total_aux += aux
+        x_processed = self.ln_f(cur)
+    
+        # 4. gather full sequence
         if world_size > 1:
-            shards = [torch.empty_like(x_processed) for _ in range(world_size)]
-            dist.all_gather(shards, x_processed.contiguous())
+            from torch.distributed.nn.functional import all_gather
+            shards = all_gather(x_processed, group=dist.group.WORLD)
             x_full = torch.cat(shards, dim=1)
         else:
             x_full = x_processed
-
-        # compute loss
+    
+        # 5. compute raw cross-entropy
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
         targets = ids.to(x_full.device)
-        is_zero3 = hasattr(self.lm_head.weight, "ds_numel")
-        if is_zero3:
-            with GatheredParameters([self.lm_head.weight], enabled=True):
-                w = self.lm_head.weight.clone()
-                loss = linear_cross_entropy(
-                    e=x_full, c=w, targets=targets,
-                    ignore_index=pad_id, reduction=reduction, shift=1
-                )
-        else:
-            loss = linear_cross_entropy(
-                e=x_full, c=self.lm_head.weight, targets=targets,
-                ignore_index=pad_id, reduction=reduction, shift=1
-            )
-        print(loss, "loss!!")
+        lm_w = self.lm_head.weight
+        if hasattr(lm_w, "ds_numel"):
+            with GatheredParameters([lm_w], enabled=True):
+                lm_w = lm_w.clone()
+    
+        raw_ce = linear_cross_entropy(
+            e=x_full,
+            c=lm_w,
+            targets=targets,
+            ignore_index=pad_id,
+            reduction=reduction,
+            shift=1
+        )
+    
+        # 6. build the scaled loss for back‑prop
+        scaled = raw_ce / world_size
         if self.training and total_aux.item() != 0:
-            loss = loss + total_aux
-
-        # cleanup
-        del x_full, targets, x_processed
-        if world_size > 1:
-            del current_x
-        return loss
+            scaled += total_aux / world_size
+    
+        # 7. log the full CE but return the scaled version
+        print(raw_ce.detach(), "loss!!")
+        return scaled
 
     def forward_embeddings_only(self, input_ids, attention_mask=None):
         """Forward pass returning final hidden states (before LM head)."""
