@@ -116,20 +116,31 @@ def cuda_sources() -> list[str]:
     return [
         "csrc/flash_attn/flash_api.cpp",
         # fused kernels
-        f"{base}/flash_fwd_hdim64_fp16_sm80.cu",
         f"{base}/flash_fwd_hdim64_bf16_sm80.cu",
-        f"{base}/flash_fwd_hdim64_fp16_causal_sm80.cu",
         f"{base}/flash_fwd_hdim64_bf16_causal_sm80.cu",
-        f"{base}/flash_bwd_hdim64_fp16_sm80.cu",
         f"{base}/flash_bwd_hdim64_bf16_sm80.cu",
-        f"{base}/flash_bwd_hdim64_fp16_causal_sm80.cu",
         f"{base}/flash_bwd_hdim64_bf16_causal_sm80.cu",
         # split‑KV forward kernels
-        f"{base}/flash_fwd_split_hdim64_fp16_sm80.cu",
         f"{base}/flash_fwd_split_hdim64_bf16_sm80.cu",
-        f"{base}/flash_fwd_split_hdim64_fp16_causal_sm80.cu",
         f"{base}/flash_fwd_split_hdim64_bf16_causal_sm80.cu",
     ]
+    # return [
+    #     "csrc/flash_attn/flash_api.cpp",
+    #     # fused kernels
+    #     f"{base}/flash_fwd_hdim64_fp16_sm80.cu",
+    #     f"{base}/flash_fwd_hdim64_bf16_sm80.cu",
+    #     f"{base}/flash_fwd_hdim64_fp16_causal_sm80.cu",
+    #     f"{base}/flash_fwd_hdim64_bf16_causal_sm80.cu",
+    #     f"{base}/flash_bwd_hdim64_fp16_sm80.cu",
+    #     f"{base}/flash_bwd_hdim64_bf16_sm80.cu",
+    #     f"{base}/flash_bwd_hdim64_fp16_causal_sm80.cu",
+    #     f"{base}/flash_bwd_hdim64_bf16_causal_sm80.cu",
+    #     # split‑KV forward kernels
+    #     f"{base}/flash_fwd_split_hdim64_fp16_sm80.cu",
+    #     f"{base}/flash_fwd_split_hdim64_bf16_sm80.cu",
+    #     f"{base}/flash_fwd_split_hdim64_fp16_causal_sm80.cu",
+    #     f"{base}/flash_fwd_split_hdim64_bf16_causal_sm80.cu",
+    # ]
 
 def rocm_sources() -> list[str]:
     """
