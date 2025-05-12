@@ -40,21 +40,24 @@ def extract_label_value(decoded_text):
 
 def greedy_generate_tail(model, input_ids, max_new_tokens=20):
     """
-    Returns only the newly generated token IDs (shape B×T_new),
-    not the entire prefix+gen sequence.
+    Greedy-generate up to `max_new_tokens` *without* extending RoPE.
+    Only the last T_local tokens of the prefix are fed to each rank.
+    Returns the newly generated ids (B × T_new).
     """
-    device = input_ids.device
-    batch = input_ids.shape[0]
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    T_local    = model.block_size // world_size
+
+    cur = input_ids[:, -T_local:].clone()          # keep last T_local tokens
     generated = []
-    cur = input_ids
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            hs = model.forward_embeddings_only(cur)      # (B, T, C)
-            logits = model.lm_head(hs)                  # (B, T, V)
-            nxt   = logits[:, -1, :].argmax(-1, keepdim=True)  # (B,1)
+            hs     = model.forward_embeddings_only(cur)      # (B, t, C)
+            logits = model.lm_head(hs)                       # (B, t, V)
+            nxt    = logits[:, -1, :].argmax(-1, keepdim=True)  # (B,1)
             generated.append(nxt)
             cur = torch.cat([cur, nxt], dim=1)
-    return torch.cat(generated, dim=1)  # (B, max_new_tokens)
+            cur = cur[:, -T_local:]          # always trim to T_local
+    return torch.cat(generated, dim=1)       # (B, max_new_tokens)
 
 @torch.no_grad()
 def local_logits(model, ids_local, mask_local):
@@ -119,39 +122,41 @@ def train_model(
     logging.info(f"Dataloader length: {len(dataloader)} batches.")
     PRETRAIN_EPOCHS = epochs
 
-    marker_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>:", add_special_tokens=False).input_ids
+    marker_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
     m_len      = len(marker_ids)
-
+    
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
         real_model.train()
         epoch_loss = 0.0
         for step, batch in enumerate(dataloader):
             print(step, len(dataloader), "progress!!")
+    
+            if (step + 1) % 150 == 0:
+                with torch.no_grad():
+                    sample_ids  = batch["input_ids"][:5].to(device)
+                    true_prices = batch["labels"][:5].tolist()
+            
+                    preds = []
+                    for ids in sample_ids:
+                        ids_list   = ids.tolist()
+                        marker_pos = next(
+                            (j + m_len for j in range(len(ids_list) - m_len + 1)
+                             if ids_list[j: j + m_len] == marker_ids),
+                            None
+                        )
+                        if marker_pos is None:
+                            preds.append("〈n/a〉")
+                            continue
+            
+                        prefix  = ids[:marker_pos].unsqueeze(0)
+                        gen_ids = greedy_generate_tail(real_model, prefix, max_new_tokens=6)
+                        preds.append(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
+            
+                # **only rank-0 prints**
+                if rank == 0:
+                    for i, pred in enumerate(preds):
+                        print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred}")
 
-            # if (step + 1) % 10 == 0:
-            #     # take the first 5 examples in this batch as independent prompts
-            #     sample_ids  = batch["input_ids"][:5].to(device)    # (5, T)
-            #     true_prices = batch["labels"][:5].tolist()
-            
-            #     # generate up to EOS (stops when eos_token_id is produced)
-            #     with torch.no_grad():
-            #         outputs = real_model.generate(
-            #             input_ids=sample_ids,
-            #             max_new_tokens=10,
-            #             eos_token_id=tokenizer.eos_token_id,
-            #             pad_token_id=tokenizer.eos_token_id
-            #         )
-            
-            #     # strip off the prompt prefix and decode each separately
-            #     gen_tokens = outputs[:, sample_ids.size(1):]       # shape (5, ≤10)
-            #     preds = [
-            #         tokenizer.decode(g, skip_special_tokens=True).strip()
-            #         for g in gen_tokens
-            #     ]
-            
-            #     # print true vs. predicted price‐string
-            #     for i, p in enumerate(preds):
-            #         print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {p or '〈empty〉'}")
 
             input_ids = batch['input_ids'].to(device)
             input_ids = pad_to_global(input_ids)
