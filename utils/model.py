@@ -168,7 +168,7 @@ class MultiHeadAttention(nn.Module):
 
         # 3) USP attention call
         out = self.usp_attn(
-            q_local, k_local, v_local,
+            q_local_rope, k_local_rope, v_local,
             dropout_p = config.DROPOUT if self.training else 0.0,
             softmax_scale=None,
             causal=True,
@@ -233,7 +233,7 @@ class NoisyTopkRouter(nn.Module):
 
 class SparseMoE(nn.Module):
     """Sparse MoE layer."""
-    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1e9):
+    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 2):
         super().__init__()
         self.router = NoisyTopkRouter(d, n_exp, top_k)
         self.experts = nn.ModuleList([Expert(d) for _ in range(n_exp)])
@@ -254,9 +254,9 @@ class SparseMoE(nn.Module):
         top_vals, top_inds, dense_probs = self.router(flat)
 
         # 2) Compute capacity and mask
-        global_tokens = torch.tensor(B*T, device=flat.device)
-        dist.all_reduce(global_tokens)        # now equals B*T
-        capacity = math.ceil(self.cap_factor * global_tokens.item() / self.num_experts)
+        local_tokens = torch.tensor(B*T, device=flat.device)
+        # dist.all_reduce(global_tokens)        # now equals B*T
+        capacity = math.ceil(self.cap_factor * local_tokens.item() / self.num_experts)
 
         mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
         mask.scatter_(1, top_inds, True)
@@ -470,29 +470,29 @@ class SparseMoELanguageModel(nn.Module):
             )
 
     def forward_next_token_efficient(
-            self, input_ids, reduction="mean", attention_mask=None, labels=None
-        ):
+        self, input_ids, reduction="mean", attention_mask=None, labels=None
+    ):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank       = dist.get_rank()      if dist.is_initialized() else 0
         device     = input_ids.device
         T          = self.block_size
-    
-        # 1. pad/trim to fixed context
-        ids = self._pad_or_trim(input_ids, T)
+
+        # 1) pad/trim to fixed context length
+        ids = self._pad_or_trim(input_ids, T)          # (B, T)
         B, T = ids.shape
-    
-        # 2. split across ranks
+
+        # 2) shard the sequence across ranks (sequence-parallel)
         if world_size > 1:
             if T % world_size != 0:
-                raise ValueError(f"Block size {T} not divisible by world size {world_size}")
+                raise ValueError(f"block_size {T} not divisible by world_size {world_size}")
             T_local   = T // world_size
-            ids_local = ids[:, rank*T_local:(rank+1)*T_local]
+            ids_local = ids[:, rank * T_local:(rank + 1) * T_local]
             if attention_mask is None:
                 pad_id     = self.tokenizer.pad_token_id
                 local_mask = (ids_local != pad_id).to(device)
             else:
                 padded     = self._pad_or_trim(attention_mask.long(), T).bool()
-                local_mask = padded[:, rank*T_local:(rank+1)*T_local]
+                local_mask = padded[:, rank * T_local:(rank + 1) * T_local]
         else:
             ids_local  = ids
             T_local    = T
@@ -501,8 +501,8 @@ class SparseMoELanguageModel(nn.Module):
                 if attention_mask is None
                 else self._pad_or_trim(attention_mask.long(), T).bool()
             )
-    
-        # 3. embed + transformer (including MoE aux accumulation)
+
+        # 3) embed + transformer (also accumulates MoE aux loss)
         x_local   = self.dropout_emb(self.token_embedding_table(ids_local))
         total_aux = torch.tensor(0.0, device=device, dtype=x_local.dtype)
         cur       = x_local
@@ -510,41 +510,41 @@ class SparseMoELanguageModel(nn.Module):
             cur, aux = blk(cur, mask=local_mask)
             if self.training:
                 total_aux += aux
-        x_processed = self.ln_f(cur)
-    
-        # 4. gather full sequence
-        if world_size > 1:
-            from torch.distributed.nn.functional import all_gather
-            shards = all_gather(x_processed, group=dist.group.WORLD)
-            x_full = torch.cat(shards, dim=1)
-        else:
-            x_full = x_processed
-    
-        # 5. compute raw cross-entropy
+        x_processed = self.ln_f(cur)                    # (B, T_local, D)
+
+        # 4) local cut-cross-entropy (memory-friendly, no gather)
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-        targets = ids.to(x_full.device)
-        lm_w = self.lm_head.weight
-        if hasattr(lm_w, "ds_numel"):
+        lm_w   = self.lm_head.weight
+        if hasattr(lm_w, "ds_numel"):                   # ZeRO-3 sharded weight
             with GatheredParameters([lm_w], enabled=True):
-                lm_w = lm_w.clone()
-    
+                w = lm_w.clone()
+        else:
+            w = lm_w
+
         raw_ce = linear_cross_entropy(
-            e=x_full,
-            c=lm_w,
-            targets=targets,
+            e=x_processed,          # (B, T_local, D)
+            c=w,                    # vocab weight
+            targets=ids_local,      # (B, T_local)
             ignore_index=pad_id,
-            reduction=reduction,
+            reduction="sum",        # sum so we can globally average later
             shift=1
         )
-    
-        # 6. build the scaled loss for back‑prop
-        scaled = raw_ce / world_size
+
+        # count real targets on this shard (drop the first token per shard)
+        n_local = (ids_local[:, 1:] != pad_id).sum()
+
+        # 5) all-reduce loss and token count so every rank has the global mean
+        if world_size > 1:
+            with torch.no_grad():
+                dist.all_reduce(raw_ce)
+                dist.all_reduce(n_local)
+
+        # 6) final loss
+        loss = raw_ce / n_local.clamp(min=1)
         if self.training and total_aux.item() != 0:
-            scaled += total_aux / world_size
-    
-        # 7. log the full CE but return the scaled version
-        print(raw_ce.detach(), "loss!!")
-        return scaled
+            loss = loss + total_aux
+
+        return loss
 
     def forward_embeddings_only(self, input_ids, attention_mask=None):
         """Forward pass returning final hidden states (before LM head)."""
