@@ -129,6 +129,7 @@ def main():
     parser.add_argument("--context_window", type=int, help="Max context window")
     parser.add_argument("--epochs", type=int, help="Number of training epochs override")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
+    parser.add_argument("--ebm_lr", type=float, default=1e-4, help="learning rate for Energy-Based Model fine‐tuning")
     parser.add_argument("--deepspeed_config", type=str, default="utils/deepspeed_config.json",
                         help="Path to the DeepSpeed config file")
     parser.add_argument("--stages", type=str, default="1,2,3,4", help="Comma-separated list of training stages to execute (1–4).")
