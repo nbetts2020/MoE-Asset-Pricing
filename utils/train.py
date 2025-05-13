@@ -18,7 +18,14 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
 # Import the helper function to update RoPE buffers.
-from utils.model import update_model_rope_for_extended_context, expand_pos_embedding
+from utils.model import update_model_rope_for_extended_context
+
+STAGE_TAG = {
+    1: "normal_pretrained",
+    2: "continual_pretrained_64k",
+    3: "supervised_finetuned_coconut",
+    4: "model_with_ebm",
+}
 
 def extract_label_value(decoded_text):
     """
@@ -115,294 +122,318 @@ def train_model(
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
+    # -----------------------------------------------
+    # If we’re *starting* at stage >1, restore the
+    # checkpoint produced by the previous stage
+    # -----------------------------------------------
+    min_stage = min(args.stages)
+    if min_stage > 1:
+        prev_tag = STAGE_TAG[min_stage - 1]
+        ckpt_dir = os.path.join(args.save_dir, prev_tag)
+        if not os.path.isdir(ckpt_dir):
+            raise FileNotFoundError(
+                f"Cannot start at stage {min_stage}: checkpoint {prev_tag} not found in {ckpt_dir}"
+            )
+    
+        if use_deepspeed:
+            # `load_checkpoint` leaves the engine on the right device & dtype
+            engine.load_checkpoint(args.save_dir, tag=prev_tag)
+        else:
+            path = os.path.join(ckpt_dir, "model.pth")
+            real_model.load_state_dict(torch.load(path, map_location="cpu"))
+        logging.info(f"Loaded checkpoint for stage {min_stage-1} ({prev_tag})")
+
     # ------------------------------------------------------------------------
     # PHASE 1: Normal Pretraining (ft_dataset_1)
     # ------------------------------------------------------------------------
-    logging.info(f"Starting normal pretraining on rank {rank}.")
-    logging.info(f"Dataloader length: {len(dataloader)} batches.")
-    PRETRAIN_EPOCHS = epochs
-
-    marker_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
-    m_len      = len(marker_ids)
+    if 1 in args.stages:
+        logging.info(f"Starting normal pretraining on rank {rank}.")
+        logging.info(f"Dataloader length: {len(dataloader)} batches.")
+        PRETRAIN_EPOCHS = epochs
     
-    for epoch in range(1, PRETRAIN_EPOCHS + 1):
-        real_model.train()
-        epoch_loss = 0.0
-        for step, batch in enumerate(dataloader):
-            print(step, len(dataloader), "progress!!")
+        marker_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+        m_len      = len(marker_ids)
+        
+        for epoch in range(1, PRETRAIN_EPOCHS + 1):
+            real_model.train()
+            epoch_loss = 0.0
+            for step, batch in enumerate(dataloader):
+                print(step, len(dataloader), "progress!!")
+        
+                if (step + 1) % 150 == 0:
+                    with torch.no_grad():
+                        sample_ids  = batch["input_ids"][:5].to(device)
+                        true_prices = batch["labels"][:5].tolist()
+                
+                        preds = []
+                        for ids in sample_ids:
+                            ids_list   = ids.tolist()
+                            marker_pos = next(
+                                (j + m_len for j in range(len(ids_list) - m_len + 1)
+                                 if ids_list[j: j + m_len] == marker_ids),
+                                None
+                            )
+                            if marker_pos is None:
+                                preds.append("〈n/a〉")
+                                continue
+                
+                            prefix  = ids[:marker_pos].unsqueeze(0)
+                            gen_ids = greedy_generate_tail(real_model, prefix, max_new_tokens=6)
+                            preds.append(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
+                
+                    # **only rank-0 prints**
+                    if rank == 0:
+                        for i, pred in enumerate(preds):
+                            print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred}")
     
-            if (step + 1) % 150 == 0:
-                with torch.no_grad():
-                    sample_ids  = batch["input_ids"][:5].to(device)
-                    true_prices = batch["labels"][:5].tolist()
-            
-                    preds = []
-                    for ids in sample_ids:
-                        ids_list   = ids.tolist()
-                        marker_pos = next(
-                            (j + m_len for j in range(len(ids_list) - m_len + 1)
-                             if ids_list[j: j + m_len] == marker_ids),
-                            None
-                        )
-                        if marker_pos is None:
-                            preds.append("〈n/a〉")
-                            continue
-            
-                        prefix  = ids[:marker_pos].unsqueeze(0)
-                        gen_ids = greedy_generate_tail(real_model, prefix, max_new_tokens=6)
-                        preds.append(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
-            
-                # **only rank-0 prints**
-                if rank == 0:
-                    for i, pred in enumerate(preds):
-                        print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred}")
-
-
-            input_ids = batch['input_ids'].to(device)
-            input_ids = pad_to_global(input_ids)
-            loss = real_model.forward_next_token_efficient(
-                input_ids, reduction="mean"
-            )
-
-            if use_deepspeed:
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                adam_optimizer.step()
-
-            # online learning penalties
-            if args.use_si and si:
-                si.update_weights(model)
-            if args.use_ewc and ewc:
-                for ewc_inst in ewc:
-                    loss = loss + args.lambda_ewc * ewc_inst.penalty(model)
-            if replay_buffer and len(replay_buffer.buffer) > 0:
-                replay_loss = replay_buffer.replay_and_calculate_loss(
-                    model=model,
-                    tokenizer=tokenizer,
-                    replay_batch_size=args.replay_batch_size,
-                    device=device,
-                    alpha=args.replay_buffer_weight
+    
+                input_ids = batch['input_ids'].to(device)
+                input_ids = pad_to_global(input_ids)
+                loss = real_model.forward_next_token_efficient(
+                    input_ids, reduction="mean"
                 )
-                loss = loss + replay_loss
-
-            epoch_loss += loss.item()
-        logging.info(f"[Normal Pretrain] Epoch {epoch}/{PRETRAIN_EPOCHS}, Avg Loss: {epoch_loss/len(dataloader):.4f}")
-
-    # save checkpoint...
-    pretrain_tag = "normal_pretrained"
-    pretrain_dir = os.path.join(args.save_dir, pretrain_tag)
-    os.makedirs(pretrain_dir, exist_ok=True)
-    if use_deepspeed:
-        engine.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
-    else:
-        torch.save(model.state_dict(), os.path.join(pretrain_dir, "model.pth"))
-
-    # if only doing stage 1, exit here
-    if getattr(args, "stage_1_only", False):
-        logging.info("stage_1_only=True, exiting after phase 1 pretraining.")
-        return
+    
+                if use_deepspeed:
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+                else:
+                    adam_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    adam_optimizer.step()
+    
+                # online learning penalties
+                if args.use_si and si:
+                    si.update_weights(model)
+                if args.use_ewc and ewc:
+                    for ewc_inst in ewc:
+                        loss = loss + args.lambda_ewc * ewc_inst.penalty(model)
+                if replay_buffer and len(replay_buffer.buffer) > 0:
+                    replay_loss = replay_buffer.replay_and_calculate_loss(
+                        model=model,
+                        tokenizer=tokenizer,
+                        replay_batch_size=args.replay_batch_size,
+                        device=device,
+                        alpha=args.replay_buffer_weight
+                    )
+                    loss = loss + replay_loss
+    
+                epoch_loss += loss.item()
+            logging.info(f"[Normal Pretrain] Epoch {epoch}/{PRETRAIN_EPOCHS}, Avg Loss: {epoch_loss/len(dataloader):.4f}")
+    
+        # save checkpoint...
+        pretrain_tag = "normal_pretrained"
+        pretrain_dir = os.path.join(args.save_dir, pretrain_tag)
+        os.makedirs(pretrain_dir, exist_ok=True)
+        if use_deepspeed:
+            engine.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
+        else:
+            torch.save(model.state_dict(), os.path.join(pretrain_dir, "model.pth"))
+    
+        # if only doing stage 1, exit here
+        if getattr(args, "stage_1_only", False):
+            logging.info("stage_1_only=True, exiting after phase 1 pretraining.")
+            return
 
     # ------------------------------------------------------------------------
     # PHASE 2: Continual Pretraining (64k context ft_dataset_1)
     # ------------------------------------------------------------------------
-    logging.info("=== Starting Continual Pretraining with Extended Context ===")
-    config.BLOCK_SIZE = 65536
-    config.CONTEXT_WINDOW = 65536
-    real_model.tokenizer.model_max_length = config.CONTEXT_WINDOW
-    expand_pos_embedding(model, new_seq_len=config.BLOCK_SIZE)
-    update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
-
-    from utils.utils import prepare_optimizer
-    new_opts = prepare_optimizer(model, args)
-    if use_deepspeed:
-        engine.optimizer = new_opts["main"]
-    else:
-        adam_optimizer  = new_opts["main"]
-
-    continual_loader = prepare_ft_dataloader(
-        tokenizer,
-        block_size=config.BLOCK_SIZE,
-        shuffle=False,
-        args=args,
-        stage=1
-    )
-    for epoch in range(1, 2):
-        real_model.train()
-        epoch_loss = 0.0
-        for batch in continual_loader:
-            input_ids = batch['input_ids'].to(device)
-            input_ids = pad_to_global(input_ids)
-            loss = real_model.forward_next_token_efficient(
-                input_ids, reduction="mean"
-            )
-            if use_deepspeed:
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                adam_optimizer.step()
-
-            epoch_loss += loss.item()
-        logging.info(f"[Continual] Epoch {epoch}/1, Avg Loss: {epoch_loss/len(continual_loader):.4f}")
-
-    # save checkpoint...
-    continual_tag = "continual_pretrained_64k"
-    continual_dir = os.path.join(args.save_dir, continual_tag)
-    os.makedirs(continual_dir, exist_ok=True)
-    if use_deepspeed:
-        engine.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
-    else:
-        torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
+    if 2 in args.stages:
+        logging.info("=== Starting Continual Pretraining with Extended Context ===")
+        config.BLOCK_SIZE = 65536
+        config.CONTEXT_WINDOW = 65536
+        real_model.tokenizer.model_max_length = config.CONTEXT_WINDOW
+        update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
+    
+        from utils.utils import prepare_optimizer
+        new_opts = prepare_optimizer(model, args)
+        if use_deepspeed:
+            engine.optimizer = new_opts["main"]
+        else:
+            adam_optimizer  = new_opts["main"]
+    
+        continual_loader = prepare_ft_dataloader(
+            tokenizer,
+            block_size=config.BLOCK_SIZE,
+            shuffle=False,
+            args=args,
+            stage=1
+        )
+        for epoch in range(1, 2):
+            real_model.train()
+            epoch_loss = 0.0
+            for batch in continual_loader:
+                input_ids = batch['input_ids'].to(device)
+                input_ids = pad_to_global(input_ids)
+                loss = real_model.forward_next_token_efficient(
+                    input_ids, reduction="mean"
+                )
+                if use_deepspeed:
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+                else:
+                    adam_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    adam_optimizer.step()
+    
+                epoch_loss += loss.item()
+            logging.info(f"[Continual] Epoch {epoch}/1, Avg Loss: {epoch_loss/len(continual_loader):.4f}")
+    
+        # save checkpoint...
+        continual_tag = "continual_pretrained_64k"
+        continual_dir = os.path.join(args.save_dir, continual_tag)
+        os.makedirs(continual_dir, exist_ok=True)
+        if use_deepspeed:
+            engine.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
+        else:
+            torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
 
     # ------------------------------------------------------------------------
     # PHASE 3: Supervised Fine-Tuning with Coconut (ft_dataset_2)
     # ------------------------------------------------------------------------
-    logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
-    config.LEARNING_RATE = 1e-5
-    config.LR_DECAY = 0.95
-    config.DROPOUT = 0.05
-
-    for sub_epoch in range(2):
-        gradual = (sub_epoch == 0)
-        ft_loader = prepare_ft_dataloader(
-            tokenizer,
-            block_size=config.BLOCK_SIZE,
-            shuffle=True,
-            args=args,
-            stage=2,
-            gradual_latent_mask=gradual,
-            full_latent_mask=not gradual
-        )
-        real_model.train()
-        epoch_loss = 0.0
-        for batch in ft_loader:
-            input_ids = batch['input_ids'].to(device)
-            input_ids = pad_to_global(input_ids)
-
-            loss = real_model.forward_coconut(
-                input_ids=input_ids,
-                attention_mask=None,
-                labels=input_ids,
-                latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
-                reduction="mean"
-            )
-
-            if use_deepspeed:
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                adam_optimizer.step()
-
-            epoch_loss += loss.item()
-        logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
-
-    # save checkpoint...
-    coconut_tag = "supervised_finetuned_coconut"
-    coconut_dir = os.path.join(args.save_dir, coconut_tag)
-    os.makedirs(coconut_dir, exist_ok=True)
-    if use_deepspeed:
-        engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
-    else:
-        torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth"))
-
-    # ------------------------------------------------------------------------
-    # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
-    # ------------------------------------------------------------------------
-    logging.info("=== Starting EBM Fine-Tuning Phase ===")
-    ebm_optimizer = torch.optim.Adam(model.ebm.parameters(), lr=args.ebm_lr)
-    margin = getattr(args, "ebm_margin", 1.0)
-
-    for epoch in range(1, args.ebm_epochs + 1):
-        real_model.ebm.train()
-        total_loss = 0.0
-        steps = 0
-
-        for stage in range(3, 8):
-            ebm_loader = prepare_ft_dataloader(
+    if 3 in args.stages:
+        logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
+        config.LEARNING_RATE = 1e-5
+        config.LR_DECAY = 0.95
+        config.DROPOUT = 0.05
+    
+        for sub_epoch in range(2):
+            gradual = (sub_epoch == 0)
+            ft_loader = prepare_ft_dataloader(
                 tokenizer,
                 block_size=config.BLOCK_SIZE,
                 shuffle=True,
                 args=args,
-                stage=stage
+                stage=2,
+                gradual_latent_mask=gradual,
+                full_latent_mask=not gradual
             )
-            for batch in ebm_loader:
+            real_model.train()
+            epoch_loss = 0.0
+            for batch in ft_loader:
+                input_ids = batch['input_ids'].to(device)
+                input_ids = pad_to_global(input_ids)
+    
+                loss = real_model.forward_coconut(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    labels=input_ids,
+                    latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
+                    reduction="mean"
+                )
+    
+                if use_deepspeed:
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+                else:
+                    adam_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    adam_optimizer.step()
+    
+                epoch_loss += loss.item()
+            logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
+    
+        # save checkpoint...
+        coconut_tag = "supervised_finetuned_coconut"
+        coconut_dir = os.path.join(args.save_dir, coconut_tag)
+        os.makedirs(coconut_dir, exist_ok=True)
+        if use_deepspeed:
+            engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
+        else:
+            torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth"))
+
+    # ------------------------------------------------------------------------
+    # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
+    # ------------------------------------------------------------------------
+    if 4 in args.stages:
+        logging.info("=== Starting EBM Fine-Tuning Phase ===")
+        ebm_optimizer = torch.optim.Adam(model.ebm.parameters(), lr=args.ebm_lr)
+        margin = getattr(args, "ebm_margin", 1.0)
+    
+        for epoch in range(1, args.ebm_epochs + 1):
+            real_model.ebm.train()
+            total_loss = 0.0
+            steps = 0
+    
+            for stage in range(3, 8):
+                ebm_loader = prepare_ft_dataloader(
+                    tokenizer,
+                    block_size=config.BLOCK_SIZE,
+                    shuffle=True,
+                    args=args,
+                    stage=stage
+                )
+                for batch in ebm_loader:
+                    ids = batch['input_ids'].to(device)
+                    ids = pad_to_global(input_ids)
+                    B, K, T = ids.shape
+                    flat_ids = ids.view(B*K, T)
+    
+                    with torch.no_grad():
+                        embs = real_model.get_embeddings(flat_ids, pool=True)
+                    embs = embs.view(B, K, -1)
+    
+                    flat_embs = embs.view(B*K, -1)
+                    energies = real_model.ebm(flat_embs).view(B, K)
+    
+                    pos_idx = energies.argmin(dim=1)
+                    pos_en = energies[torch.arange(B), pos_idx]
+                    neg_mask = torch.ones_like(energies, dtype=torch.bool)
+                    neg_mask[torch.arange(B), pos_idx] = False
+                    neg_en = energies[neg_mask].view(B, K-1)
+    
+                    loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                    ebm_optimizer.zero_grad()
+                    loss.backward()
+                    ebm_optimizer.step()
+    
+                    total_loss += loss.item()
+                    steps += 1
+    
+            logging.info(f"[EBM FT] Epoch {epoch}/{args.ebm_epochs}, Avg Loss: {total_loss/steps:.4f}")
+    
+        # validation on ft_dataset_8
+        logging.info("=== EBM Validation ===")
+        real_model.ebm.eval()
+        val_loader = prepare_ft_dataloader(
+            tokenizer,
+            block_size=config.BLOCK_SIZE,
+            shuffle=False,
+            args=args,
+            stage=8
+        )
+        val_loss = 0.0
+        steps = 0
+        with torch.no_grad():
+            for batch in val_loader:
                 ids = batch['input_ids'].to(device)
-                ids = pad_to_global(input_ids)
+                ids = pad_to_global(ids)
                 B, K, T = ids.shape
                 flat_ids = ids.view(B*K, T)
-
-                with torch.no_grad():
-                    embs = real_model.get_embeddings(flat_ids, pool=True)
-                embs = embs.view(B, K, -1)
-
-                flat_embs = embs.view(B*K, -1)
-                energies = real_model.ebm(flat_embs).view(B, K)
-
+                embs = real_model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
+                energies = real_model.ebm(embs.view(B*K, -1)).view(B, K)
                 pos_idx = energies.argmin(dim=1)
                 pos_en = energies[torch.arange(B), pos_idx]
                 neg_mask = torch.ones_like(energies, dtype=torch.bool)
                 neg_mask[torch.arange(B), pos_idx] = False
                 neg_en = energies[neg_mask].view(B, K-1)
-
                 loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
-                ebm_optimizer.zero_grad()
-                loss.backward()
-                ebm_optimizer.step()
-
-                total_loss += loss.item()
+                val_loss += loss.item()
                 steps += 1
-
-        logging.info(f"[EBM FT] Epoch {epoch}/{args.ebm_epochs}, Avg Loss: {total_loss/steps:.4f}")
-
-    # validation on ft_dataset_8
-    logging.info("=== EBM Validation ===")
-    real_model.ebm.eval()
-    val_loader = prepare_ft_dataloader(
-        tokenizer,
-        block_size=config.BLOCK_SIZE,
-        shuffle=False,
-        args=args,
-        stage=8
-    )
-    val_loss = 0.0
-    steps = 0
-    with torch.no_grad():
-        for batch in val_loader:
-            ids = batch['input_ids'].to(device)
-            ids = pad_to_global(ids)
-            B, K, T = ids.shape
-            flat_ids = ids.view(B*K, T)
-            embs = real_model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
-            energies = real_model.ebm(embs.view(B*K, -1)).view(B, K)
-            pos_idx = energies.argmin(dim=1)
-            pos_en = energies[torch.arange(B), pos_idx]
-            neg_mask = torch.ones_like(energies, dtype=torch.bool)
-            neg_mask[torch.arange(B), pos_idx] = False
-            neg_en = energies[neg_mask].view(B, K-1)
-            loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
-            val_loss += loss.item()
-            steps += 1
-    logging.info(f"[EBM Val] Avg Loss: {val_loss/steps:.4f}")
-
-    # save final model+EBM
-    final_tag = "model_with_ebm"
-    final_dir = os.path.join(args.save_dir, final_tag)
-    os.makedirs(final_dir, exist_ok=True)
-    if use_deepspeed:
-        engine.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
-    else:
-        torch.save(model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
-
-    logging.info("Training complete.")
+        logging.info(f"[EBM Val] Avg Loss: {val_loss/steps:.4f}")
+    
+        # save final model+EBM
+        final_tag = "model_with_ebm"
+        final_dir = os.path.join(args.save_dir, final_tag)
+        os.makedirs(final_dir, exist_ok=True)
+        if use_deepspeed:
+            engine.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
+        else:
+            torch.save(model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
+    
+        logging.info("Training complete.")
