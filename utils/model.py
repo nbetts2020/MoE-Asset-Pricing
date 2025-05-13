@@ -751,8 +751,3 @@ def update_model_rope_for_extended_context(model, new_seq_len, base: float = 10_
             logging.info(f"Tokenizer max_length updated to {model.block_size}")
 
     return model
-
-def expand_pos_embedding(*args, **kwargs):
-    """Deprecated: no-op when using RoPE."""
-    logging.warning("expand_pos_embedding is deprecated and does nothing.")
-    pass
