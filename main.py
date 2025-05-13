@@ -133,12 +133,12 @@ def main():
                         help="Path to the DeepSpeed config file")
     parser.add_argument("--stages", type=str, default="1,2,3,4", help="Comma-separated list of training stages to execute (1–4).")
 
+    args = parser.parse_args()
+    print_debug_info("AFTER ARGPARSE")
+
     args.stages = sorted({int(s.strip()) for s in args.stages.split(",") if s.strip()})
     if not all(1 <= s <= 4 for s in args.stages):
         raise ValueError("--stages must contain integers 1-4")
-
-    args = parser.parse_args()
-    print_debug_info("AFTER ARGPARSE")
 
     # Handle small/test-mode hyperparameters
     if args.test_model:
