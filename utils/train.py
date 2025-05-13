@@ -77,7 +77,7 @@ def local_logits(model, ids_local, mask_local):
 
 def train_model(
     model,
-    optimizer,      # Single optimizer for main model
+    optimizer,      # single optimizer for main model
     epochs,
     device,
     dataloader,
@@ -86,210 +86,227 @@ def train_model(
     ewc=None,
     replay_buffer=None,
     tokenizer=None,
-    use_deepspeed=False
+    use_deepspeed=False,
 ):
     """
     Training loop:
-      1. Normal pretraining (ft_dataset_1)
-      2. Continual pretraining with 64k context (ft_dataset_1)
-      3. Supervised fine-tuning with Coconut (ft_dataset_2)
-      4. EBM fine-tuning on bootstrap datasets (ft_dataset_3-7) + validation on ft_dataset_8
-
-    If args.stage_1_only == True, only phase 1 is run and the function returns immediately after saving.
+      1. Normal pre-training          (ft_dataset_1)
+      2. Continual pre-training 64 k   (ft_dataset_1)
+      3. Supervised fine-tuning        (ft_dataset_2)
+      4. EBM fine-tuning + validation  (ft_dataset_3-8)
     """
 
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    T_local    = config.BLOCK_SIZE // world_size
-
-    def pad_to_global(ids: torch.Tensor) -> torch.Tensor:
-        B, T = ids.shape
-        target = world_size * T_local
-        if T < target:
-            pad = torch.full((B, target - T),
-                             model.tokenizer.pad_token_id,
-                             device=ids.device, dtype=ids.dtype)
-            return torch.cat([ids, pad], dim=1)
-        else:
-            # trim any over‑long sequence from the left
-            return ids[:, -target:]
-
+    # --------------------------------------------------------------------- #
+    #  Pick the *real* model object (engine.module when using DeepSpeed)
+    # --------------------------------------------------------------------- #
     if use_deepspeed:
-        engine = model
-        real_model = engine.module
+        engine      = model
+        real_model  = engine.module
     else:
+        engine      = None
         adam_optimizer = optimizer
-        real_model = model
+        real_model  = model
 
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank       = dist.get_rank()       if dist.is_initialized() else 0
 
-    # -----------------------------------------------
-    # If we’re *starting* at stage >1, restore the
-    # checkpoint produced by the previous stage
-    # -----------------------------------------------
+    # --------------------------------------------------------------------- #
+    #  Helper: pad (or left-trim) to the model’s *current* global context
+    # --------------------------------------------------------------------- #
+    def pad_to_global(ids: torch.Tensor) -> torch.Tensor:
+        """
+        Pad / trim *on the left* so every sample is exactly
+        real_model.block_size tokens long, then return that full-length
+        tensor (sharding happens later inside forward).
+        """
+        B, T = ids.shape
+        T_full    = real_model.block_size           # single source of truth
+        pad_id    = real_model.tokenizer.pad_token_id
+
+        if T < T_full:
+            pad = torch.full(
+                (B, T_full - T), pad_id,
+                dtype=ids.dtype, device=ids.device
+            )
+            full = torch.cat([ids, pad], dim=1)
+        else:
+            full = ids[:, -T_full:]                 # trim from the left
+
+        return full
+    # --------------------------------------------------------------------- #
+
+    # -----------------------------------------------------------
+    #  If we start at stage > 1, restore the previous checkpoint
+    # -----------------------------------------------------------
     min_stage = min(args.stages)
     if min_stage > 1:
         prev_tag = STAGE_TAG[min_stage - 1]
         ckpt_dir = os.path.join(args.save_dir, prev_tag)
         if not os.path.isdir(ckpt_dir):
             raise FileNotFoundError(
-                f"Cannot start at stage {min_stage}: checkpoint {prev_tag} not found in {ckpt_dir}"
+                f"Cannot start at stage {min_stage}: checkpoint '{prev_tag}' "
+                f"not found in {ckpt_dir}"
             )
-    
-        if use_deepspeed:
-            # `load_checkpoint` leaves the engine on the right device & dtype
+
+        if engine:
             engine.load_checkpoint(args.save_dir, tag=prev_tag)
         else:
             path = os.path.join(ckpt_dir, "model.pth")
             real_model.load_state_dict(torch.load(path, map_location="cpu"))
-        logging.info(f"Loaded checkpoint for stage {min_stage-1} ({prev_tag})")
+        logging.info(f"Loaded checkpoint from previous stage '{prev_tag}'")
 
-    # ------------------------------------------------------------------------
-    # PHASE 1: Normal Pretraining (ft_dataset_1)
-    # ------------------------------------------------------------------------
+    # ===================================================================== #
+    #  PHASE 1 – Normal pre-training
+    # ===================================================================== #
     if 1 in args.stages:
-        logging.info(f"Starting normal pretraining on rank {rank}.")
-        logging.info(f"Dataloader length: {len(dataloader)} batches.")
+        logging.info(f"→ Phase 1: normal pre-training (rank {rank})")
         PRETRAIN_EPOCHS = epochs
-    
-        marker_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
-        m_len      = len(marker_ids)
-        
+
+        marker_ids = tokenizer(
+            "<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False
+        ).input_ids
+        m_len = len(marker_ids)
+
         for epoch in range(1, PRETRAIN_EPOCHS + 1):
             real_model.train()
             epoch_loss = 0.0
             for step, batch in enumerate(dataloader):
                 print(step, len(dataloader), "progress!!")
-        
+                # -------- quick sanity print every 150 mini-batches ----------
                 if (step + 1) % 150 == 0:
                     with torch.no_grad():
                         sample_ids  = batch["input_ids"][:5].to(device)
                         true_prices = batch["labels"][:5].tolist()
-                
+
                         preds = []
                         for ids in sample_ids:
-                            ids_list   = ids.tolist()
+                            ids_list = ids.tolist()
                             marker_pos = next(
                                 (j + m_len for j in range(len(ids_list) - m_len + 1)
-                                 if ids_list[j: j + m_len] == marker_ids),
-                                None
+                                 if ids_list[j:j + m_len] == marker_ids),
+                                None,
                             )
                             if marker_pos is None:
                                 preds.append("〈n/a〉")
                                 continue
-                
                             prefix  = ids[:marker_pos].unsqueeze(0)
-                            gen_ids = greedy_generate_tail(real_model, prefix, max_new_tokens=6)
-                            preds.append(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
-                
-                    # **only rank-0 prints**
-                    if rank == 0:
-                        for i, pred in enumerate(preds):
-                            print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred}")
-    
-    
-                input_ids = batch['input_ids'].to(device)
-                input_ids = pad_to_global(input_ids)
+                            gen_ids = greedy_generate_tail(
+                                real_model, prefix, max_new_tokens=6
+                            )
+                            preds.append(
+                                tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+                            )
+                        if rank == 0:
+                            for i, pred in enumerate(preds):
+                                print(
+                                    f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, "
+                                    f"pred → {pred}"
+                                )
+                # ------------------------------------------------------------
+
+                input_ids = pad_to_global(batch["input_ids"].to(device))
                 loss = real_model.forward_next_token_efficient(
                     input_ids, reduction="mean"
                 )
-    
-                if use_deepspeed:
-                    engine.zero_grad()
-                    engine.backward(loss)
-                    engine.step()
+
+                if engine:
+                    engine.zero_grad(); engine.backward(loss); engine.step()
                 else:
                     adam_optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
                     adam_optimizer.step()
-    
-                # online learning penalties
+
+                # regularisers / replay
                 if args.use_si and si:
-                    si.update_weights(model)
+                    si.update_weights(real_model)
                 if args.use_ewc and ewc:
                     for ewc_inst in ewc:
-                        loss = loss + args.lambda_ewc * ewc_inst.penalty(model)
-                if replay_buffer and len(replay_buffer.buffer) > 0:
-                    replay_loss = replay_buffer.replay_and_calculate_loss(
-                        model=model,
+                        loss = loss + args.lambda_ewc * ewc_inst.penalty(real_model)
+                if replay_buffer and len(replay_buffer.buffer):
+                    loss += replay_buffer.replay_and_calculate_loss(
+                        model=real_model,
                         tokenizer=tokenizer,
                         replay_batch_size=args.replay_batch_size,
                         device=device,
-                        alpha=args.replay_buffer_weight
+                        alpha=args.replay_buffer_weight,
                     )
-                    loss = loss + replay_loss
-    
+
                 epoch_loss += loss.item()
-            logging.info(f"[Normal Pretrain] Epoch {epoch}/{PRETRAIN_EPOCHS}, Avg Loss: {epoch_loss/len(dataloader):.4f}")
-    
-        # save checkpoint...
-        pretrain_tag = "normal_pretrained"
-        pretrain_dir = os.path.join(args.save_dir, pretrain_tag)
-        os.makedirs(pretrain_dir, exist_ok=True)
-        if use_deepspeed:
-            engine.save_checkpoint(args.save_dir, tag=pretrain_tag, client_state={})
+
+            logging.info(
+                f"[Phase 1] Epoch {epoch}/{PRETRAIN_EPOCHS} — "
+                f"avg loss {epoch_loss/len(dataloader):.4f}"
+            )
+
+        # save after phase 1
+        tag = STAGE_TAG[1]
+        if engine:
+            engine.save_checkpoint(args.save_dir, tag=tag)
         else:
-            torch.save(model.state_dict(), os.path.join(pretrain_dir, "model.pth"))
-    
-        # if only doing stage 1, exit here
+            os.makedirs(os.path.join(args.save_dir, tag), exist_ok=True)
+            torch.save(
+                real_model.state_dict(),
+                os.path.join(args.save_dir, tag, "model.pth"),
+            )
+
         if getattr(args, "stage_1_only", False):
-            logging.info("stage_1_only=True, exiting after phase 1 pretraining.")
+            logging.info("stage_1_only=True → stopping after phase 1")
             return
 
-    # ------------------------------------------------------------------------
-    # PHASE 2: Continual Pretraining (64k context ft_dataset_1)
-    # ------------------------------------------------------------------------
+    # ===================================================================== #
+    #  PHASE 2 – Continual pre-training with extended context
+    # ===================================================================== #
     if 2 in args.stages:
-        logging.info("=== Starting Continual Pretraining with Extended Context ===")
-        config.BLOCK_SIZE = 65536
-        config.CONTEXT_WINDOW = 65536
-        real_model.tokenizer.model_max_length = config.CONTEXT_WINDOW
-        update_model_rope_for_extended_context(model, new_seq_len=config.BLOCK_SIZE, base=500000.0)
-    
+        logging.info("→ Phase 2: continual pre-training (64 k context)")
+
+        NEW_LEN = 2048
+        # one call updates RoPE *and* sets real_model.block_size/tokenizer
+        update_model_rope_for_extended_context(real_model, new_seq_len=NEW_LEN,
+                                               base=500_000.0)
+
+        # new optimiser (LR schedule, new parameters, …)
         from utils.utils import prepare_optimizer
-        new_opts = prepare_optimizer(model, args)
-        if use_deepspeed:
-            engine.optimizer = new_opts["main"]
+        new_opts = prepare_optimizer(real_model, args)
+        if engine:
+            logging.info("DeepSpeed engine retains its optimizer")
         else:
-            adam_optimizer  = new_opts["main"]
-    
+            adam_optimizer = new_opts["main"]
+
         continual_loader = prepare_ft_dataloader(
-            tokenizer,
-            block_size=config.BLOCK_SIZE,
-            shuffle=False,
-            args=args,
-            stage=1
+            tokenizer, block_size=real_model.block_size,
+            shuffle=False, args=args, stage=1
         )
-        for epoch in range(1, 2):
-            real_model.train()
-            epoch_loss = 0.0
-            for batch in continual_loader:
-                input_ids = batch['input_ids'].to(device)
-                input_ids = pad_to_global(input_ids)
-                loss = real_model.forward_next_token_efficient(
-                    input_ids, reduction="mean"
-                )
-                if use_deepspeed:
-                    engine.zero_grad()
-                    engine.backward(loss)
-                    engine.step()
-                else:
-                    adam_optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
-                    adam_optimizer.step()
-    
-                epoch_loss += loss.item()
-            logging.info(f"[Continual] Epoch {epoch}/1, Avg Loss: {epoch_loss/len(continual_loader):.4f}")
-    
-        # save checkpoint...
-        continual_tag = "continual_pretrained_64k"
-        continual_dir = os.path.join(args.save_dir, continual_tag)
-        os.makedirs(continual_dir, exist_ok=True)
-        if use_deepspeed:
-            engine.save_checkpoint(args.save_dir, tag=continual_tag, client_state={})
+
+        real_model.train()
+        epoch_loss = 0.0
+        for batch in continual_loader:
+            input_ids = pad_to_global(batch["input_ids"].to(device))
+            loss = real_model.forward_next_token_efficient(
+                input_ids, reduction="mean"
+            )
+
+            if engine:
+                engine.zero_grad(); engine.backward(loss); engine.step()
+            else:
+                adam_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
+                adam_optimizer.step()
+
+            epoch_loss += loss.item()
+
+        logging.info(f"[Phase 2] Avg loss {epoch_loss/len(continual_loader):.4f}")
+
+        tag = STAGE_TAG[2]
+        if engine:
+            engine.save_checkpoint(args.save_dir, tag=tag)
         else:
-            torch.save(model.state_dict(), os.path.join(continual_dir, "model.pth"))
+            os.makedirs(os.path.join(args.save_dir, tag), exist_ok=True)
+            torch.save(
+                real_model.state_dict(),
+                os.path.join(args.save_dir, tag, "model.pth"),
+            )
 
     # ------------------------------------------------------------------------
     # PHASE 3: Supervised Fine-Tuning with Coconut (ft_dataset_2)
