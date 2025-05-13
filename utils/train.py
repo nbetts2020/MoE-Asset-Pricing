@@ -314,25 +314,32 @@ def train_model(
     if 3 in args.stages:
         logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
         config.LEARNING_RATE = 1e-5
-        config.LR_DECAY = 0.95
-        config.DROPOUT = 0.05
+        config.LR_DECAY      = 0.95
+    
+        # Prepare one loader (loads the parquet only once)
+        ft_loader = prepare_ft_dataloader(
+            tokenizer=tokenizer,
+            block_size=config.BLOCK_SIZE,
+            shuffle=True,
+            args=args,
+            stage=2,
+            gradual_latent_mask=True,    # start with gradual masking
+            full_latent_mask=False
+        )
     
         for sub_epoch in range(2):
+            # Toggle masking flags in-place
             gradual = (sub_epoch == 0)
-            ft_loader = prepare_ft_dataloader(
-                tokenizer,
-                block_size=config.BLOCK_SIZE,
-                shuffle=True,
-                args=args,
-                stage=2,
-                gradual_latent_mask=gradual,
-                full_latent_mask=not gradual
-            )
+            ds      = ft_loader.dataset
+            ds.gradual_latent_mask = gradual
+            ds.full_latent_mask    = not gradual
+    
             real_model.train()
             epoch_loss = 0.0
-            for batch in ft_loader:
-                input_ids = batch['input_ids'].to(device)
-                input_ids = pad_to_global(input_ids)
+    
+            for step, batch in enumerate(ft_loader):
+                print(step, len(ft_loader), "coconut progress!!")
+                input_ids = pad_to_global(batch["input_ids"].to(device))
     
                 loss = real_model.forward_coconut(
                     input_ids=input_ids,
@@ -353,6 +360,7 @@ def train_model(
                     adam_optimizer.step()
     
                 epoch_loss += loss.item()
+    
             logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
     
         # save checkpoint...
@@ -371,8 +379,8 @@ def train_model(
         logging.info("=== Starting EBM Fine-Tuning Phase ===")
         ebm_optimizer = torch.optim.Adam(model.ebm.parameters(), lr=args.ebm_lr)
         margin = getattr(args, "ebm_margin", 1.0)
-    
-        for epoch in range(1, args.ebm_epochs + 1):
+        ebm_epochs = 1
+        for epoch in range(1, ebm_epochs + 1):
             real_model.ebm.train()
             total_loss = 0.0
             steps = 0
