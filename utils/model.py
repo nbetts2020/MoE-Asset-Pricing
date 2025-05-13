@@ -586,30 +586,21 @@ class SparseMoELanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,             # (B, T_global)
         attention_mask=None,
-        labels=None,                         #  ignored
-        latent_token_id=None,                #  pass  self.tokenizer.convert_tokens_to_ids('<bot>')
+        labels=None,                         # ignored
+        latent_token_id=None,                # pass self.tokenizer.convert_tokens_to_ids('<bot>')
         reduction: str = "mean",
     ):
-        """
-        Implements Coconut (Hao et al., 2024):
-        – every <bot> token starts a *latent* step
-        – its embedding is replaced by the *last* hidden state from the
-          previous token
-        – no CE loss is taken on the <bot> positions
-        Works with sequence-parallel sharding exactly like
-        `forward_next_token_efficient`.
-        """
         assert latent_token_id is not None, "pass latent_token_id=<bot>-id"
-
-        # == step-0: normal sharding boiler-plate  ────────────────────────
+    
+        # ── step 0: sharding boilerplate ────────────────────────────────────────
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank       = dist.get_rank()      if dist.is_initialized() else 0
         device     = input_ids.device
         T_glb      = self.block_size
-
+    
         ids_glb = self._pad_or_trim(input_ids, T_glb)     # (B, T_glb)
-        B, _     = ids_glb.shape
-
+        B, _    = ids_glb.shape
+    
         if world_size > 1:
             if T_glb % world_size:
                 raise ValueError("block_size not divisible by world_size")
@@ -618,93 +609,75 @@ class SparseMoELanguageModel(nn.Module):
         else:
             T_loc   = T_glb
             ids_loc = ids_glb
-
-        # build the usual causal mask (pads→0)
+    
         pad_id   = self.tokenizer.pad_token_id
         loc_mask = (ids_loc != pad_id).to(device) if attention_mask is None \
-                   else self._pad_or_trim(attention_mask.long(), T_glb)\
+                   else self._pad_or_trim(attention_mask.long(), T_glb) \
                            [:, rank*T_loc:(rank+1)*T_loc].bool()
-
-        # == step-1: clone an *embedding* matrix we can edit in-place ——───
-        emb_loc = self.token_embedding_table(ids_loc)         # (B,T_loc,D)
-
-        # we will iteratively *fill in* latent-thought embeddings, one pass
-        # per <bot>.  Track which positions are still latent:
-        lat_mask = (ids_loc == latent_token_id)               # (B,T_loc)
-        n_lat_max = lat_mask.sum(dim=1).max().item()          # worst-case K
-
-        total_aux = torch.tensor(0.0, device=device)          # MoE aux-loss
-        dtype     = emb_loc.dtype
-
-        # == multi-pass  loop  (K latent thoughts ⇒ K+1 forward passes) ──
-        prev_h = None
-        filled = torch.zeros_like(lat_mask)
-
+    
+        # ── step 1: prepare embeddings + latent mask ───────────────────────────
+        emb_loc  = self.token_embedding_table(ids_loc)    # (B, T_loc, D)
+        lat_mask = (ids_loc == latent_token_id)           # (B, T_loc)
+        n_lat_max= lat_mask.sum(dim=1).max().item()
+        total_aux= torch.tensor(0.0, device=device)
+        dtype    = emb_loc.dtype
+        filled   = torch.zeros_like(lat_mask)
+    
+        # ── step 2: multi-pass Coconut loop ────────────────────────────────────
         for _ in range(int(n_lat_max) + 1):
-
-            # -- a) run one transformer pass on the *current* embeddings
             x = self.dropout_emb(emb_loc)
             for blk in self.blocks:
                 x, aux = blk(x, mask=loc_mask)
                 if self.training:
                     total_aux += aux
-            x = self.ln_f(x)                                 # (B,T_loc,D)
-
-            # -- b) identify the *next* latent token per sample we still
-            #       need to fill; replace its embedding with the *last*
-            #       hidden state before it (continuous thought)
+            x = self.ln_f(x)  # (B, T_loc, D)
+    
+            # find next latent <bot> per sample
             with torch.no_grad():
-                # first unfinished <bot> in every sample
-                nxt_pos = ((lat_mask & ~filled).float()      # 0/1 mask
-                           .argmax(dim=1))                   # (B,)
-                # if a sample is done, argmax==0, but may not be latent
-                gather_idx = []
-                update_idx = []
+                nxt_pos = ((lat_mask & ~filled).float().argmax(dim=1))
+                gather_idx, update_idx = [], []
                 for b in range(B):
                     p = nxt_pos[b].item()
-                    if p==0 and not lat_mask[b,0]:
-                        continue               # nothing left in this sample
+                    if p == 0 and not lat_mask[b,0]:
+                        continue
                     update_idx.append((b, p))
-                    prev_h_b = x[b, p-1 if p>0 else 0]       # last hidden
-                    gather_idx.append(prev_h_b)
+                    gather_idx.append(x[b, p-1 if p>0 else 0])
                 if not update_idx:
-                    break                     # all latent tokens filled
-
-                h_stack = torch.stack(gather_idx, dim=0)     # (N,D)
+                    break
+                h_stack = torch.stack(gather_idx, dim=0)
                 for (b,p), h in zip(update_idx, h_stack):
                     emb_loc[b, p] = h.to(dtype)
-                    filled  [b, p] = True
-
-        # == step-2: final CE loss  (identical to efficient NLL) ──────────
+                    filled[b, p] = True
+    
+        # ── step 3: final cross-entropy loss ───────────────────────────────────
         lm_w = self.lm_head.weight
         if hasattr(lm_w, "ds_numel"):
             with GatheredParameters([lm_w], enabled=True):
                 w = lm_w.clone()
         else:
             w = lm_w
-
-        # ignore pads **and** latent tokens
-        ignore = torch.tensor([pad_id, latent_token_id], device=device)
-
-        raw_ce = linear_cross_entropy(
-            e=x,                       # final hidden (B,T_loc,D)
-            c=w,
-            targets=ids_loc,
-            ignore_index=ignore,
-            reduction="sum",
-            shift=1
+    
+        # mask out <bot> positions as pads, then use single ignore_index
+        targets = ids_loc.masked_fill(lat_mask, pad_id)
+        raw_ce  = linear_cross_entropy(
+            e            = x,           # (B, T_loc, D)
+            c            = w,
+            targets      = targets,
+            ignore_index = pad_id,
+            reduction    = "sum",
+            shift        = 1,
         )
-
+    
         n_local = ((~lat_mask) & (ids_loc != pad_id))[:,1:].sum()
-
         if world_size > 1:
             with torch.no_grad():
-                dist.all_reduce(raw_ce); dist.all_reduce(n_local)
-
+                dist.all_reduce(raw_ce)
+                dist.all_reduce(n_local)
+    
         loss = raw_ce / n_local.clamp(min=1)
         if self.training and total_aux.item() != 0:
             loss = loss + total_aux
-        print(loss, "loss!!")
+    
         return loss
 
 
