@@ -704,6 +704,7 @@ class SparseMoELanguageModel(nn.Module):
         loss = raw_ce / n_local.clamp(min=1)
         if self.training and total_aux.item() != 0:
             loss = loss + total_aux
+        print(loss, "loss!!")
         return loss
 
 
