@@ -308,45 +308,45 @@ def train_model(
                 os.path.join(args.save_dir, tag, "model.pth"),
             )
 
-    # ------------------------------------------------------------------------
-    # PHASE 3: Supervised Fine-Tuning with Coconut (ft_dataset_2)
-    # ------------------------------------------------------------------------
+    # ---------------------------------------------------------------------#
+    #  PHASE 3 – Supervised Coconut fine-tuning with N-stage mask schedule #
+    # ---------------------------------------------------------------------#
     if 3 in args.stages:
         logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
         config.LEARNING_RATE = 1e-5
         config.LR_DECAY      = 0.95
     
-        # Prepare one loader (loads the parquet only once)
+        # Build ONE dataloader (the parquet is read only once)
         ft_loader = prepare_ft_dataloader(
-            tokenizer=tokenizer,
-            block_size=config.BLOCK_SIZE,
-            shuffle=True,
-            args=args,
-            stage=2,
-            gradual_latent_mask=True,    # start with gradual masking
-            full_latent_mask=False
+            tokenizer   = tokenizer,
+            block_size  = config.BLOCK_SIZE,
+            shuffle     = True,
+            args        = args,
+            stage       = 2,               # ft_dataset_2
         )
+        ds: PrecomputedDataset = ft_loader.dataset        # type: ignore
     
-        for sub_epoch in range(2):
-            # Toggle masking flags in-place
-            gradual = (sub_epoch == 0)
-            ds      = ft_loader.dataset
-            ds.gradual_latent_mask = gradual
-            ds.full_latent_mask    = not gradual
+        # Iterate over the mask curriculum
+        mask_stages = getattr(config, "COCONUT_MASK_STAGES", [0.0, 1.0])
+        for stage_idx, frac in enumerate(mask_stages):
+            ds.mask_fraction = float(frac)        # schedule_masking will use this
+            logging.info(
+                f"→ Coconut stage {stage_idx+1}/{len(mask_stages)} "
+                f"— mask {frac*100:.0f}% of reasoning tokens"
+            )
     
             real_model.train()
             epoch_loss = 0.0
     
             for step, batch in enumerate(ft_loader):
-                print(step, len(ft_loader), "coconut progress!!")
                 input_ids = pad_to_global(batch["input_ids"].to(device))
     
                 loss = real_model.forward_coconut(
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    labels=input_ids,
-                    latent_token_id=model.tokenizer.convert_tokens_to_ids("<bot>"),
-                    reduction="mean"
+                    input_ids       = input_ids,
+                    attention_mask  = None,
+                    labels          = input_ids,
+                    latent_token_id = model.tokenizer.convert_tokens_to_ids("<bot>"),
+                    reduction       = "mean",
                 )
     
                 if use_deepspeed:
@@ -356,16 +356,19 @@ def train_model(
                 else:
                     adam_optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
                     adam_optimizer.step()
     
                 epoch_loss += loss.item()
     
-            logging.info(f"[Coconut] Sub-epoch {sub_epoch+1}/2, Avg Loss: {epoch_loss/len(ft_loader):.4f}")
+            logging.info(
+                f"[Coconut] Stage {stage_idx+1}/{len(mask_stages)}, "
+                f"avg loss {epoch_loss/len(ft_loader):.4f}"
+            )
     
-        # save checkpoint...
-        coconut_tag = "supervised_finetuned_coconut"
-        coconut_dir = os.path.join(args.save_dir, coconut_tag)
+        # Save checkpoint after the full curriculum
+        coconut_tag  = "supervised_finetuned_coconut"
+        coconut_dir  = os.path.join(args.save_dir, coconut_tag)
         os.makedirs(coconut_dir, exist_ok=True)
         if use_deepspeed:
             engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
