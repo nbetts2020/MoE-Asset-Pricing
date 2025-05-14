@@ -1,6 +1,7 @@
 import os
 import torch
 import pandas as pd
+import math
 import logging
 from torch.utils.data import Dataset, DataLoader
 from transformers import LlamaTokenizerFast
@@ -34,19 +35,48 @@ GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 # -------------------------------------------------------------------------
 # SCHEDULING FUNCTION FOR LATENT MASKING
 # -------------------------------------------------------------------------
-def schedule_masking(input_ids_list, reasoning_start_id, reasoning_end_id, latent_token_id, gradual=True):
-    if reasoning_start_id not in input_ids_list or reasoning_end_id not in input_ids_list:
+def schedule_masking(
+    input_ids_list: list[int],
+    reasoning_start_id: int,
+    reasoning_end_id: int,
+    latent_token_id: int,
+    mask_fraction: float = 1.0
+) -> list[int]:
+    """
+    Replace a fraction of tokens in the reasoning span with the latent token.
+
+    Args:
+      input_ids_list: full token ID list
+      reasoning_start_id: token ID marking the start of the reasoning span
+      reasoning_end_id: token ID marking the end of the reasoning span
+      latent_token_id: token ID to insert (e.g. '<bot>')
+      mask_fraction: fraction of the span to mask (0.0–1.0)
+
+    Returns:
+      A new list with the first ceil(span_len * mask_fraction) tokens
+      after the start marker replaced by latent_token_id.
+    """
+    # locate the span boundaries
+    try:
+        start_idx = input_ids_list.index(reasoning_start_id)
+        end_idx   = input_ids_list.index(reasoning_end_id)
+    except ValueError:
+        return input_ids_list  # markers not both present
+
+    span_len = end_idx - (start_idx + 1)
+    if span_len <= 0 or mask_fraction <= 0.0:
         return input_ids_list
-    start_idx = input_ids_list.index(reasoning_start_id)
-    end_idx = input_ids_list.index(reasoning_end_id)
-    span = input_ids_list[start_idx+1:end_idx]
-    L = len(span)
-    if L == 0:
-        return input_ids_list
-    n = (L // 2) if gradual else L
-    for i in range(start_idx+1, start_idx+1+n):
-        if i < end_idx:
-            input_ids_list[i] = latent_token_id
+
+    # compute how many tokens to mask
+    n_mask = min(
+        span_len,
+        max(1, int(math.ceil(span_len * mask_fraction)))
+    )
+
+    # apply masking in-place
+    for i in range(start_idx + 1, start_idx + 1 + n_mask):
+        input_ids_list[i] = latent_token_id
+
     return input_ids_list
 
 def rreplace(s, old, new, occurrence=1):
