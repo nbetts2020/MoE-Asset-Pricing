@@ -294,13 +294,11 @@ def main():
         model.load_state_dict(torch.load(consolidated_model_path, map_location="cpu"))  # Load on CPU first
 
         # ------------------ Multi-GPU Inference with DeepSpeed ------------------
-        # If WORLD_SIZE > 1, let's partition the model across GPUs. Otherwise it stays on one GPU.
         mp_size = int(os.environ.get("WORLD_SIZE", 1))
-        # Use fp16 if your hardware supports it; otherwise, switch to bf16 or float32
         model = deepspeed.init_inference(
             model,
             mp_size=mp_size,
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
             replace_method="auto",
             config=args.deepspeed_config
         )
@@ -310,48 +308,21 @@ def main():
             f"with mp_size={mp_size}"
         )
 
-        # RL logic
-        from utils.attention_rl import HierarchicalAttentionRL, rl_train_hAttention
-        rl_module = None
-        if args.use_rl_module:
-            rl_module = HierarchicalAttentionRL(
-                tokenizer_name=args.tokenizer_name,
-                embed_dim=config.N_EMBED,
-                max_length=config.BLOCK_SIZE,
-                num_queries=config.BLOCK_SIZE,
-                truncate_limit=None
-            )
-            rl_checkpoint_path = os.path.join(args.save_dir, "hAttention_rl.pth")
-            if os.path.exists(rl_checkpoint_path):
-                checkpoint = torch.load(rl_checkpoint_path, map_location="cpu")
-                rl_module.load_state_dict(checkpoint, strict=False)
-                logging.info("Hierarchical Attention RL module loaded from checkpoint (keys ignored where mismatched).")
-            else:
-                logging.warning(f"RL checkpoint not found at {rl_checkpoint_path}; proceeding with untrained RL module.")
-            rl_module.eval()
-
         # ---------- Actual Inference Logic ----------
         if not args.test:
-            if args.use_rl_module:
-                with torch.no_grad():
-                    downsampled, _, _ = rl_module(args.text, model=model)
-                    compressed_embedding = downsampled.mean(dim=1)
-                    pred = model.regression_head(compressed_embedding).squeeze(0)
-                print(f"Predicted Price: {pred.item()}")
-            else:
-                # Simple truncation approach
-                tokenizer.truncation_side = 'left'
-                tokens = tokenizer(
-                    args.text,
-                    truncation=True,
-                    max_length=config.CONTEXT_WINDOW,
-                    return_tensors="pt"
-                )
-                with torch.no_grad():
-                    # DeepSpeed automatically handles GPU placement, so just pass CPU tensors
-                    outputs = model(input_ids=tokens["input_ids"])
-                    output = outputs["output"]
-                print(f"Predicted Price: {output.item()}")
+            # Simple truncation approach
+            tokenizer.truncation_side = 'left'
+            tokens = tokenizer(
+                args.text,
+                truncation=True,
+                max_length=config.BLOCK_SIZE,
+                return_tensors="pt"
+            )
+            with torch.no_grad():
+                # DeepSpeed automatically handles GPU placement, so just pass CPU tensors
+                outputs = model(input_ids=tokens["input_ids"])
+                output = outputs["output"]
+            print(f"Predicted Price: {output.item()}")
 
         else:
             # 'test' inference: iterating over data, computing metrics
@@ -359,76 +330,75 @@ def main():
                 raise ValueError("Test mode requires --use_ebm for integrated EBM logic.")
 
             if args.percent_data < 100:
-                global_max = int(0.2 * 453932 * (args.percent_data / 100))
+                global_max = int(0.01 * 453932 * (args.percent_data / 100))
             else:
                 global_max = int(1e12)
             cumulative_offset = 0
             all_metrics = OnlineMetrics()
             all_sector_metrics = {}
 
-            for i in range(1, 19):
-                if cumulative_offset >= global_max:
-                    logging.info("Global max reached; stopping further file processing.")
-                    break
+            if cumulative_offset >= global_max:
+                logging.info("Global max reached; stopping further file processing.")
+                break
 
-                run_filename = f"run_dataset_{i}.parquet"
-                logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
+            run_filename = f"run_dataset_1.parquet"
+            logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
 
-                metrics, sector_metrics, processed_in_file = process_run_dataset(
-                    run_dataset_filename=run_filename,
-                    tokenizer=tokenizer,
-                    model=model,
-                    rl_module=rl_module,
-                    args=args,
-                    device=device,  # device is typically 'cuda', but DS does the partitioning
-                    batch_size=1,
-                    current_offset=cumulative_offset,
-                    global_max=global_max,
-                    cache_dir="/tmp/hf_cache_datasets_run"
-                )
-                cumulative_offset += processed_in_file
+            metrics, sector_metrics, processed_in_file = process_run_dataset(
+                run_dataset_filename=run_filename,
+                tokenizer=tokenizer,
+                model=model,
+                rl_module=rl_module,
+                args=args,
+                device=device,
+                batch_size=1,
+                current_offset=cumulative_offset,
+                global_max=global_max,
+                cache_dir="/tmp/hf_cache_datasets_run"
+            )
+            cumulative_offset += processed_in_file
 
-                # Accumulate overall stats
-                all_metrics.count += metrics.count
-                all_metrics.sum_sq_error += metrics.sum_sq_error
-                all_metrics.sum_y += metrics.sum_y
-                all_metrics.sum_y_sq += metrics.sum_y_sq
-                all_metrics.trend_correct += metrics.trend_correct
-                for thresh in all_metrics.thresholds:
-                    all_stats = all_metrics.stats[thresh]
-                    metrics_stats = metrics.stats[thresh]
-                    all_stats["excess_returns_sum"] += metrics_stats["excess_returns_sum"]
-                    all_stats["excess_returns_sq_sum"] += metrics_stats["excess_returns_sq_sum"]
-                    all_stats["downside_returns_sq_sum"] += metrics_stats["downside_returns_sq_sum"]
-                    all_stats["downside_count"] += metrics_stats["downside_count"]
-                    all_stats["strategy_returns_sum"] += metrics_stats["strategy_returns_sum"]
-                    all_stats["wins"] += metrics_stats["wins"]
-                    all_stats["gross_profits"] += metrics_stats["gross_profits"]
-                    all_stats["gross_losses"] += metrics_stats["gross_losses"]
+            # Accumulate overall stats
+            all_metrics.count += metrics.count
+            all_metrics.sum_sq_error += metrics.sum_sq_error
+            all_metrics.sum_y += metrics.sum_y
+            all_metrics.sum_y_sq += metrics.sum_y_sq
+            all_metrics.trend_correct += metrics.trend_correct
+            for thresh in all_metrics.thresholds:
+                all_stats = all_metrics.stats[thresh]
+                metrics_stats = metrics.stats[thresh]
+                all_stats["excess_returns_sum"] += metrics_stats["excess_returns_sum"]
+                all_stats["excess_returns_sq_sum"] += metrics_stats["excess_returns_sq_sum"]
+                all_stats["downside_returns_sq_sum"] += metrics_stats["downside_returns_sq_sum"]
+                all_stats["downside_count"] += metrics_stats["downside_count"]
+                all_stats["strategy_returns_sum"] += metrics_stats["strategy_returns_sum"]
+                all_stats["wins"] += metrics_stats["wins"]
+                all_stats["gross_profits"] += metrics_stats["gross_profits"]
+                all_stats["gross_losses"] += metrics_stats["gross_losses"]
 
-                # Per-sector stats
-                for sector, sm in sector_metrics.items():
-                    if sector not in all_sector_metrics:
-                        all_sector_metrics[sector] = OnlineMetrics()
-                    all_sm = all_sector_metrics[sector]
-                    all_sm.count += sm.count
-                    all_sm.sum_sq_error += sm.sum_sq_error
-                    all_sm.sum_y += sm.sum_y
-                    all_sm.sum_y_sq += sm.sum_y_sq
-                    all_sm.trend_correct += sm.trend_correct
-                    for thresh in all_sm.thresholds:
-                        all_stats = all_sm.stats[thresh]
-                        sm_stats = sm.stats[thresh]
-                        all_stats["excess_returns_sum"] += sm_stats["excess_returns_sum"]
-                        all_stats["excess_returns_sq_sum"] += sm_stats["excess_returns_sq_sum"]
-                        all_stats["downside_returns_sq_sum"] += sm_stats["downside_returns_sq_sum"]
-                        all_stats["downside_count"] += sm_stats["downside_count"]
-                        all_stats["strategy_returns_sum"] += sm_stats["strategy_returns_sum"]
-                        all_stats["wins"] += sm_stats["wins"]
-                        all_stats["gross_profits"] += sm_stats["gross_profits"]
-                        all_stats["gross_losses"] += sm_stats["gross_losses"]
+            # Per-sector stats
+            for sector, sm in sector_metrics.items():
+                if sector not in all_sector_metrics:
+                    all_sector_metrics[sector] = OnlineMetrics()
+                all_sm = all_sector_metrics[sector]
+                all_sm.count += sm.count
+                all_sm.sum_sq_error += sm.sum_sq_error
+                all_sm.sum_y += sm.sum_y
+                all_sm.sum_y_sq += sm.sum_y_sq
+                all_sm.trend_correct += sm.trend_correct
+                for thresh in all_sm.thresholds:
+                    all_stats = all_sm.stats[thresh]
+                    sm_stats = sm.stats[thresh]
+                    all_stats["excess_returns_sum"] += sm_stats["excess_returns_sum"]
+                    all_stats["excess_returns_sq_sum"] += sm_stats["excess_returns_sq_sum"]
+                    all_stats["downside_returns_sq_sum"] += sm_stats["downside_returns_sq_sum"]
+                    all_stats["downside_count"] += sm_stats["downside_count"]
+                    all_stats["strategy_returns_sum"] += sm_stats["strategy_returns_sum"]
+                    all_stats["wins"] += sm_stats["wins"]
+                    all_stats["gross_profits"] += sm_stats["gross_profits"]
+                    all_stats["gross_losses"] += sm_stats["gross_losses"]
 
-                logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
+            logging.info(f"After {run_filename}, cumulative offset is now {cumulative_offset}.")
 
             # Compute final results
             results = all_metrics.compute()
