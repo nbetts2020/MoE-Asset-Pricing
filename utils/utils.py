@@ -248,17 +248,21 @@ def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int =
         if rl_rows != -1 and accumulated >= rl_rows:
             break
 
-def process_run_dataset(run_dataset_filename, tokenizer, model, rl_module, args, device,
+def process_run_dataset(run_dataset_filename, tokenizer, model, args, device,
                         batch_size=500, current_offset=0, global_max=int(1e12),
                         cache_dir="/tmp/hf_cache_datasets_run"):
-    import os
-    import gc
-    import shutil
+                            
+    import os, gc, shutil, torch
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
+    from utils.train import greedy_generate_tail, extract_label_value
+
+    # precompute our marker IDs once
+    open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+    m_len    = len(open_ids)
+    close_id = tokenizer.convert_tokens_to_ids(" </STOCK PRICE 30 DAYS OUT>")
 
     os.makedirs(cache_dir, exist_ok=True)
-
     file_path = hf_hub_download(
         repo_id="nbettencourt/sc454k-preprocessed-dfs",
         filename=run_dataset_filename,
@@ -268,7 +272,7 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, rl_module, args,
     parquet_file = pq.ParquetFile(file_path)
 
     overall_metrics = OnlineMetrics()
-    sector_metrics = {}
+    sector_metrics  = {}
     processed_in_file = 0
 
     for batch in parquet_file.iter_batches(batch_size=batch_size):
@@ -276,77 +280,94 @@ def process_run_dataset(run_dataset_filename, tokenizer, model, rl_module, args,
         df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
         df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0].reset_index(drop=True)
 
-        num_rows = len(df_chunk)
-        if current_offset + processed_in_file >= global_max:
-            break
+        for idx, sample in df_chunk.iterrows():
+            if current_offset + processed_in_file + idx >= global_max:
+                break
 
-        start_idx = 0
-        end_idx = min(num_rows, global_max - (current_offset + processed_in_file))
-
-        for idx in range(start_idx, end_idx):
-            sample = df_chunk.iloc[idx]
             sector = sample.get('Sector', "Unknown")
 
             try:
+                # build and tag your best_context
                 best_context = ebm_select_contexts(
-                    df=df_chunk,
-                    idx=idx,
-                    model=model,  # Now includes EBM internally
-                    tokenizer=tokenizer,
-                    ebm_samples=args.ebm_num_samples,
+                    df=df_chunk, idx=idx, model=model,
+                    tokenizer=tokenizer, ebm_samples=args.ebm_num_samples,
                     rl_module=rl_module
                 )
-                best_context = rreplace(best_context, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
+                best_context = rreplace(
+                    best_context,
+                    "<30 DAY LABEL>",
+                    "<STOCK PRICE 30 DAYS OUT>:",
+                    1
+                ) + " </STOCK PRICE 30 DAYS OUT>"
 
-                if args.use_rl_module and rl_module is not None:
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            downsampled, pred, _ = rl_module(best_context, model=model)
-                    pred_value = pred.item()  # Use RL module’s prediction
-                else:
-                    tokenizer.truncation_side = 'left'
-                    encoding = tokenizer(
-                        best_context,
-                        truncation=True,
-                        padding="max_length",
-                        max_length=config.BLOCK_SIZE,
-                        return_tensors="pt"
-                    ).to(device)
-                    input_ids = encoding["input_ids"]
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            outputs = model(input_ids=input_ids)  # Now returns a dictionary
-                            output = outputs["output"]  # Extract the prediction
-                    pred_value = output.item()
+                # tokenize prefix
+                tokenizer.truncation_side = 'left'
+                encoding = tokenizer(
+                    best_context,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=config.BLOCK_SIZE,
+                    return_tensors="pt"
+                ).to(device)
+                input_ids = encoding["input_ids"]  # (1, T)
+
+                # locate open‐tag position
+                ids_list = input_ids[0].tolist()
+                marker_pos = next(
+                    (j + m_len for j in range(len(ids_list)-m_len+1)
+                     if ids_list[j:j+m_len] == open_ids),
+                    None
+                )
+                if marker_pos is None:
+                    continue
+
+                # greedy generate until close tag
+                prefix   = input_ids[:, :marker_pos]
+                world_sz = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                T_loc    = model.block_size // world_sz
+                cur      = prefix[:, -T_loc:].clone()
+                gen_toks = []
+
+                for _ in range(20):
+                    hs     = model.forward_embeddings_only(cur)
+                    logits = model.lm_head(hs)[:, -1, :]
+                    nxt    = logits.argmax(-1, keepdim=True)
+                    gen_toks.append(nxt)
+                    if nxt.item() == close_id:
+                        break
+                    cur = torch.cat([cur, nxt], dim=1)[:, -T_loc:]
+
+                gen_ids  = torch.cat(gen_toks, dim=1)
+                full_ids = torch.cat([prefix, gen_ids], dim=1)[0]
+                decoded  = tokenizer.decode(full_ids, skip_special_tokens=True)
+                pred_value = extract_label_value(decoded)
+                if pred_value is None:
+                    continue
 
             except Exception as e:
                 print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
                 continue
 
-            actual = sample['weighted_avg_720_hrs']
+            actual   = sample['weighted_avg_720_hrs']
             oldprice = sample['weighted_avg_0_hrs']
-            rf = sample['Risk_Free_Rate']
+            rf       = sample['Risk_Free_Rate']
 
             overall_metrics.update(pred_value, actual, oldprice, rf)
-            if sector not in sector_metrics:
-                sector_metrics[sector] = OnlineMetrics()
-            sector_metrics[sector].update(pred_value, actual, oldprice, rf)
+            sector_metrics.setdefault(sector, OnlineMetrics()) \
+                          .update(pred_value, actual, oldprice, rf)
 
             print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred_value}")
 
-        processed_in_file += num_rows
+        processed_in_file += len(df_chunk)
         del df_chunk
         gc.collect()
         torch.cuda.empty_cache()
-
         if current_offset + processed_in_file >= global_max:
             break
 
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir, ignore_errors=True)
-
+    # cleanup
+    if os.path.exists(file_path): os.remove(file_path)
+    shutil.rmtree(cache_dir, ignore_errors=True)
     return overall_metrics, sector_metrics, processed_in_file
                             
 def load_model_weights(model, weights_path, device):
