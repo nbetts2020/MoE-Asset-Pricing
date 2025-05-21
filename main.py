@@ -348,7 +348,6 @@ def main():
                 run_dataset_filename=run_filename,
                 tokenizer=tokenizer,
                 model=model,
-                rl_module=rl_module,
                 args=args,
                 device=device,
                 batch_size=1,
