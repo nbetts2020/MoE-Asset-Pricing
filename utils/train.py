@@ -29,20 +29,20 @@ STAGE_TAG = {
 
 def extract_label_value(decoded_text):
     """
-    Extracts the numerical label following the "<STOCK PRICE 30 DAYS OUT>>:" marker and returns it as a float.
-    If multiple dots are found (e.g. "2..98"), they are replaced with a single dot.
-    Returns None if extraction or conversion fails.
+    Extracts the numerical label between
+    '<STOCK PRICE 30 DAYS OUT>:' and '</STOCK PRICE 30 DAYS OUT>'.
     """
-    match = re.search(r'\<STOCK PRICE 30 DAYS OUT\>:\s*([\d\.]+)', decoded_text)
-    if match:
-        num_str = match.group(1)
-        num_str = re.sub(r'\.\.+', '.', num_str)
-        try:
-            return float(num_str)
-        except ValueError as e:
-            logging.error(f"Could not convert label string to float: '{num_str}'. Error: {e}")
-            return None
-    else:
+    m = re.search(
+        r'<STOCK PRICE 30 DAYS OUT>:\s*([\d\.]+)\s*<\/STOCK PRICE 30 DAYS OUT>',
+        decoded_text
+    )
+    if not m:
+        return None
+    num = re.sub(r'\.\.+', '.', m.group(1))
+    try:
+        return float(num)
+    except ValueError:
+        logging.error(f"Bad float '{num}' in \"{decoded_text}\"")
         return None
 
 def greedy_generate_tail(model, input_ids, max_new_tokens=20):
@@ -162,10 +162,9 @@ def train_model(
         logging.info(f"→ Phase 1: normal pre-training (rank {rank})")
         PRETRAIN_EPOCHS = epochs
 
-        marker_ids = tokenizer(
-            "<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False
-        ).input_ids
-        m_len = len(marker_ids)
+        open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+        m_len    = len(open_ids)
+        close_id = tokenizer.convert_tokens_to_ids(" </STOCK PRICE 30 DAYS OUT>")
 
         for epoch in range(1, PRETRAIN_EPOCHS + 1):
             real_model.train()
@@ -177,31 +176,45 @@ def train_model(
                     with torch.no_grad():
                         sample_ids  = batch["input_ids"][:5].to(device)
                         true_prices = batch["labels"][:5].tolist()
-
                         preds = []
+                
                         for ids in sample_ids:
                             ids_list = ids.tolist()
                             marker_pos = next(
                                 (j + m_len for j in range(len(ids_list) - m_len + 1)
-                                 if ids_list[j:j + m_len] == marker_ids),
+                                 if ids_list[j:j + m_len] == open_ids),
                                 None,
                             )
                             if marker_pos is None:
                                 preds.append("〈n/a〉")
                                 continue
-                            prefix  = ids[:marker_pos].unsqueeze(0)
-                            gen_ids = greedy_generate_tail(
-                                real_model, prefix, max_new_tokens=6
-                            )
-                            preds.append(
-                                tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-                            )
+                
+                            # greedy‐generate until the closing tag appears
+                            prefix     = ids[:marker_pos].unsqueeze(0)
+                            world_size = dist.get_world_size() if dist.is_initialized() else 1
+                            T_local    = real_model.block_size // world_size
+                            cur        = prefix[:, -T_local:].clone()
+                            gen_tokens = []
+                
+                            for _ in range(20):
+                                hs     = real_model.forward_embeddings_only(cur)
+                                logits = real_model.lm_head(hs)[:, -1, :]
+                                nxt    = logits.argmax(-1, keepdim=True)
+                                gen_tokens.append(nxt)
+                                if nxt.item() == close_id:
+                                    break
+                                cur = torch.cat([cur, nxt], dim=1)[:, -T_local:]
+                
+                            gen_ids  = torch.cat(gen_tokens, dim=1)
+                            full_ids = torch.cat([prefix, gen_ids], dim=1)[0]
+                            decoded  = tokenizer.decode(full_ids, skip_special_tokens=True)
+                            val      = extract_label_value(decoded)
+                            preds.append(f"{val:.2f}" if val is not None else "〈n/a〉")
+                
                         if rank == 0:
                             for i, pred in enumerate(preds):
-                                print(
-                                    f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, "
-                                    f"pred → {pred}"
-                                )
+                                print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred}")
+
                 # ------------------------------------------------------------
 
                 input_ids = pad_to_global(batch["input_ids"].to(device))
