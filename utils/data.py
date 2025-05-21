@@ -26,7 +26,7 @@ GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(
 
 # Add special tokens
 special_tokens = {
-    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<eot>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ']
+    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<eot>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ', ' </STOCK PRICE 30 DAYS OUT>']
 }
 GLOBAL_TOKENIZER.add_special_tokens(special_tokens)
 # Set pad token to eos
@@ -106,7 +106,7 @@ class PrecomputedDataset(Dataset):
     def __getitem__(self, idx):
         text = self.df.iloc[idx].get('text', '')
         raw_label = self.df.iloc[idx].get('weighted_avg_720_hrs', 0.0)
-        label_str = f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f}"
+        label_str = f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f} </STOCK PRICE 30 DAYS OUT>"
         new_text = text + label_str
 
         self.tokenizer.truncation_side = 'left'
@@ -114,7 +114,7 @@ class PrecomputedDataset(Dataset):
             new_text,
             truncation=True,
             padding='max_length',
-            max_length=config.CONTEXT_WINDOW,
+            max_length=config.BLOCK_SIZE,
             return_tensors='pt'
         )
         ids = enc['input_ids'].squeeze(0).tolist()
@@ -158,7 +158,7 @@ class PrecomputedBootstrapDataset(Dataset):
                 txt,
                 truncation=True,
                 padding='max_length',
-                max_length=config.CONTEXT_WINDOW,
+                max_length=config.BLOCK_SIZE,
                 return_tensors='pt'
             )
             all_ids.append(enc['input_ids'].squeeze(0))
@@ -208,9 +208,11 @@ def prepare_ft_dataloader(
     os.remove(file_path)
 
     if stage in (1, 2):
-        df["text"] = df["text"].apply(
-            lambda x: rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>", 1)
+        df["text"] = df["text"].apply(lambda x: 
+            rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>:", 1)
+            + " </STOCK PRICE 30 DAYS OUT>"
         )
+
         dataset = PrecomputedDataset(
             df,
             tokenizer,
@@ -223,6 +225,13 @@ def prepare_ft_dataloader(
     else:
         text_cols = [f"text_iteration_{i}" for i in range(1, 27)]
         label_col = "weighted_avg_720_hrs"
+        # after loading df for stages >=3:
+        label_str = df[label_col].map(lambda v: 
+            f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
+        )
+        for col in text_cols:
+            df[col] = df[col] + " " + label_str
+
         dataset = PrecomputedBootstrapDataset(
             df,
             tokenizer=tokenizer,
