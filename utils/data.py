@@ -9,6 +9,9 @@ from utils.config import config
 from huggingface_hub import hf_hub_download
 from torch.utils.data.distributed import DistributedSampler
 
+import pyarrow.parquet as pq
+from torch.utils.data import IterableDataset
+
 # Disable tokenizer parallelism to avoid warnings after fork.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -87,50 +90,111 @@ def rreplace(s, old, new, occurrence=1):
 # PRECOMPUTED SINGLE-TEXT DATASET
 # -------------------------------------------------------------------------
 class PrecomputedDataset(Dataset):
-    def __init__(self, df, tokenizer, block_size, gradual_latent_mask=False, full_latent_mask=False):
-        self.df = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.block_size = block_size
-        self.gradual_latent_mask = gradual_latent_mask
-        self.full_latent_mask = full_latent_mask
-        # cache token ids
-        self.latent_id = tokenizer.convert_tokens_to_ids('<bot>')
-        self.start_id = tokenizer.convert_tokens_to_ids('<reasoning>')
-        self.end_id = tokenizer.convert_tokens_to_ids('</reasoning>')
-        # cache BOS token id (for <s>)
-        self.bos_id = tokenizer.bos_token_id
+    """
+    Parquet-backed dataset.
 
-    def __len__(self):
-        return len(self.df)
+    • If `streaming=True`, each sample is read lazily from the Parquet
+      file, so only a single row-group lives in RAM at once.
+    • When `streaming=False` the full DataFrame is held in memory
+      (legacy behaviour).
 
-    def __getitem__(self, idx):
-        text = self.df.iloc[idx].get('text', '')
-        raw_label = self.df.iloc[idx].get('weighted_avg_720_hrs', 0.0)
-        label_str = f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f} </STOCK PRICE 30 DAYS OUT>"
-        new_text = text + label_str
+    The curriculum for Coconut masking is driven by the *mutable*
+    attribute `mask_fraction` (0 → no masking, 1 → mask the whole
+    <reasoning> span).  Phase-3 code can update that field between
+    passes:
 
-        self.tokenizer.truncation_side = 'left'
-        enc = self.tokenizer(
-            new_text,
-            truncation=True,
-            padding='max_length',
-            max_length=config.BLOCK_SIZE,
-            return_tensors='pt'
+        ds.mask_fraction = 0.0   # first pass, no masking
+        ds.mask_fraction = 1.0   # second pass, full masking
+    """
+
+    def __init__(
+        self,
+        source,                     # pandas.DataFrame 𝘰𝘳 str(path-to-parquet)
+        tokenizer,
+        block_size: int,
+        mask_fraction: float = 1.0, # initial masking ratio
+        streaming: bool = False
+    ):
+        self.streaming      = streaming
+        self.tokenizer      = tokenizer
+        self.block_size     = block_size
+        self.mask_fraction  = float(mask_fraction)
+
+        # --- cache special-token ids once ----------------------------------
+        self.latent_id = tokenizer.convert_tokens_to_ids("<bot>")
+        self.start_id  = tokenizer.convert_tokens_to_ids("<reasoning>")
+        self.end_id    = tokenizer.convert_tokens_to_ids("</reasoning>")
+        self.bos_id    = tokenizer.bos_token_id
+
+        # --- pick storage mode --------------------------------------------
+        if streaming:
+            self.pq_file = pq.ParquetFile(source)          # lazy, columnar
+            self._n      = self.pq_file.metadata.num_rows
+        else:
+            self.df = source.reset_index(drop=True)
+
+    # ------------------------------------------------------------------ #
+    def __len__(self) -> int:
+        return self._n if self.streaming else len(self.df)
+
+    # ------------------------------------------------------------------ #
+    def _get_row(self, idx: int) -> dict:
+        if not self.streaming:
+            return self.df.iloc[idx]
+
+        # Which row-group contains this row?
+        rg_size   = self.pq_file.metadata.row_group(0).num_rows
+        rg_index  = idx // rg_size
+        offset    = idx %  rg_size
+
+        batch = (
+            self.pq_file
+                .read_row_group(rg_index)   # load one small row-group
+                .slice(offset, 1)           # keep just the single row
         )
-        ids = enc['input_ids'].squeeze(0).tolist()
+        return {col: batch[col][0].as_py() for col in batch.schema.names}
 
-        # prepend BOS (<s>) and trim to block_size
+    # ------------------------------------------------------------------ #
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        row        = self._get_row(idx)
+        text       = row.get("text", "")
+        raw_label  = row.get("weighted_avg_720_hrs", 0.0)
+
+        # append numeric label in the expected tag format
+        label_str  = (
+            f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f} "
+            f"</STOCK PRICE 30 DAYS OUT>"
+        )
+        new_text   = text + label_str
+
+        # tokenize (left-truncation to `block_size`)
+        self.tokenizer.truncation_side = "left"
+        enc  = self.tokenizer(
+            new_text,
+            truncation   = True,
+            padding      = "max_length",
+            max_length   = self.block_size,
+            return_tensors = "pt",
+        )
+        ids  = enc["input_ids"].squeeze(0).tolist()
+
+        # prepend <s> and drop final token to keep length constant
         ids = [self.bos_id] + ids[:-1]
 
-        if self.gradual_latent_mask or self.full_latent_mask:
+        # -------- Coconut masking ---------------------------------------
+        if 0.0 < self.mask_fraction <= 1.0:
             ids = schedule_masking(
                 ids,
-                self.start_id, self.end_id,
+                self.start_id,
+                self.end_id,
                 self.latent_id,
-                gradual=self.gradual_latent_mask
+                mask_fraction = self.mask_fraction,
             )
-        input_ids = torch.tensor(ids, dtype=torch.long)
-        return {'input_ids': input_ids, 'label': torch.tensor(raw_label, dtype=torch.float32)}
+
+        return {
+            "input_ids": torch.tensor(ids,        dtype=torch.long),
+            "label":     torch.tensor(raw_label, dtype=torch.float32),
+        }
 
 # -------------------------------------------------------------------------
 # PRECOMPUTED BOOTSTRAP DATASET (25 TEXT ITERATIONS)
@@ -187,79 +251,102 @@ def prepare_ft_dataloader(
     shuffle,
     args,
     stage: int = 1,
-    gradual_latent_mask: bool = False,
-    full_latent_mask: bool = False,
-    sampler=None
+    sampler=None,
+    streaming: bool = False,
 ):
     """
     stage:
-      1 => ft_dataset_1.parquet       (PrecomputedDataset, no label replace)
-      2 => ft_dataset_2.parquet       (PrecomputedDataset, do label replace)
-      3-7 => ft_dataset_{stage}.parquet (PrecomputedBootstrapDataset)
-      8 => ft_dataset_8.parquet       (PrecomputedBootstrapDataset test)
+      1 → ft_dataset_1.parquet  (PrecomputedDataset)
+      2 → ft_dataset_2.parquet  (PrecomputedDataset)
+      3–7 → ft_dataset_{k}.parquet (PrecomputedBootstrapDataset)
+      8 → ft_dataset_8.parquet  (PrecomputedBootstrapDataset, val)
     """
-    filename = f"ft_dataset_{stage}.parquet"
+    filename  = f"ft_dataset_{stage}.parquet"
     file_path = hf_hub_download(
-        repo_id="nbettencourt/sc454k-preprocessed-dfs",
-        filename=filename,
-        repo_type="dataset"
+        repo_id  = "nbettencourt/sc454k-preprocessed-dfs",
+        filename = filename,
+        repo_type= "dataset",
     )
-    df = pd.read_parquet(file_path)
-    os.remove(file_path)
 
+    # ───────────────────────────────────────────────────────────────────────
+    #  SINGLE-TEXT DATASETS (stages 1 & 2)                                  #
+    # ───────────────────────────────────────────────────────────────────────
     if stage in (1, 2):
-        df["text"] = df["text"].apply(lambda x: 
-            rreplace(x, "<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>:", 1)
-            + " </STOCK PRICE 30 DAYS OUT>"
-        )
+        # • streaming=True  → pass the path; PrecomputedDataset will read lazily
+        # • streaming=False → keep legacy behaviour: load full df into RAM
+        if streaming:
+            df_or_path = file_path
+        else:
+            df_or_path = pd.read_parquet(file_path)
+            os.remove(file_path)
+
+            # label-tag replacement is only needed in-memory; the streaming
+            # dataset can do it on-the-fly if you wish.
+            df_or_path["text"] = df_or_path["text"].apply(
+                lambda x: rreplace(
+                    x,
+                    "<30 DAY LABEL>",
+                    "<STOCK PRICE 30 DAYS OUT>:",
+                    1,
+                ) + " </STOCK PRICE 30 DAYS OUT>"
+            )
 
         dataset = PrecomputedDataset(
-            df,
+            df_or_path,
             tokenizer,
-            block_size=block_size,
-            gradual_latent_mask=gradual_latent_mask,
-            full_latent_mask=full_latent_mask
+            block_size      = block_size,
+            mask_fraction   = 0.0,       # no masking for phases 1&2
+            streaming       = streaming,
         )
-        collate = custom_collate_fn
-        drop_last = True
+        collate    = custom_collate_fn
+        drop_last  = True
+
+    # ───────────────────────────────────────────────────────────────────────
+    #  BOOTSTRAP (K-text) DATASETS (stages 3-8)                             #
+    # ───────────────────────────────────────────────────────────────────────
     else:
+        df = pd.read_parquet(file_path)
+        os.remove(file_path)
+
         text_cols = [f"text_iteration_{i}" for i in range(1, 27)]
         label_col = "weighted_avg_720_hrs"
-        # after loading df for stages >=3:
-        label_str = df[label_col].map(lambda v: 
-            f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
+
+        label_tag = df[label_col].map(
+            lambda v: f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
         )
         for col in text_cols:
-            df[col] = df[col] + " " + label_str
+            df[col] = df[col] + " " + label_tag
 
-        dataset = PrecomputedBootstrapDataset(
+        dataset   = PrecomputedBootstrapDataset(
             df,
-            tokenizer=tokenizer,
-            block_size=block_size,
-            text_columns=text_cols,
-            label_column=label_col
+            tokenizer   = tokenizer,
+            block_size  = block_size,
+            text_columns= text_cols,
+            label_column= label_col,
         )
-        collate = bootstrap_collate_fn
-        drop_last = (stage < 8)
+        collate    = bootstrap_collate_fn
+        drop_last  = (stage < 8)
 
-    # **Add this block** to shard data across ranks
+    # ───────────────────────────────────────────────────────────────────────
+    #  DISTRIBUTED SAMPLING (unchanged)                                     #
+    # ───────────────────────────────────────────────────────────────────────
     if torch.distributed.is_initialized() and sampler is None:
         sampler = DistributedSampler(
             dataset,
-            num_replicas=torch.distributed.get_world_size(),
-            rank=torch.distributed.get_rank(),
-            shuffle=shuffle,
-            seed=getattr(args, "random_seed", 42)
+            num_replicas = torch.distributed.get_world_size(),
+            rank         = torch.distributed.get_rank(),
+            shuffle      = shuffle,
+            seed         = getattr(args, "random_seed", 42),
         )
-        shuffle = False   # sampler will handle shuffling
+        shuffle = False  # sampler handles shuffling
 
     return DataLoader(
         dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=(shuffle and sampler is None),
-        sampler=sampler,
-        num_workers=0,
-        collate_fn=collate,
-        pin_memory=True,
-        drop_last=drop_last
+        batch_size = config.BATCH_SIZE,
+        shuffle    = (shuffle and sampler is None),
+        sampler    = sampler,
+        num_workers= 0,
+        collate_fn = collate,
+        pin_memory = True,
+        drop_last  = drop_last,
     )
