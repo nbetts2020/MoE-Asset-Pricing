@@ -339,7 +339,7 @@ def main():
 
             if cumulative_offset >= global_max:
                 logging.info("Global max reached; stopping further file processing.")
-                break
+                return
 
             run_filename = f"run_dataset_1.parquet"
             logging.info(f"Processing {run_filename} (cumulative offset: {cumulative_offset})...")
