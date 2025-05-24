@@ -580,37 +580,35 @@ class SparseMoELanguageModel(nn.Module):
         return x_full
 
     # ------------------------------------------------------------------ #
-    #  Coconut latent-reasoning forward (multi-pass)                     #
+    #  Coconut latent-reasoning forward (faithful, crash-proof version)   #
     # ------------------------------------------------------------------ #
     def forward_coconut(
         self,
-        input_ids: torch.Tensor,             # (B, T_global)
+        input_ids: torch.Tensor,     # (B, T_global)
         attention_mask=None,
-        labels=None,                         # ignored
-        latent_token_id=None,                # id of "<bot>"
+        labels=None,                 # ignored
+        latent_token_id=None,        # id of "<bot>"
         reduction: str = "mean",
     ):
         """
-        Multi-token Coconut forward that handles <bot> … <eot> spans.
+        Fully faithful Coconut forward (§3 of the paper).
     
-        For every <bot> ... <eot> span we:
-        1. Run the transformer.
-        2. Replace the whole span’s embeddings with the hidden state *before*
-           <bot> (continuous-thought embedding).
-        3. Repeat until all spans are filled.
-        Loss is computed only on tokens **outside** the spans.
+        • Each latent token between <bot> … <eot> is replaced *sequentially*
+          by the hidden state produced at that exact position (h_i, h_{i+1}, …).
+        • Loss is computed only on non-latent tokens.
+        • If a batch contains **no** latent spans, we fall back to a single
+          Transformer pass (avoids the undefined-`x` crash).
         """
         assert latent_token_id is not None, "pass latent_token_id=<bot>-id"
     
-        # ── boiler-plate sharding ─────────────────────────────────────────────
+        # ---------- sharding boiler-plate -----------------------------------
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank       = dist.get_rank()      if dist.is_initialized() else 0
         device     = input_ids.device
         T_glb      = self.block_size
     
-        ids_glb = self._pad_or_trim(input_ids, T_glb)           # (B, T_glb)
+        ids_glb = self._pad_or_trim(input_ids, T_glb)         # (B, T_glb)
         B, _    = ids_glb.shape
-    
         if world_size > 1:
             if T_glb % world_size:
                 raise ValueError("block_size not divisible by world_size")
@@ -622,67 +620,78 @@ class SparseMoELanguageModel(nn.Module):
     
         pad_id   = self.tokenizer.pad_token_id
         loc_mask = (ids_loc != pad_id).to(device) if attention_mask is None \
-                   else self._pad_or_trim(attention_mask.long(), T_glb) \
-                           [:, rank*T_loc:(rank+1)*T_loc].bool()
+            else self._pad_or_trim(attention_mask.long(), T_glb) \
+                 [:, rank*T_loc:(rank+1)*T_loc].bool()
     
-        # ── prepare embeddings & span bookkeeping ────────────────────────────
-        emb_loc   = self.token_embedding_table(ids_loc)          # (B, T_loc, D)
-        bot_mask  = (ids_loc == latent_token_id)                 # <bot>
-        eot_id    = self.tokenizer.convert_tokens_to_ids("<eot>")
-        eot_mask  = (ids_loc == eot_id)                          # <eot>
+        # ---------- embeddings & span bookkeeping ---------------------------
+        emb_loc  = self.token_embedding_table(ids_loc)        # (B, T_loc, D)
+        bot_mask = (ids_loc == latent_token_id)
+        eot_id   = self.tokenizer.convert_tokens_to_ids("</reasoning>")
+        eot_mask = (ids_loc == eot_id)
     
-        # collect (bot_pos, eot_pos) pairs per sample
-        spans_per_sample = []
+        progress_per_sample = []  # [ [cur_pos, eot_pos], …] per sample
         for b in range(B):
             bots = bot_mask[b].nonzero(as_tuple=False).flatten()
             eots = eot_mask[b].nonzero(as_tuple=False).flatten()
             spans = []
             for bp in bots:
                 ep = eots[eots > bp][0] if (eots > bp).any() else None
-                if ep is None:
-                    continue                         # unmatched bot → skip
-                spans.append((bp.item(), ep.item()))
-            spans_per_sample.append(spans)
+                if ep is not None:
+                    spans.append([bp.item(), ep.item()])  # cur_pos = bot_pos
+            progress_per_sample.append(spans)
     
-        total_passes = max(len(s) for s in spans_per_sample)
+        total_passes = max(
+            (ep - cp + 1) for spans in progress_per_sample for cp, ep in spans
+        ) if any(progress_per_sample) else 0
     
         total_aux = torch.tensor(0.0, device=device, dtype=emb_loc.dtype)
     
-        # ── multi-pass Coconut loop ──────────────────────────────────────────
-        for _ in range(total_passes):
-            # forward
+        # ==================================================================== #
+        #  A) batch HAS latent spans  → multi-pass token-by-token replacement  #
+        # ==================================================================== #
+        if total_passes > 0:
+            for _ in range(total_passes):
+                x = self.dropout_emb(emb_loc)
+                for blk in self.blocks:
+                    x, aux = blk(x, mask=loc_mask)
+                    if self.training:
+                        total_aux += aux
+                x = self.ln_f(x)                               # (B, T_loc, D)
+    
+                # replace next latent token in each span
+                with torch.no_grad():
+                    for b, spans in enumerate(progress_per_sample):
+                        for idx, (cur_pos, eot_pos) in enumerate(spans):
+                            if cur_pos > eot_pos:
+                                continue
+                            emb_loc[b, cur_pos] = x[b, cur_pos]
+                            spans[idx][0] += 1                 # advance cur_pos
+    
+            # loss mask over every latent token
+            span_mask = (bot_mask | eot_mask).clone()
+            for b, spans in enumerate(progress_per_sample):
+                for cur_pos, eot_pos in spans:
+                    span_mask[b, cur_pos-1:eot_pos+1] = True
+    
+        # ==================================================================== #
+        #  B) batch has NO latent spans → single forward pass                  #
+        # ==================================================================== #
+        else:
             x = self.dropout_emb(emb_loc)
             for blk in self.blocks:
                 x, aux = blk(x, mask=loc_mask)
                 if self.training:
                     total_aux += aux
-            x = self.ln_f(x)                                   # (B, T_loc, D)
+            x = self.ln_f(x)
+            span_mask = torch.zeros_like(ids_loc, dtype=torch.bool)
     
-            # fill next span embeddings
-            with torch.no_grad():
-                for b, spans in enumerate(spans_per_sample):
-                    if not spans:
-                        continue
-                    bot_pos, eot_pos = spans.pop(0)            # take next span
-                    prev_h = x[b, bot_pos-1 if bot_pos > 0 else 0]
-                    emb_loc[b, bot_pos:eot_pos+1] = prev_h     # broadcast
-    
-        # ── build loss mask over entire spans ────────────────────────────────
-        span_mask = torch.zeros_like(ids_loc, dtype=torch.bool)
-        for b, spans in enumerate(spans_per_sample):
-            # spans are now empty - but we processed them; rebuild mask
-            for bot_pos, eot_pos in spans:      # spans list was popped → rebuild
-                span_mask[b, bot_pos:eot_pos+1] = True
-        # easier: combine original masks
-        span_mask |= bot_mask | eot_mask
-    
+        # ---------- language-model loss (masked) -----------------------------
         lm_w = self.lm_head.weight
         with GatheredParameters([lm_w], enabled=hasattr(lm_w, "ds_numel")):
             w = lm_w.clone() if hasattr(lm_w, "ds_numel") else lm_w
     
         targets = ids_loc.masked_fill(span_mask, pad_id)
-    
-        raw_ce = linear_cross_entropy(
+        raw_ce  = linear_cross_entropy(
             e            = x,
             c            = w,
             targets      = targets,
@@ -701,6 +710,7 @@ class SparseMoELanguageModel(nn.Module):
         if self.training and total_aux.item():
             loss = loss + total_aux
         return loss
+        
 
     def get_embeddings(self, input_ids, pool=True):
         """Gets final layer embeddings, with optional mean pooling."""
