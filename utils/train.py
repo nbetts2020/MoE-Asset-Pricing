@@ -262,6 +262,14 @@ def train_model(
                 real_model.state_dict(),
                 os.path.join(args.save_dir, tag, "model.pth"),
             )
+        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+            # replace "us-west-2" with whatever region your bucket is in
+            upload_checkpoint_to_s3(
+                local_dir=os.path.join(args.save_dir, STAGE_TAG[1]),
+                bucket=args.bucket,
+                remote_dir=STAGE_TAG[1],
+                region="us-west-2",
+            )
 
         if getattr(args, "stage_1_only", False):
             logging.info("stage_1_only=True → stopping after phase 1")
@@ -320,6 +328,14 @@ def train_model(
             torch.save(
                 real_model.state_dict(),
                 os.path.join(args.save_dir, tag, "model.pth"),
+            )
+        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+            # replace "us-west-2" with whatever region your bucket is in
+            upload_checkpoint_to_s3(
+                local_dir=os.path.join(args.save_dir, STAGE_TAG[2]),
+                bucket=args.bucket,
+                remote_dir=STAGE_TAG[2],
+                region="us-west-2",
             )
 
     # --------------------------------------------------------------------- #
@@ -394,6 +410,14 @@ def train_model(
             engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
         else:
             torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth"))
+        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+            # replace "us-west-2" with whatever region your bucket is in
+            upload_checkpoint_to_s3(
+                local_dir=os.path.join(args.save_dir, STAGE_TAG[3]),
+                bucket=args.bucket,
+                remote_dir=STAGE_TAG[3],
+                region="us-west-2",
+            )
 
     # ------------------------------------------------------------------------
     # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
@@ -483,5 +507,13 @@ def train_model(
             engine.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
         else:
             torch.save(model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
+        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+            # replace "us-west-2" with whatever region your bucket is in
+            upload_checkpoint_to_s3(
+                local_dir=os.path.join(args.save_dir, STAGE_TAG[4]),
+                bucket=args.bucket,
+                remote_dir=STAGE_TAG[4],
+                region="us-west-2",
+            )
 
         logging.info("Training complete.")
