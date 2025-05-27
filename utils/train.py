@@ -16,6 +16,7 @@ from utils.ewc import ElasticWeightConsolidation
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+import deepspeed
 
 # Import the helper function to update RoPE buffers.
 from utils.model import update_model_rope_for_extended_context
@@ -74,6 +75,11 @@ def local_logits(model, ids_local, mask_local):
         x, _ = blk(x, mask=mask_local)      # ignore MoE aux‑loss
     x = model.ln_f(x)
     return model.lm_head(x)                 # (B, T_local, vocab)
+
+def dbg(msg: str):
+    """Print from **all** ranks and flush right away."""
+    r = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[rank {r}] {msg}", flush=True)
 
 def train_model(
     model,
@@ -140,20 +146,43 @@ def train_model(
     # -----------------------------------------------------------
     min_stage = min(args.stages)
     if min_stage > 1:
-        prev_tag = STAGE_TAG[min_stage - 1]
-        ckpt_dir = os.path.join(args.save_dir, prev_tag)
-        if not os.path.isdir(ckpt_dir):
-            raise FileNotFoundError(
-                f"Cannot start at stage {min_stage}: checkpoint '{prev_tag}' "
-                f"not found in {ckpt_dir}"
+        prev_tag  = STAGE_TAG[min_stage - 1]               # e.g. "normal_pretrained"
+        ckpt_root = args.save_dir
+        stage_dir = os.path.join(ckpt_root, prev_tag)
+
+        # ── rank-0 downloads just the ZeRO shard files ────────────
+        if rank == 0 and not os.path.isdir(stage_dir):
+            os.makedirs(stage_dir, exist_ok=True)
+            subprocess.check_call([
+                "aws", "s3", "sync", "--region", "us-west-1",
+                f"s3://{args.bucket}/model/{prev_tag}/", stage_dir
+            ])
+        if world_size > 1:
+            dist.barrier()
+
+        # ── load *only* the module weights ────────────────────────────
+        if engine:
+            engine.load_checkpoint(
+                load_dir=stage_dir,           # ← root of all stage-dirs
+                tag=None,                 # ← name of the subfolder you just synced
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+                load_module_only=True,
+                load_module_strict=False
+            )
+        else:
+            real_model.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        stage_dir,
+                        "zero_pp_rank_0_mp_rank_00_model_states.pt"
+                    ),
+                    map_location="cpu"
+                ),
+                strict=True
             )
 
-        if engine:
-            engine.load_checkpoint(args.save_dir, tag=prev_tag)
-        else:
-            path = os.path.join(ckpt_dir, "model.pth")
-            real_model.load_state_dict(torch.load(path, map_location="cpu"))
-        logging.info(f"Loaded checkpoint from previous stage '{prev_tag}'")
+        logging.info(f"Loaded checkpoint from Phase {min_stage} ('{prev_tag}')")
 
     # ===================================================================== #
     #  PHASE 1 – Normal pre-training
@@ -266,7 +295,7 @@ def train_model(
             upload_checkpoint_to_s3(
                 local_dir=os.path.join(args.save_dir, STAGE_TAG[1]),
                 bucket=args.bucket,
-                remote_dir=STAGE_TAG[1]
+                remote_dir=f"model/{STAGE_TAG[1]}"
             )
 
         if getattr(args, "stage_1_only", False):
@@ -277,71 +306,122 @@ def train_model(
     #  PHASE 2 – Continual pre-training with extended context
     # ===================================================================== #
     if 2 in args.stages:
-        logging.info("→ Phase 2: continual pre-training (64 k context)")
+        dbg("→ entering Phase 2")
 
-        NEW_LEN = 4096
-        # one call updates RoPE *and* sets real_model.block_size/tokenizer
-        update_model_rope_for_extended_context(real_model, new_seq_len=NEW_LEN,
-                                               base=10_000.0)
-        config.BLOCK_SIZE = real_model.block_size
+        # ── 0. load the Phase-1 checkpoint before touching RoPE or SP groups ─────
+        dbg("loading Phase-1 checkpoint")
+        engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
+        real_model = engine.module  # unwrap DeepSpeed
+        dbg("loaded Phase-1 model")
 
-        # new optimiser (LR schedule, new parameters, …)
-        from utils.utils import prepare_optimizer
-        new_opts = prepare_optimizer(real_model, args)
-        if engine:
-            logging.info("DeepSpeed engine retains its optimizer")
-        else:
-            adam_optimizer = new_opts["main"]
+        NEW_LEN = 4096                     # target context length
+        device   = torch.device("cuda")
 
-        continual_loader = prepare_ft_dataloader(
-            tokenizer, block_size=NEW_LEN,
-            shuffle=False, args=args, stage=1, streaming=True
+        # ── 1. global sync so all ranks have the same model state ───────────
+        dbg("before barrier #1")
+        dist.barrier()
+        dbg("passed barrier #1")
+        real_model.block_size = NEW_LEN
+        config.BLOCK_SIZE = NEW_LEN
+        # ── 2. extend the RoPE tables in-place ──────────────────────────────
+        dbg("calling update_model_rope_for_extended_context")
+        update_model_rope_for_extended_context(
+            real_model,
+            new_seq_len = NEW_LEN,
+            base        = 10_000.0,
         )
+        dbg(f"after RoPE update: block_size = {real_model.block_size}")
+
+        # ── 3. rebuild sequence-parallel process groups & each attention ────
+        if dist.is_initialized():
+            from yunchang import set_seq_parallel_pg, LongContextAttention
+            from yunchang.kernels import AttnType
+
+            set_seq_parallel_pg(
+                config.SP_ULYSSES_DEGREE,
+                config.SP_RING_DEGREE,
+                dist.get_rank(),
+                dist.get_world_size(),
+            )
+
+            for blk in real_model.blocks:
+                blk.sa.usp_attn = LongContextAttention(
+                    scatter_idx     = 2,
+                    gather_idx      = 1,
+                    ring_impl_type  = "zigzag",
+                    use_pack_qkv    = True,
+                    use_sync        = True,
+                    attn_type       = AttnType.FA,
+                    attn_processor  = None,
+                )
+
+        # ── 4. zero out any optimizer state so momentum/etc doesn’t mix old context ─
+        dbg("zeroing DeepSpeed optimizer state")
+        engine.optimizer.zero_grad(set_to_none=True)
+
+        # ── 5. sync again before you start training on the new context ─────────
+        dbg("before barrier #2")
+        dist.barrier()
+        dbg("passed barrier #2")
+
+        # ── 6. tiny RoPE-FT pass ─────────────────────────────────────────────
+        dbg("building continual_loader")
+        continual_loader = prepare_ft_dataloader(
+            tokenizer,
+            block_size = NEW_LEN,
+            shuffle    = False,
+            args       = args,
+            stage      = 1,
+            streaming  = True,
+        )
+        dbg("continual_loader ready")
 
         real_model.train()
         epoch_loss = 0.0
-        for batch in continual_loader:
-            input_ids = pad_to_global(batch["input_ids"].to(device))
-            loss = real_model.forward_next_token_efficient(
-                input_ids, reduction="mean"
-            )
+        dbg("entering training loop")
 
-            if engine:
-                engine.zero_grad(); engine.backward(loss); engine.step()
-            else:
-                adam_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
-                adam_optimizer.step()
+        for idx, batch in enumerate(continual_loader):
+            print(idx, len(continual_loader))
+            bsz = batch["input_ids"].size(0)
+            if bsz != config.BATCH_SIZE:
+                dbg(f"Skipping stray batch of size {bsz}")
+                continue
+
+            input_ids = pad_to_global(batch["input_ids"].to(device))
+            loss      = real_model.forward_next_token_efficient(
+                            input_ids, reduction="mean"
+                        )
+            print(loss, "loss!!")
+
+            engine.zero_grad()
+            engine.backward(loss)
+            engine.step()
 
             epoch_loss += loss.item()
 
         logging.info(f"[Phase 2] Avg loss {epoch_loss/len(continual_loader):.4f}")
 
+        # ── 7. save & upload the Phase-2 checkpoint ───────────────────────────
         tag = STAGE_TAG[2]
-        if engine:
-            engine.save_checkpoint(args.save_dir, tag=tag)
-        else:
-            os.makedirs(os.path.join(args.save_dir, tag), exist_ok=True)
-            torch.save(
-                real_model.state_dict(),
-                os.path.join(args.save_dir, tag, "model.pth"),
-            )
-        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+        engine.save_checkpoint(args.save_dir, tag=tag)
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
             upload_checkpoint_to_s3(
-                local_dir=os.path.join(args.save_dir, STAGE_TAG[2]),
-                bucket=args.bucket,
-                remote_dir=STAGE_TAG[2]
+                local_dir  = os.path.join(args.save_dir, tag),
+                bucket     = args.bucket,
+                remote_dir = f"model/{tag}",
             )
+
 
     # --------------------------------------------------------------------- #
     #  PHASE 3 – Coconut (supervised) fine-tuning with mask curriculum      #
     # --------------------------------------------------------------------- #
     if 3 in args.stages:
+
         logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
         config.LEARNING_RATE = 1e-5
         config.LR_DECAY      = 0.95
-    
+
         # ----------------------------------------------------------------- #
         # Build ONE streaming dataloader (Parquet never fully in RAM)       #
         # ----------------------------------------------------------------- #
@@ -354,7 +434,7 @@ def train_model(
             streaming   = True        # ← **critical**
         )
         ds: PrecomputedDataset = ft_loader.dataset     # type: ignore
-    
+
         # ----------------------------------------------------------------- #
         # Iterate over the mask-fraction curriculum                         #
         # ----------------------------------------------------------------- #
@@ -365,13 +445,13 @@ def train_model(
                 f"→ Coconut stage {stage_idx+1}/{len(mask_stages)}  — "
                 f"mask {frac*100:.0f}% of reasoning tokens"
             )
-    
+
             real_model.train()
             epoch_loss = 0.0
-    
+
             for step, batch in enumerate(ft_loader):
                 input_ids = pad_to_global(batch["input_ids"].to(device))
-    
+
                 loss = real_model.forward_coconut(
                     input_ids       = input_ids,
                     attention_mask  = None,
@@ -379,7 +459,7 @@ def train_model(
                     latent_token_id = model.tokenizer.convert_tokens_to_ids("<bot>"),
                     reduction       = "mean",
                 )
-    
+
                 if use_deepspeed:
                     engine.zero_grad(); engine.backward(loss); engine.step()
                 else:
@@ -387,21 +467,21 @@ def train_model(
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
                     adam_optimizer.step()
-    
+
                 epoch_loss += loss.item()
-    
+
             logging.info(
                 f"[Coconut] Stage {stage_idx+1}/{len(mask_stages)} — "
                 f"avg loss {epoch_loss/len(ft_loader):.4f}"
             )
-    
+
         # ----------------------------------------------------------------- #
         # Save checkpoint after completing all mask stages                  #
         # ----------------------------------------------------------------- #
         coconut_tag = "supervised_finetuned_coconut"
         coconut_dir = os.path.join(args.save_dir, coconut_tag)
         os.makedirs(coconut_dir, exist_ok=True)
-    
+
         if use_deepspeed:
             engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
         else:
@@ -410,13 +490,14 @@ def train_model(
             upload_checkpoint_to_s3(
                 local_dir=os.path.join(args.save_dir, STAGE_TAG[3]),
                 bucket=args.bucket,
-                remote_dir=STAGE_TAG[3]
+                remote_dir=f"model/{STAGE_TAG[3]}"
             )
 
     # ------------------------------------------------------------------------
     # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
     # ------------------------------------------------------------------------
     if 4 in args.stages:
+
         logging.info("=== Starting EBM Fine-Tuning Phase ===")
         ebm_optimizer = torch.optim.Adam(model.ebm.parameters(), lr=args.ebm_lr)
         margin = getattr(args, "ebm_margin", 1.0)
@@ -505,7 +586,7 @@ def train_model(
             upload_checkpoint_to_s3(
                 local_dir=os.path.join(args.save_dir, STAGE_TAG[4]),
                 bucket=args.bucket,
-                remote_dir=STAGE_TAG[4]
+                remote_dir=f"model/{STAGE_TAG[4]}"
             )
 
         logging.info("Training complete.")
