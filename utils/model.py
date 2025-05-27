@@ -54,6 +54,9 @@ from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 from yunchang import set_seq_parallel_pg, LongContextAttention, EXTRACT_FUNC_DICT
 from yunchang.kernels import AttnType
 
+import contextlib
+import tqdm
+
 # -----------------------------------------------------------------------------#
 #  RoPE helpers
 # -----------------------------------------------------------------------------#
@@ -586,84 +589,110 @@ class SparseMoELanguageModel(nn.Module):
     # ------------------------------------------------------------------ #
     def forward_coconut(
         self,
-        input_ids: torch.Tensor,     # (B, T_global)
+        input_ids: torch.Tensor,
         attention_mask=None,
-        labels=None,                 # ignored
-        latent_token_id=None,        # id of "<reasoning>"
+        labels=None,                  # ignored
+        latent_token_id=None,         # id of "<reasoning>"
         reduction: str = "mean",
-    ):
-        """
-        Coconut forward (§3) with memory-friendly multi-pass, a gradient-
-        carrying final pass, and a debug helper that prepends "<reasoning>"
-        if a closing tag appears without its opener inside this shard.
-        """
+        show_progress: bool = True,
+        ):
         assert latent_token_id is not None, "pass latent_token_id=<reasoning>-id"
     
-        # ───────── shard / pad ──────────────────────────────────────────
+        # ------------------------------------------------------------
+        #  basic sharding / padding
+        # ------------------------------------------------------------
         world = dist.is_initialized()
         world_size = dist.get_world_size() if world else 1
         rank       = dist.get_rank()      if world else 0
         device     = input_ids.device
         T_glb      = self.block_size
     
-        ids_glb = self._pad_or_trim(input_ids, T_glb)
-        B, _    = ids_glb.shape
+        ids_full = self._pad_or_trim(input_ids, T_glb)          # (B, T_glb)
+    
         if world_size > 1:
-            if T_glb % world_size:
-                raise ValueError("block_size not divisible by world size")
             T_loc   = T_glb // world_size
-            ids_loc = ids_glb[:, rank*T_loc:(rank+1)*T_loc]
+            start   = rank * T_loc
+            end     = start + T_loc
+            ids_loc = ids_full[:, start:end]                     # (B, T_loc)
         else:
             T_loc   = T_glb
-            ids_loc = ids_glb
+            start   = 0
+            end     = T_loc
+            ids_loc = ids_full
     
         pad_id = self.tokenizer.pad_token_id
     
-        # ───────── prepend opener if needed (debug-time) ───────────────
+        # ------------------------------------------------------------
+        #  opener insertion (local slice) – keeps debug helper
+        # ------------------------------------------------------------
         eot_id   = self.tokenizer.convert_tokens_to_ids("</reasoning>")
-        has_eot  = (ids_loc == eot_id).any(dim=1)
-        has_bot  = (ids_loc == latent_token_id).any(dim=1)
-        need_bot = has_eot & ~has_bot
+        need_bot = ((ids_loc == eot_id).any(dim=1) &
+                    ~(ids_loc == latent_token_id).any(dim=1))
         if need_bot.any():
             rows = need_bot.nonzero(as_tuple=True)[0]
-            shifted = torch.cat([ ids_loc.new_full((rows.numel(), 1), latent_token_id),
-                                  ids_loc[rows, :-1] ], dim=1)
-            ids_loc = ids_loc.clone(); ids_loc[rows] = shifted
+            shift = torch.cat([ ids_loc.new_full((rows.numel(), 1), latent_token_id),
+                                ids_loc[rows, :-1] ], dim=1)
+            ids_loc = ids_loc.clone(); ids_loc[rows] = shift
+            ids_full[:, start:end] = ids_loc          # keep global view in sync
     
         # local attention mask
         if attention_mask is None:
             loc_mask = (ids_loc != pad_id).to(device)
         else:
-            full = self._pad_or_trim(attention_mask.long(), T_glb).bool()
-            loc_mask = full[:, rank*T_loc:(rank+1)*T_loc].to(device)
+            full_mask = self._pad_or_trim(attention_mask.long(), T_glb).bool()
+            loc_mask  = full_mask[:, start:end].to(device)
     
-        # ───────── span bookkeeping ────────────────────────────────────
-        emb_loc  = self.token_embedding_table(ids_loc)           # (B,T_loc,D)
-        bot_mask = (ids_loc == latent_token_id)
-        eot_mask = (ids_loc == eot_id)
-    
-        spans_per_sample = []
-        for b in range(B):
-            bots = bot_mask[b].nonzero(as_tuple=False).flatten()
-            eots = eot_mask[b].nonzero(as_tuple=False).flatten()
+        # ------------------------------------------------------------
+        #  build global reasoning spans, then clip to this shard
+        # ------------------------------------------------------------
+        spans_full = []
+        bot_id = latent_token_id
+        for b in range(ids_full.size(0)):
+            bots = (ids_full[b] == bot_id).nonzero(as_tuple=True)[0]
+            eots = (ids_full[b] == eot_id).nonzero(as_tuple=True)[0]
             spans = []
             for bp in bots:
                 later = eots[eots > bp]
                 if later.numel():
-                    spans.append([bp.item(), int(later[0])])
-            spans_per_sample.append(spans)
+                    spans.append([int(bp), int(later[0])])
+            spans_full.append(spans)
     
-        total_passes = max((ep-cp+1) for s in spans_per_sample for cp,ep in s) if any(spans_per_sample) else 0
+        spans_per_sample = []
+        for spans in spans_full:
+            local = []
+            for gcur, gend in spans:
+                if gend <= start or gcur >= end:
+                    continue
+                lcur = max(0, gcur - start)
+                lend = min(T_loc - 1, gend - start)
+                local.append([lcur, lend])
+            spans_per_sample.append(local)
+    
+        # ------------------------------------------------------------
+        #  BLOCK-stride multi-pass (no-grad)
+        # ------------------------------------------------------------
+        BLOCK = 32
+        total_passes = max(
+            math.ceil((ep - cp + 1) / BLOCK)
+            for spans in spans_per_sample for cp, ep in spans
+        ) if any(spans_per_sample) else 0
+    
         if world_size > 1:
-            tp = torch.tensor(total_passes, device=device, dtype=torch.long)
-            dist.all_reduce(tp, op=dist.ReduceOp.MAX); total_passes = int(tp.item())
+            tp = torch.tensor(total_passes, device=device)
+            dist.all_reduce(tp, op=dist.ReduceOp.MAX)
+            total_passes = int(tp)
     
-        total_aux = torch.zeros(1, device=device, dtype=emb_loc.dtype)
+        total_aux = torch.zeros(1, device=device, dtype=self.token_embedding_table.weight.dtype)
+        emb_loc   = self.token_embedding_table(ids_loc)
     
-        # ───────── multi-pass latent replacement (no grad) ─────────────
+        if total_passes and show_progress and rank == 0:
+            print(f"[Coconut] {total_passes} passes (BLOCK={BLOCK})")
+    
         if total_passes:
             with torch.no_grad():
-                for _ in range(total_passes):
+                for p in range(total_passes):
+                    if show_progress and rank == 0 and (p % max(1,total_passes//10) == 0 or p == total_passes-1):
+                        print(f"  pass {p+1}/{total_passes}")
                     x = self.dropout_emb(emb_loc)
                     for blk in self.blocks:
                         x, aux = blk(x, mask=loc_mask); total_aux += aux
@@ -671,56 +700,70 @@ class SparseMoELanguageModel(nn.Module):
     
                     new_emb = emb_loc.clone()
                     for b, spans in enumerate(spans_per_sample):
-                        for i, (cur,end) in enumerate(spans):
-                            if cur <= end:
-                                new_emb[b,cur] = x[b,cur]
-                                spans[i][0] += 1
+                        for i, (cur, end_) in enumerate(spans):
+                            if cur <= end_:
+                                blk_end = min(cur + BLOCK - 1, end_)
+                                new_emb[b, cur:blk_end+1] = x[b, cur:blk_end+1]
+                                spans[i][0] = blk_end + 1
                     emb_loc = new_emb
     
-            span_mask = (bot_mask | eot_mask).clone()
-            for b, spans in enumerate(spans_per_sample):
-                for cur_now,end in spans:
-                    span_mask[b,cur_now-1:end+1] = True
-        else:
-            span_mask = torch.zeros_like(ids_loc, dtype=torch.bool)
+        # global span-mask (needed for CE)
+        span_mask_full = torch.zeros_like(ids_full, dtype=torch.bool)
+        for b, spans in enumerate(spans_full):
+            for s, e in spans:
+                span_mask_full[b, s-1:e+1] = True      # include opener token-1
     
-        # ───────── one final forward WITH grad ─────────────────────────
+        # ------------------------------------------------------------
+        #  one final forward WITH grad (local shard)
+        # ------------------------------------------------------------
         emb_loc.requires_grad_(True)
         x = self.dropout_emb(emb_loc)
         for blk in self.blocks:
             x, aux = blk(x, mask=loc_mask); total_aux += aux
-        x = self.ln_f(x)
+        x = self.ln_f(x)                                   # (B, T_loc, D)
     
-        # ───────── compute loss (guaranteed non-empty gather) ──────────
-        kept_mask      = (~span_mask) & (ids_loc != pad_id)     # tokens we care about
-        post_shift_cnt = kept_mask[:,1:].sum()                  # after shift
+        # ------------------------------------------------------------
+        #  all-gather hidden states so CE sees full context
+        # ------------------------------------------------------------
+        if world_size > 1:
+            shards = [torch.empty_like(x) for _ in range(world_size)]
+            dist.all_gather(shards, x.contiguous())
+            x_full = torch.cat(shards, dim=1)              # (B, T_glb, D)
+        else:
+            x_full = x
+    
+        # ------------------------------------------------------------
+        #  global cross-entropy
+        # ------------------------------------------------------------
+        kept = (~span_mask_full) & (ids_full != pad_id)
+        n_tokens = kept[:,1:].sum()                        # after shift
     
         lm_w = self.lm_head.weight
-        with GatheredParameters([lm_w], enabled=hasattr(lm_w,"ds_numel")):
-            w = lm_w.clone() if hasattr(lm_w,"ds_numel") else lm_w
+        with GatheredParameters([lm_w], enabled=hasattr(lm_w, "ds_numel")):
+            w = lm_w.clone() if hasattr(lm_w, "ds_numel") else lm_w
     
-        if post_shift_cnt.item() == 0:               # ← this rank has zero targets
-            raw_ce = (x.sum() * 0)                   # scalar-0 with grad
-            n_local = torch.tensor(0, device=device, dtype=torch.long)
-        else:
-            targets = ids_loc.masked_fill(span_mask, pad_id)
-            raw_ce  = linear_cross_entropy(
-                e=x, c=w, targets=targets,
-                ignore_index=pad_id, reduction="sum", shift=1
-            )
-            n_local = post_shift_cnt
+        targets_full = ids_full.masked_fill(span_mask_full, pad_id)
+        raw_ce = linear_cross_entropy(
+            e = x_full,
+            c = w,
+            targets = targets_full,
+            ignore_index = pad_id,
+            reduction = "sum",
+            shift = 1
+        )
     
-        # still participate in collective ops so all ranks match
         if world_size > 1:
             with torch.no_grad():
-                dist.all_reduce(raw_ce); dist.all_reduce(n_local)
+                dist.all_reduce(raw_ce); dist.all_reduce(n_tokens)
     
-        denom = n_local.clamp(min=1)        # avoid div/0, ok because raw_ce=0 if n_local==0
-        loss  = raw_ce / denom
+        loss = raw_ce / n_tokens.clamp(min=1)
         if self.training:
             loss = loss + total_aux
+    
+        if rank == 0:
+            print(f"[Coconut] loss = {loss.item():.4f}")
+    
         return loss
-
 
     def get_embeddings(self, input_ids, pool=True):
         """Gets final layer embeddings, with optional mean pooling."""
