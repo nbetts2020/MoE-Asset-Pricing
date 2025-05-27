@@ -24,6 +24,9 @@ from huggingface_hub import login
 from datasets import load_dataset
 from dotenv import load_dotenv
 
+import boto3
+from botocore.exceptions import ClientError
+
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -1399,17 +1402,22 @@ def consolidate_checkpoint_to_pth(checkpoint_dir: str, tag: str, output_path: st
 
     return final_path
 
-def upload_checkpoint_to_s3(local_dir: str, bucket: str, remote_dir: str = "model"):
-    try:
-        logging.info(f"Uploading checkpoint from {local_dir} to s3://{bucket}/{remote_dir}")
-        result = subprocess.run(
-            ["aws", "s3", "sync", local_dir, f"s3://{bucket}/{remote_dir}"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        logging.info(f"Checkpoint directory synchronized successfully.\n{result.stdout}")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error syncing checkpoint directory: {e.stderr}")
-        raise
+def upload_checkpoint_to_s3(local_dir: str, bucket: str, remote_dir: str = "model", region: str = "us-west-1"):
+    """
+    Recursively upload all files under `local_dir` to s3://<bucket>/<remote_dir>/...
+    """
+    s3 = boto3.resource("s3", region_name=region)
+    bucket_obj = s3.Bucket(bucket)
+
+    for root, _, files in os.walk(local_dir):
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            # build the key by taking the path relative to local_dir
+            rel_path = os.path.relpath(local_path, local_dir)
+            s3_key = os.path.join(remote_dir, rel_path).replace(os.sep, "/")
+            try:
+                bucket_obj.upload_file(local_path, s3_key)
+                logging.info(f"Uploaded {local_path} → s3://{bucket}/{s3_key}")
+            except ClientError as e:
+                logging.error(f"Error uploading {local_path}: {e}")
+                raise
