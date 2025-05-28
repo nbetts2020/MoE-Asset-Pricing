@@ -417,82 +417,174 @@ def train_model(
     #  PHASE 3 – Coconut (supervised) fine-tuning with mask curriculum      #
     # --------------------------------------------------------------------- #
     if 3 in args.stages:
+        dbg("→ entering Phase 3")
 
-        logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
-        config.LEARNING_RATE = 1e-5
-        config.LR_DECAY      = 0.95
+        # ── 0. load the Phase-1 checkpoint before touching RoPE or SP groups ─────
+        dbg("loading Phase-2 checkpoint")
+        engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[2])
+        real_model = engine.module  # unwrap DeepSpeed
+        dbg("loaded Phase-2 model")
 
-        # ----------------------------------------------------------------- #
-        # Build ONE streaming dataloader (Parquet never fully in RAM)       #
-        # ----------------------------------------------------------------- #
-        ft_loader = prepare_ft_dataloader(
-            tokenizer   = tokenizer,
-            block_size  = config.BLOCK_SIZE,
-            shuffle     = True,
-            args        = args,
-            stage       = 2,          # ← ft_dataset_2.parquet
-            streaming   = True        # ← **critical**
-        )
-        ds: PrecomputedDataset = ft_loader.dataset     # type: ignore
+        device   = torch.device("cuda")
 
-        # ----------------------------------------------------------------- #
-        # Iterate over the mask-fraction curriculum                         #
-        # ----------------------------------------------------------------- #
-        mask_stages = config.COCONUT_MASK_STAGES
-        for stage_idx, frac in enumerate(mask_stages):
-            ds.mask_fraction = float(frac)             # dataset will apply masking
-            logging.info(
-                f"→ Coconut stage {stage_idx+1}/{len(mask_stages)}  — "
-                f"mask {frac*100:.0f}% of reasoning tokens"
+        # ── 3. rebuild sequence-parallel process groups & each attention ────
+        if dist.is_initialized():
+            from yunchang import set_seq_parallel_pg, LongContextAttention
+            from yunchang.kernels import AttnType
+
+            set_seq_parallel_pg(
+                config.SP_ULYSSES_DEGREE,
+                config.SP_RING_DEGREE,
+                dist.get_rank(),
+                dist.get_world_size(),
             )
 
-            real_model.train()
-            epoch_loss = 0.0
-
-            for step, batch in enumerate(ft_loader):
-                input_ids = pad_to_global(batch["input_ids"].to(device))
-
-                loss = real_model.forward_coconut(
-                    input_ids       = input_ids,
-                    attention_mask  = None,
-                    labels          = input_ids,
-                    latent_token_id = model.tokenizer.convert_tokens_to_ids("<bot>"),
-                    reduction       = "mean",
+            for blk in real_model.blocks:
+                blk.sa.usp_attn = LongContextAttention(
+                    scatter_idx     = 2,
+                    gather_idx      = 1,
+                    ring_impl_type  = "zigzag",
+                    use_pack_qkv    = True,
+                    use_sync        = True,
+                    attn_type       = AttnType.FA,
+                    attn_processor  = None,
                 )
 
-                if use_deepspeed:
-                    engine.zero_grad(); engine.backward(loss); engine.step()
-                else:
-                    adam_optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
-                    adam_optimizer.step()
+        # ── 4. zero out any optimizer state so momentum/etc doesn’t mix old context ─
+        dbg("zeroing DeepSpeed optimizer state")
+        engine.optimizer.zero_grad(set_to_none=True)
 
-                epoch_loss += loss.item()
+        # ── 5. sync again before you start training on the new context ─────────
+        dbg("before barrier #2")
+        dist.barrier()
+        dbg("passed barrier #2")
 
-            logging.info(
-                f"[Coconut] Stage {stage_idx+1}/{len(mask_stages)} — "
-                f"avg loss {epoch_loss/len(ft_loader):.4f}"
-            )
+        # ── 6. tiny RoPE-FT pass ─────────────────────────────────────────────
+        dbg("building continual_loader")
+        continual_loader = prepare_ft_dataloader(
+            tokenizer,
+            block_size = config.BLOCK_SIZE,
+            shuffle    = False,
+            args       = args,
+            stage      = 2,
+            streaming  = True,
+        )
+        dbg("continual_loader ready")
 
-        # ----------------------------------------------------------------- #
-        # Save checkpoint after completing all mask stages                  #
-        # ----------------------------------------------------------------- #
-        coconut_tag = "supervised_finetuned_coconut"
-        coconut_dir = os.path.join(args.save_dir, coconut_tag)
-        os.makedirs(coconut_dir, exist_ok=True)
+        real_model.train()
+        epoch_loss = 0.0
+        dbg("entering training loop")
 
-        if use_deepspeed:
-            engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={})
-        else:
-            torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth"))
-        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+        for idx, batch in enumerate(continual_loader):
+            print(idx, len(continual_loader))
+            bsz = batch["input_ids"].size(0)
+            if bsz != config.BATCH_SIZE:
+                dbg(f"Skipping stray batch of size {bsz}")
+                continue
+
+            input_ids = pad_to_global(batch["input_ids"].to(device))
+            loss      = real_model.forward_next_token_efficient(
+                            input_ids, reduction="mean"
+                        )
+            print(loss, "loss!!")
+
+            engine.zero_grad()
+            engine.backward(loss)
+            engine.step()
+
+            epoch_loss += loss.item()
+
+        logging.info(f"[Phase 3] Avg loss {epoch_loss/len(continual_loader):.4f}")
+
+        # ── 7. save & upload the Phase-2 checkpoint ───────────────────────────
+        tag = STAGE_TAG[3]
+        engine.save_checkpoint(args.save_dir, tag=tag)
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
             upload_checkpoint_to_s3(
-                local_dir=os.path.join(args.save_dir, STAGE_TAG[3]),
-                bucket=args.bucket,
-                remote_dir=f"model/{STAGE_TAG[3]}"
+                local_dir  = os.path.join(args.save_dir, tag),
+                bucket     = args.bucket,
+                remote_dir = f"model/{tag}",
             )
+    # if 3 in args.stages:
 
+    #     logging.info("=== Starting Supervised Fine-Tuning (Coconut) ===")
+    #     config.LEARNING_RATE = 1e-5 # Set learning rate for this stage
+    #     config.LR_DECAY      = 0.95 # Set learning rate decay for this stage
+
+    #     mask_stages = config.COCONUT_MASK_STAGES # Get mask stages from config
+    #     mask_stages = [0.05, 1.0] # Example override for testing
+
+    #     for stage_idx, frac in enumerate(mask_stages):
+    #         logging.info(
+    #             f"→ Coconut curriculum stage {stage_idx+1}/{len(mask_stages)}  — "
+    #             f"mask_fraction {frac*100:.0f}%"
+    #         )
+
+    #         # Re-create the dataloader for each mask fraction stage to ensure it's applied
+    #         ft_loader = prepare_ft_dataloader(
+    #             tokenizer   = tokenizer, # Pass tokenizer
+    #             block_size  = config.BLOCK_SIZE, # Pass block size
+    #             shuffle     = True, # Shuffle data for training
+    #             args        = args, # Pass command line arguments
+    #             stage       = 2,    # Use ft_dataset_2.parquet for this phase
+    #             streaming   = True, # Use streaming for large datasets
+    #             mask_fraction = float(frac) # Pass the current mask fraction to the dataloader
+    #         )
+    #         # ds: PrecomputedDataset = ft_loader.dataset # No longer need to directly manipulate ds.mask_fraction
+
+    #         real_model.train() # Set model to training mode
+    #         epoch_loss = 0.0 # Initialize epoch loss
+
+    #         # Iterate over batches from the dataloader
+    #         for step, batch in enumerate(ft_loader):
+    #             input_ids = pad_to_global(batch["input_ids"].to(device)) # Pad batch and move to device
+
+    #             # Perform forward pass with Coconut logic
+    #             loss = real_model.forward_coconut(
+    #                 input_ids       = input_ids,
+    #                 attention_mask  = None, # Assuming full attention or handled internally
+    #                 labels          = input_ids, # Using input_ids as labels for MLM-like objective or internal handling
+    #                 latent_token_id = model.tokenizer.convert_tokens_to_ids("<bot>"), # Pass latent token ID
+    #                 reduction       = "mean", # Loss reduction method
+    #             )
+
+    #             # Backward pass and optimizer step
+    #             if use_deepspeed:
+    #                 engine.zero_grad()
+    #                 engine.backward(loss)
+    #                 engine.step()
+    #             else:
+    #                 adam_optimizer.zero_grad()
+    #                 loss.backward()
+    #                 torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0) # Gradient clipping
+    #                 adam_optimizer.step()
+
+    #             epoch_loss += loss.item() # Accumulate loss
+
+    #         logging.info(
+    #             f"[Coconut] Curriculum Stage {stage_idx+1}/{len(mask_stages)} — "
+    #             f"Avg Epoch Loss: {epoch_loss/len(ft_loader):.4f}"
+    #         )
+
+    #     # Save checkpoint after completing all mask stages
+    #     coconut_tag = "supervised_finetuned_coconut"
+    #     coconut_dir = os.path.join(args.save_dir, coconut_tag)
+    #     os.makedirs(coconut_dir, exist_ok=True) # Create directory if it doesn't exist
+
+    #     if use_deepspeed:
+    #         engine.save_checkpoint(args.save_dir, tag=coconut_tag, client_state={}) # Save DeepSpeed checkpoint
+    #     else:
+    #         torch.save(model.state_dict(), os.path.join(coconut_dir, "model.pth")) # Save standard PyTorch model
+        
+    #     # Upload checkpoint to S3 if applicable
+    #     if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+    #         upload_checkpoint_to_s3(
+    #             local_dir=os.path.join(args.save_dir, STAGE_TAG[3]), # Use STAGE_TAG for consistency
+    #             bucket=args.bucket,
+    #             remote_dir=f"model/{STAGE_TAG[3]}"
+    #         )
+            
     # ------------------------------------------------------------------------
     # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
     # ------------------------------------------------------------------------
