@@ -605,7 +605,8 @@ def train_model(
                     block_size=config.BLOCK_SIZE,
                     shuffle=True,
                     args=args,
-                    stage=stage
+                    stage=stage,
+                    streaming=True
                 )
                 for batch in ebm_loader:
                     ids = batch['input_ids'].to(device)
@@ -644,7 +645,8 @@ def train_model(
             block_size=config.BLOCK_SIZE,
             shuffle=False,
             args=args,
-            stage=8
+            stage=8,
+            streaming=True
         )
         val_loss = 0.0
         steps = 0
