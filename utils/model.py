@@ -184,7 +184,7 @@ class MultiHeadAttention(nn.Module):
 
         # 5) chunked ring-flash
         # split into 4 KV chunks to save peak memory
-        M = 4
+        M = 1
         attn_accum = torch.zeros_like(q_rope)
         for k_chunk, v_chunk in zip(current_k.chunk(M, dim=1), current_v.chunk(M, dim=1)):
             out = self.usp_attn(
