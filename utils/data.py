@@ -90,29 +90,12 @@ def rreplace(s, old, new, occurrence=1):
 # PRECOMPUTED SINGLE-TEXT DATASET
 # -------------------------------------------------------------------------
 class PrecomputedDataset(Dataset):
-    """
-    Parquet-backed dataset.
-
-    • If `streaming=True`, each sample is read lazily from the Parquet
-      file, so only a single row-group lives in RAM at once.
-    • When `streaming=False` the full DataFrame is held in memory
-      (legacy behaviour).
-
-    The curriculum for Coconut masking is driven by the *mutable*
-    attribute `mask_fraction` (0 → no masking, 1 → mask the whole
-    <reasoning> span).  Phase-3 code can update that field between
-    passes:
-
-        ds.mask_fraction = 0.0   # first pass, no masking
-        ds.mask_fraction = 1.0   # second pass, full masking
-    """
-
     def __init__(
         self,
-        source,                     # pandas.DataFrame 𝘰𝘳 str(path-to-parquet)
+        source,
         tokenizer,
         block_size: int,
-        mask_fraction: float = 1.0, # initial masking ratio
+        mask_fraction: float = 1.0,
         streaming: bool = False
     ):
         self.streaming      = streaming
@@ -120,54 +103,47 @@ class PrecomputedDataset(Dataset):
         self.block_size     = block_size
         self.mask_fraction  = float(mask_fraction)
 
-        # --- cache special-token ids once ----------------------------------
         self.latent_id = tokenizer.convert_tokens_to_ids("<bot>")
         self.start_id  = tokenizer.convert_tokens_to_ids("<reasoning>")
         self.end_id    = tokenizer.convert_tokens_to_ids("</reasoning>")
         self.bos_id    = tokenizer.bos_token_id
+        self.eot_id_for_opener = tokenizer.convert_tokens_to_ids("</reasoning>")
 
-        # --- pick storage mode --------------------------------------------
         if streaming:
-            self.pq_file = pq.ParquetFile(source)          # lazy, columnar
+            self.pq_file = pq.ParquetFile(source)
             self._n      = self.pq_file.metadata.num_rows
         else:
             self.df = source.reset_index(drop=True)
+            self._n = len(self.df)
 
-    # ------------------------------------------------------------------ #
     def __len__(self) -> int:
-        return self._n if self.streaming else len(self.df)
+        return self._n
 
-    # ------------------------------------------------------------------ #
     def _get_row(self, idx: int) -> dict:
         if not self.streaming:
             return self.df.iloc[idx]
 
-        # Which row-group contains this row?
         rg_size   = self.pq_file.metadata.row_group(0).num_rows
         rg_index  = idx // rg_size
         offset    = idx %  rg_size
-
         batch = (
             self.pq_file
-                .read_row_group(rg_index)   # load one small row-group
-                .slice(offset, 1)           # keep just the single row
+                .read_row_group(rg_index)
+                .slice(offset, 1)
         )
         return {col: batch[col][0].as_py() for col in batch.schema.names}
 
-    # ------------------------------------------------------------------ #
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row        = self._get_row(idx)
         text       = row.get("text", "")
         raw_label  = row.get("weighted_avg_720_hrs", 0.0)
 
-        # append numeric label in the expected tag format
         label_str  = (
             f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f} "
             f"</STOCK PRICE 30 DAYS OUT>"
         )
         new_text   = text + label_str
 
-        # tokenize (left-truncation to `block_size`)
         self.tokenizer.truncation_side = "left"
         enc  = self.tokenizer(
             new_text,
@@ -176,23 +152,31 @@ class PrecomputedDataset(Dataset):
             max_length   = self.block_size,
             return_tensors = "pt",
         )
-        ids  = enc["input_ids"].squeeze(0).tolist()
+        
+        ids_list  = enc["input_ids"].squeeze(0).tolist()
 
-        # prepend <s> and drop final token to keep length constant
-        ids = [self.bos_id] + ids[:-1]
+        if ids_list[0] != self.bos_id :
+            ids_list = [self.bos_id] + ids_list[:-1]
+        
+        has_eot = self.eot_id_for_opener in ids_list
+        has_bot = self.latent_id in ids_list
 
-        # -------- Coconut masking ---------------------------------------
+        if has_eot and not has_bot:
+            ids_list = [self.latent_id] + ids_list[:-1]
+
         if 0.0 < self.mask_fraction <= 1.0:
-            ids = schedule_masking(
-                ids,
+            ids_list = schedule_masking(
+                ids_list,
                 self.start_id,
                 self.end_id,
                 self.latent_id,
                 mask_fraction = self.mask_fraction,
             )
+        
+        final_ids_tensor = torch.tensor(ids_list, dtype=torch.long)
 
         return {
-            "input_ids": torch.tensor(ids,        dtype=torch.long),
+            "input_ids": final_ids_tensor,
             "label":     torch.tensor(raw_label, dtype=torch.float32),
         }
 
@@ -200,35 +184,76 @@ class PrecomputedDataset(Dataset):
 # PRECOMPUTED BOOTSTRAP DATASET (25 TEXT ITERATIONS)
 # -------------------------------------------------------------------------
 class PrecomputedBootstrapDataset(Dataset):
-    def __init__(self, df, tokenizer, block_size, text_columns, label_column):
-        self.df = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.block_size = block_size
-        self.text_cols = text_columns
-        self.label_col = label_column
+    """
+    Parquet-backed bootstrap dataset. If streaming=True, reads
+    one row at a time from the Parquet file to keep memory low.
+    Otherwise loads the full DataFrame into RAM.
+    """
+    def __init__(
+        self,
+        source,                    # either pd.DataFrame or str(path-to-parquet)
+        tokenizer,
+        block_size: int,
+        text_columns: list[str],
+        label_column: str,
+        streaming: bool = False
+    ):
+        self.streaming    = streaming
+        self.tokenizer    = tokenizer
+        self.block_size   = block_size
+        self.text_cols    = text_columns
+        self.label_col    = label_column
 
-    def __len__(self):
-        return len(self.df)
+        if streaming:
+            # lazy, columnar reader
+            self.pq_file = pq.ParquetFile(source)
+            self._n      = self.pq_file.metadata.num_rows
+        else:
+            # in-memory
+            self.df = source.reset_index(drop=True)
+            self._n = len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+    def __len__(self) -> int:
+        return self._n
+
+    def _get_row(self, idx: int) -> pd.Series:
+        if not self.streaming:
+            return self.df.iloc[idx]
+        # streaming mode: locate the row-group and offset
+        rg_size  = self.pq_file.metadata.row_group(0).num_rows
+        rg_index = idx // rg_size
+        offset   = idx % rg_size
+        batch = (
+            self.pq_file
+                .read_row_group(rg_index)
+                .slice(offset, 1)
+        )
+        # convert single-row Table to dict→Series
+        data = {col: batch[col][0].as_py() for col in batch.schema.names}
+        return pd.Series(data)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        row = self._get_row(idx)
+        # gather the K different texts for this bootstrap sample
         texts = [row[col] for col in self.text_cols]
         label = torch.tensor(row[self.label_col], dtype=torch.float32)
-        
-        # tokenize each bootstrap text
+
+        # tokenize each of the K texts
         all_ids = []
         for txt in texts:
             enc = self.tokenizer(
                 txt,
                 truncation=True,
-                padding='max_length',
-                max_length=config.BLOCK_SIZE,
-                return_tensors='pt'
+                padding="max_length",
+                max_length=self.block_size,
+                return_tensors="pt",
             )
-            all_ids.append(enc['input_ids'].squeeze(0))
-        input_ids = torch.stack(all_ids, dim=0)  # (K, T)
-        return {'input_ids': input_ids, 'label': label}
+            all_ids.append(enc["input_ids"].squeeze(0))
+        # stack into shape (K, T)
+        input_ids = torch.stack(all_ids, dim=0)
 
+        return {"input_ids": input_ids, "label": label}
+        
 # -------------------------------------------------------------------------
 # CUSTOM COLLATE FUNCTIONS
 # -------------------------------------------------------------------------
@@ -253,6 +278,7 @@ def prepare_ft_dataloader(
     stage: int = 1,
     sampler=None,
     streaming: bool = False,
+    mask_fraction: float = 0.0
 ):
     """
     stage:
@@ -295,7 +321,7 @@ def prepare_ft_dataloader(
             df_or_path,
             tokenizer,
             block_size      = block_size,
-            mask_fraction   = 0.0,       # no masking for phases 1&2
+            mask_fraction   = mask_fraction,
             streaming       = streaming,
         )
         collate    = custom_collate_fn
