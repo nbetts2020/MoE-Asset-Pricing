@@ -2,6 +2,9 @@
 # =============================================================================
 #  Sequence-Parallel Unified‑SP (YunChang) Attention + Sparse‑MoE LM
 # =============================================================================
+import sys
+sys.path.insert(0, "/home/ubuntu/MoE-Asset-Pricing/flash-attention")
+sys.path.insert(0, "/home/ubuntu/MoE-Asset-Pricing/long-context-attention")
 
 import torch
 torch.Tensor.continous = torch.Tensor.contiguous
@@ -16,8 +19,6 @@ def _SeqApply_shim(*args, **kwargs):
     return _SeqApply_orig(*args)
 _yc_attn.SeqAllToAll4D.apply = _SeqApply_shim
 
-import sys
-sys.path.insert(0, "/home/ubuntu/MoE-Asset-Pricing/flash-attention")
 
 import flash_attn.flash_attn_interface as _fai
 import flash_attn                       as _fa
@@ -104,7 +105,7 @@ def apply_rope(
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_embed: int, n_head: int):
         super().__init__()
-        assert n_embed % n_head == 0, "Embedding dimension must be divisible by number of heads"
+        assert n_embed % n_head == 0
         self.n_head = n_head
         self.head_dim = n_embed // n_head
         self.n_embed = n_embed
@@ -112,13 +113,11 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed, bias=False)
 
-        # RoPE buffers
-        self.max_seq = config.BLOCK_SIZE  # initial max seq length
+        self.max_seq = config.BLOCK_SIZE
         sin, cos = build_sin_cos(self.max_seq, self.head_dim // 2, torch.device("cpu"))
         self.register_buffer("rope_sin", sin.float(), persistent=False)
         self.register_buffer("rope_cos", cos.float(), persistent=False)
 
-        # set up sequence-parallel process groups
         if dist.is_initialized():
             set_seq_parallel_pg(
                 config.SP_ULYSSES_DEGREE,
@@ -127,51 +126,68 @@ class MultiHeadAttention(nn.Module):
                 dist.get_world_size()
             )
 
-        # Unified Sequence-Parallel Attention
         self.usp_attn = LongContextAttention(
-            scatter_idx=2,            # optional, defaults to 2
-            gather_idx=1,             # optional, defaults to 1
+            scatter_idx=2,
+            gather_idx=1,
             ring_impl_type="zigzag",
             use_pack_qkv=True,
             use_sync=True,
             attn_type=AttnType.FA,
-            attn_processor=None,      # leave as default unless you have a custom processor
+            attn_processor=None,
         )
 
     def update_rope(self, new_len: int, base: float = 10_000.0):
-        """Extends RoPE buffers if needed."""
         if new_len <= self.max_seq:
             return
-        logging.info(f"Extending RoPE max sequence length from {self.max_seq} to {new_len}")
         self.max_seq = new_len
         sin, cos = build_sin_cos(new_len, self.head_dim // 2, torch.device("cpu"), base=base)
         self._buffers['rope_sin'] = sin.float()
         self._buffers['rope_cos'] = cos.float()
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, return_attn_probs: bool = False):
-        # x: (B, T_local, C)
-        B, T_local, C = x.shape
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor = None,
+        past_k: torch.Tensor = None,
+        past_v: torch.Tensor = None,
+        return_attn_probs: bool = False
+    ):
+        B, T_new, C = x.shape
         device = x.device
-        rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
+        
+        qkv_new_proj = self.qkv(x)
+        q_new, k_new, v_new = qkv_new_proj.view(B, T_new, self.n_head, 3 * self.head_dim).split(self.head_dim, dim=-1)
 
-        # 1) Project to QKV
-        qkv = self.qkv(x).view(B, T_local, self.n_head, 3 * self.head_dim)
-        q_local, k_local, v_local = qkv.split(self.head_dim, dim=-1)
+        start_pos = past_k.shape[1] if past_k is not None else 0
+        total_len_for_rope = start_pos + T_new
+        
+        self.update_rope(total_len_for_rope)
+        
+        sin_val = self.rope_sin[start_pos : start_pos + T_new].to(device=device, dtype=x.dtype)
+        cos_val = self.rope_cos[start_pos : start_pos + T_new].to(device=device, dtype=x.dtype)
+        
+        q_rope, k_rope = apply_rope(q_new, k_new, sin_val, cos_val)
+        v_rope = v_new
 
-        # 2) Apply RoPE
-        total_seq = T_local * world_size
-        self.update_rope(total_seq)
-        sin = self.rope_sin[:total_seq].to(device)
-        cos = self.rope_cos[:total_seq].to(device)
-        start = rank * T_local
-        sin_l = sin[start:start + T_local]
-        cos_l = cos[start:start + T_local]
-        q_local_rope, k_local_rope = apply_rope(q_local, k_local, sin_l, cos_l)
+        if past_k is not None:
+            current_k = torch.cat((past_k, k_rope), dim=1)
+            current_v = torch.cat((past_v, v_rope), dim=1)
+        else:
+            current_k = k_rope
+            current_v = v_rope
 
-        # 3) USP attention call
-        out = self.usp_attn(
-            q_local_rope, k_local_rope, v_local,
+        MAX_CACHE_LEN = int(config.BLOCK_SIZE / world_size)
+        
+        if current_k.shape[1] > MAX_CACHE_LEN:
+            current_k = current_k[:, -MAX_CACHE_LEN:, :, :]
+        if current_v.shape[1] > MAX_CACHE_LEN:
+            current_v = current_v[:, -MAX_CACHE_LEN:, :, :]
+            
+        current_q = q_rope
+
+        attn_output_from_usp = self.usp_attn(
+            current_q, current_k, current_v,
             dropout_p = config.DROPOUT if self.training else 0.0,
             softmax_scale=None,
             causal=True,
@@ -179,11 +195,26 @@ class MultiHeadAttention(nn.Module):
             softcap=0.0,
             alibi_slopes=None,
             deterministic=True,
-            return_attn_probs=False,
+            return_attn_probs=return_attn_probs
         )
-        attn_out = out.reshape(B, T_local, C)
-        # 4) Final projection
-        return self.proj(attn_out)
+        
+        attn_probs = None
+        if return_attn_probs:
+            if isinstance(attn_output_from_usp, tuple) and len(attn_output_from_usp) > 1:
+                attn_ctx_output = attn_output_from_usp[0]
+                attn_probs = attn_output_from_usp[1] 
+            else:
+                attn_ctx_output = attn_output_from_usp 
+        else:
+            attn_ctx_output = attn_output_from_usp
+
+        attn_ctx_output_reshaped = attn_ctx_output.reshape(B, T_new, C)
+        
+        y = self.proj(attn_ctx_output_reshaped)
+
+        if return_attn_probs:
+            return y, current_k, current_v, attn_probs 
+        return y, current_k, current_v
 
 # -----------------------------------------------------------------------------#
 #  Mixture-of-Experts blocks
@@ -310,19 +341,33 @@ class SparseMoE(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block using USP Attention and SparseMoE FFN."""
+    """Transformer block using USP Attention and SparseMoE FFN, with KV-cache support."""
     def __init__(self, d: int, n_head: int, n_exp: int, top_k: int):
         super().__init__()
         self.ln1 = nn.LayerNorm(d)
-        self.sa = MultiHeadAttention(d, n_head)
+        self.sa  = MultiHeadAttention(d, n_head)
         self.ln2 = nn.LayerNorm(d)
         self.moe = SparseMoE(d, n_exp, top_k)
 
-    def forward(self, x_local, mask=None):
-        attn_out = self.sa(self.ln1(x_local), mask=mask)
-        x = x_local + attn_out
-        moe_out, aux_loss = self.moe(self.ln2(x))
-        return x + moe_out, aux_loss
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_k: Optional[torch.Tensor] = None,
+        past_v: Optional[torch.Tensor] = None,
+    ):
+        # 1) Self-attn with cache
+        x_norm = self.ln1(x)
+        attn_out, k, v = self.sa(x_norm, mask=mask, past_k=past_k, past_v=past_v)
+        x = x + attn_out
+
+        # 2) MoE feed-forward
+        ff_in = self.ln2(x)
+        moe_out, aux_loss = self.moe(ff_in)
+        x = x + moe_out
+
+        # 3) Return updated hidden + aux loss + new cache
+        return x, aux_loss, k, v
 
 # -----------------------------------------------------------------------------#
 #  Sparse-MoE Language Model
@@ -351,7 +396,7 @@ class SparseMoELanguageModel(nn.Module):
             special = {
                 'additional_special_tokens': [
                     '<bot>', '<start_latent>', '<end_latent>', '<eot>',
-                    '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: '
+                    '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ', ' </STOCK PRICE 30 DAYS OUT>'
                 ]
             }
             self.tokenizer.add_special_tokens(special)
@@ -512,7 +557,7 @@ class SparseMoELanguageModel(nn.Module):
         total_aux = torch.tensor(0.0, device=device, dtype=x_local.dtype)
         cur       = x_local
         for blk in self.blocks:
-            cur, aux = blk(cur, mask=local_mask)
+            cur, aux, _, _ = blk(cur, mask=local_mask)
             if self.training:
                 total_aux += aux
         x_processed = self.ln_f(cur)                    # (B, T_local, D)
@@ -591,180 +636,177 @@ class SparseMoELanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask=None,
-        labels=None,                  # ignored
-        latent_token_id=None,         # id of "<reasoning>"
+        labels=None,
+        latent_token_id=None,
         reduction: str = "mean",
         show_progress: bool = True,
-        ):
-        assert latent_token_id is not None, "pass latent_token_id=<reasoning>-id"
+    ):
+        assert latent_token_id is not None  # Ensure latent_token_id is provided
     
-        # ------------------------------------------------------------
-        #  basic sharding / padding
-        # ------------------------------------------------------------
-        world = dist.is_initialized()
+        world      = dist.is_initialized()
         world_size = dist.get_world_size() if world else 1
         rank       = dist.get_rank()      if world else 0
         device     = input_ids.device
         T_glb      = self.block_size
+        B          = input_ids.size(0)
     
-        ids_full = self._pad_or_trim(input_ids, T_glb)          # (B, T_glb)
-    
+        # Pad/trim & shard
+        ids_full = self._pad_or_trim(input_ids, T_glb)  # (B, T_glb)
         if world_size > 1:
-            T_loc   = T_glb // world_size
-            start   = rank * T_loc
-            end     = start + T_loc
-            ids_loc = ids_full[:, start:end]                     # (B, T_loc)
+            T_loc = T_glb // world_size
+            start_idx_loc = rank * T_loc
+            end_idx_loc   = start_idx_loc + T_loc
         else:
-            T_loc   = T_glb
-            start   = 0
-            end     = T_loc
-            ids_loc = ids_full
+            T_loc = T_glb
+            start_idx_loc = 0
+            end_idx_loc   = T_glb
+        ids_loc = ids_full[:, start_idx_loc:end_idx_loc]  # (B, T_loc)
     
-        pad_id = self.tokenizer.pad_token_id
-    
-        # ------------------------------------------------------------
-        #  opener insertion (local slice) – keeps debug helper
-        # ------------------------------------------------------------
-        eot_id   = self.tokenizer.convert_tokens_to_ids("</reasoning>")
-        need_bot = ((ids_loc == eot_id).any(dim=1) &
-                    ~(ids_loc == latent_token_id).any(dim=1))
-        if need_bot.any():
-            rows = need_bot.nonzero(as_tuple=True)[0]
-            shift = torch.cat([ ids_loc.new_full((rows.numel(), 1), latent_token_id),
-                                ids_loc[rows, :-1] ], dim=1)
-            ids_loc = ids_loc.clone(); ids_loc[rows] = shift
-            ids_full[:, start:end] = ids_loc          # keep global view in sync
-    
-        # local attention mask
-        if attention_mask is None:
-            loc_mask = (ids_loc != pad_id).to(device)
-        else:
-            full_mask = self._pad_or_trim(attention_mask.long(), T_glb).bool()
-            loc_mask  = full_mask[:, start:end].to(device)
-    
-        # ------------------------------------------------------------
-        #  build global reasoning spans, then clip to this shard
-        # ------------------------------------------------------------
-        spans_full = []
+        pad_id = self.tokenizer.pad_token_id or -1
+        eot_id = self.tokenizer.convert_tokens_to_ids("</reasoning>")
         bot_id = latent_token_id
-        for b in range(ids_full.size(0)):
-            bots = (ids_full[b] == bot_id).nonzero(as_tuple=True)[0]
-            eots = (ids_full[b] == eot_id).nonzero(as_tuple=True)[0]
-            spans = []
-            for bp in bots:
-                later = eots[eots > bp]
-                if later.numel():
-                    spans.append([int(bp), int(later[0])])
-            spans_full.append(spans)
     
-        spans_per_sample = []
-        for spans in spans_full:
-            local = []
-            for gcur, gend in spans:
-                if gend <= start or gcur >= end:
-                    continue
-                lcur = max(0, gcur - start)
-                lend = min(T_loc - 1, gend - start)
-                local.append([lcur, lend])
-            spans_per_sample.append(local)
-    
-        # ------------------------------------------------------------
-        #  BLOCK-stride multi-pass (no-grad)
-        # ------------------------------------------------------------
-        BLOCK = 32
-        total_passes = max(
-            math.ceil((ep - cp + 1) / BLOCK)
-            for spans in spans_per_sample for cp, ep in spans
-        ) if any(spans_per_sample) else 0
-    
-        if world_size > 1:
-            tp = torch.tensor(total_passes, device=device)
-            dist.all_reduce(tp, op=dist.ReduceOp.MAX)
-            total_passes = int(tp)
-    
-        total_aux = torch.zeros(1, device=device, dtype=self.token_embedding_table.weight.dtype)
-        emb_loc   = self.token_embedding_table(ids_loc)
-    
-        if total_passes and show_progress and rank == 0:
-            print(f"[Coconut] {total_passes} passes (BLOCK={BLOCK})")
-    
-        if total_passes:
-            with torch.no_grad():
-                for p in range(total_passes):
-                    if show_progress and rank == 0 and (p % max(1,total_passes//10) == 0 or p == total_passes-1):
-                        print(f"  pass {p+1}/{total_passes}")
-                    x = self.dropout_emb(emb_loc)
-                    for blk in self.blocks:
-                        x, aux = blk(x, mask=loc_mask); total_aux += aux
-                    x = self.ln_f(x)
-    
-                    new_emb = emb_loc.clone()
-                    for b, spans in enumerate(spans_per_sample):
-                        for i, (cur, end_) in enumerate(spans):
-                            if cur <= end_:
-                                blk_end = min(cur + BLOCK - 1, end_)
-                                new_emb[b, cur:blk_end+1] = x[b, cur:blk_end+1]
-                                spans[i][0] = blk_end + 1
-                    emb_loc = new_emb
-    
-        # global span-mask (needed for CE)
-        span_mask_full = torch.zeros_like(ids_full, dtype=torch.bool)
-        for b, spans in enumerate(spans_full):
-            for s, e in spans:
-                span_mask_full[b, s-1:e+1] = True      # include opener token-1
-    
-        # ------------------------------------------------------------
-        #  one final forward WITH grad (local shard)
-        # ------------------------------------------------------------
-        emb_loc.requires_grad_(True)
-        x = self.dropout_emb(emb_loc)
-        for blk in self.blocks:
-            x, aux = blk(x, mask=loc_mask); total_aux += aux
-        x = self.ln_f(x)                                   # (B, T_loc, D)
-    
-        # ------------------------------------------------------------
-        #  all-gather hidden states so CE sees full context
-        # ------------------------------------------------------------
-        if world_size > 1:
-            shards = [torch.empty_like(x) for _ in range(world_size)]
-            dist.all_gather(shards, x.contiguous())
-            x_full = torch.cat(shards, dim=1)              # (B, T_glb, D)
+        if attention_mask is None:
+            full_attention_mask = (ids_full != pad_id)
         else:
-            x_full = x
+            full_attention_mask = self._pad_or_trim(attention_mask.long(), T_glb).bool()
+        loc_mask = full_attention_mask[:, start_idx_loc:end_idx_loc].to(device)
     
-        # ------------------------------------------------------------
-        #  global cross-entropy
-        # ------------------------------------------------------------
-        kept = (~span_mask_full) & (ids_full != pad_id)
-        n_tokens = kept[:,1:].sum()                        # after shift
+        # Find spans & compute max_ct_steps_in_batch
+        spans_full_global_indices = []
+        max_ct_steps_in_batch = 0
+        for b_idx in range(B):
+            bot_indices = (ids_full[b_idx] == bot_id).nonzero(as_tuple=True)[0]
+            eot_indices = (ids_full[b_idx] == eot_id).nonzero(as_tuple=True)[0]
+            current_batch_spans = []
+            for b_g_idx in bot_indices:
+                later_eots = eot_indices[eot_indices > b_g_idx]
+                if later_eots.numel() > 0:
+                    e_g_idx = later_eots[0].item()
+                    num_cts = e_g_idx - b_g_idx.item() - 1
+                    if num_cts >= 0:
+                        current_batch_spans.append((b_g_idx.item(), e_g_idx))
+                        max_ct_steps_in_batch = max(max_ct_steps_in_batch, num_cts)
+            spans_full_global_indices.append(current_batch_spans)
+        if world:
+            tmp = torch.tensor(max_ct_steps_in_batch, device=device)
+            dist.all_reduce(tmp, op=dist.ReduceOp.MAX)
+            max_ct_steps_in_batch = int(tmp.item())
+    
+        # --- MODIFICATION: Cap max_ct_steps_in_batch to prevent OOM ---
+        HARD_LIMIT_MAX_CTS = getattr(config, "COCONUT_MAX_ITERATIONS", 50)
+        if max_ct_steps_in_batch > HARD_LIMIT_MAX_CTS:
+            if rank == 0 and show_progress:
+                print(f"WARNING: Capping max_ct_steps_in_batch from {max_ct_steps_in_batch} to {HARD_LIMIT_MAX_CTS}")
+            max_ct_steps_in_batch = HARD_LIMIT_MAX_CTS
+        # --- END MODIFICATION ---
+    
+        # Prepare storage
+        current_g_embeddings = self.token_embedding_table(ids_full).detach().clone()  # (B, T_glb, D)
+        total_aux_loss = torch.zeros(1, device=device)
+        n_layers = len(self.blocks)
+        past_ks = [None] * n_layers
+        past_vs = [None] * n_layers
+    
+        # INITIAL FULL PASS TO BUILD CACHE
+        x_loc = self.dropout_emb(current_g_embeddings[:, start_idx_loc:end_idx_loc])
+        for i, blk in enumerate(self.blocks):
+            out, aux, k, v = blk(x_loc, mask=loc_mask, past_k=None, past_v=None)
+            total_aux_loss += aux
+            past_ks[i], past_vs[i] = k, v
+            x_loc = out
+    
+        # Gather full hidden to select initial CT input
+        if world:
+            shards = [torch.empty_like(x_loc) for _ in range(world_size)]
+            dist.all_gather(shards, x_loc.contiguous())
+            h_full_global = torch.cat(shards, dim=1)
+        else:
+            h_full_global = x_loc
+    
+        # Pick the first '<reasoning>' hidden as 'cur'
+        cur = torch.stack([
+            h_full_global[b, spans_full_global_indices[b][0][0], :]
+            for b in range(B)
+        ], dim=0).unsqueeze(1)  # (B,1,D)
+    
+        # ITERATIVE CT PASSES WITH KV CACHE
+        for ct_iter in range(max_ct_steps_in_batch):
+            if show_progress and rank == 0:
+                print(f"  CT Gen Pass {ct_iter+1}/{max_ct_steps_in_batch}")
+            x_step = self.dropout_emb(cur)  # (B,1,D)
+            for i, blk in enumerate(self.blocks):
+                out, aux, k, v = blk(
+                    x_step,
+                    mask=None,
+                    past_k=past_ks[i],
+                    past_v=past_vs[i],
+                )
+                total_aux_loss += aux
+                past_ks[i], past_vs[i] = k, v
+                x_step = out
+    
+            # Write the new hidden into current_g_embeddings
+            for b_idx in range(B):
+                bot_g_idx, eot_g_idx = spans_full_global_indices[b_idx][0]
+                src_idx = bot_g_idx + ct_iter
+                tgt_idx = src_idx + 1
+                if tgt_idx < eot_g_idx:
+                    current_g_embeddings[b_idx, tgt_idx, :] = x_step[b_idx, 0, :]
+            cur = x_step
+    
+        if show_progress and rank == 0:
+            print(f"[Coconut] Final Logits Pass ({max_ct_steps_in_batch+1} total effective passes)")
+    
+        # FINAL PASS & LOSS (core logic unchanged)
+        final_input_embeddings_loc = current_g_embeddings[:, start_idx_loc:end_idx_loc].clone()
+        x_loc = self.dropout_emb(final_input_embeddings_loc)
+        iter_aux_loss = torch.zeros_like(total_aux_loss)
+        for blk in self.blocks:
+            x_loc, aux, _, _ = blk(x_loc, mask=loc_mask, past_k=None, past_v=None)
+            iter_aux_loss += aux
+        x_loc = self.ln_f(x_loc)
+    
+        if world:
+            final_shards = [torch.empty_like(x_loc) for _ in range(world_size)]
+            dist.all_gather(final_shards, x_loc.contiguous())
+            x_full_for_logits = torch.cat(final_shards, dim=1)
+        else:
+            x_full_for_logits = x_loc
+    
+        loss_mask_full = torch.zeros_like(ids_full, dtype=torch.bool)
+        for b_idx in range(B):
+            bot_g_idx, eot_g_idx = spans_full_global_indices[b_idx][0]
+            if eot_g_idx > bot_g_idx + 1:
+                loss_mask_full[b_idx, bot_g_idx+1:eot_g_idx] = True
     
         lm_w = self.lm_head.weight
         with GatheredParameters([lm_w], enabled=hasattr(lm_w, "ds_numel")):
-            w = lm_w.clone() if hasattr(lm_w, "ds_numel") else lm_w
+            w_for_ce = lm_w.clone() if hasattr(lm_w, "ds_numel") else lm_w
+            targets_for_loss = ids_full.clone()
+            targets_for_loss[loss_mask_full] = pad_id
+            raw_ce = linear_cross_entropy(
+                e=x_full_for_logits,
+                c=w_for_ce,
+                targets=targets_for_loss,
+                ignore_index=pad_id,
+                reduction="sum",
+                shift=True,
+            )
     
-        targets_full = ids_full.masked_fill(span_mask_full, pad_id)
-        raw_ce = linear_cross_entropy(
-            e = x_full,
-            c = w,
-            targets = targets_full,
-            ignore_index = pad_id,
-            reduction = "sum",
-            shift = 1
-        )
-    
-        if world_size > 1:
+        n_valid = (targets_for_loss[:, 1:] != pad_id).sum()
+        if world:
             with torch.no_grad():
-                dist.all_reduce(raw_ce); dist.all_reduce(n_tokens)
+                dist.all_reduce(raw_ce)
+                dist.all_reduce(n_valid)
+        mean_ce_loss = raw_ce / n_valid.clamp(min=1)
+        final_loss = mean_ce_loss + (total_aux_loss + iter_aux_loss if self.training else 0.0)
     
-        loss = raw_ce / n_tokens.clamp(min=1)
-        if self.training:
-            loss = loss + total_aux
+        if rank == 0 and show_progress:
+            print(f"[Coconut] Final Loss: {final_loss.item():.4f} (CE: {mean_ce_loss.item():.4f}, Aux: {(total_aux_loss+iter_aux_loss).item():.4f})")
     
-        if rank == 0:
-            print(f"[Coconut] loss = {loss.item():.4f}")
-    
-        return loss
-
+        return final_loss
+        
     def get_embeddings(self, input_ids, pool=True):
         """Gets final layer embeddings, with optional mean pooling."""
         x = self.forward_embeddings_only(input_ids, attention_mask=None)
