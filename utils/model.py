@@ -155,65 +155,59 @@ class MultiHeadAttention(nn.Module):
         B, T_new, C = x.shape
         device = x.device
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        
-        qkv_new_proj = self.qkv(x)
-        q_new, k_new, v_new = qkv_new_proj.view(B, T_new, self.n_head, 3 * self.head_dim).split(self.head_dim, dim=-1)
 
-        start_pos = past_k.shape[1] if past_k is not None else 0
-        total_len_for_rope = start_pos + T_new
-        
-        self.update_rope(total_len_for_rope)
-        
-        sin_val = self.rope_sin[start_pos : start_pos + T_new].to(device=device, dtype=x.dtype)
-        cos_val = self.rope_cos[start_pos : start_pos + T_new].to(device=device, dtype=x.dtype)
-        
-        q_rope, k_rope = apply_rope(q_new, k_new, sin_val, cos_val)
+        # 1) project + split
+        qkv = self.qkv(x)
+        q_new, k_new, v_new = qkv.view(B, T_new, self.n_head, 3 * self.head_dim).split(self.head_dim, dim=-1)
+
+        # 2) RoPE
+        start = past_k.shape[1] if past_k is not None else 0
+        total_len = start + T_new
+        self.update_rope(total_len)
+        sin = self.rope_sin[start:start+T_new].to(device=device, dtype=x.dtype)
+        cos = self.rope_cos[start:start+T_new].to(device=device, dtype=x.dtype)
+        q_rope, k_rope = apply_rope(q_new, k_new, sin, cos)
         v_rope = v_new
 
+        # 3) KV cache
         if past_k is not None:
-            current_k = torch.cat((past_k, k_rope), dim=1)
-            current_v = torch.cat((past_v, v_rope), dim=1)
+            current_k = torch.cat([past_k, k_rope], dim=1)
+            current_v = torch.cat([past_v, v_rope], dim=1)
         else:
-            current_k = k_rope
-            current_v = v_rope
+            current_k, current_v = k_rope, v_rope
 
-        MAX_CACHE_LEN = int(config.BLOCK_SIZE / world_size)
-        
-        if current_k.shape[1] > MAX_CACHE_LEN:
-            current_k = current_k[:, -MAX_CACHE_LEN:, :, :]
-        if current_v.shape[1] > MAX_CACHE_LEN:
-            current_v = current_v[:, -MAX_CACHE_LEN:, :, :]
-            
-        current_q = q_rope
+        # 4) trim to max cache
+        MAX = int(config.BLOCK_SIZE / world_size)
+        if current_k.shape[1] > MAX:
+            current_k = current_k[:, -MAX:, :, :]
+            current_v = current_v[:, -MAX:, :, :]
 
-        attn_output_from_usp = self.usp_attn(
-            current_q, current_k, current_v,
-            dropout_p = config.DROPOUT if self.training else 0.0,
-            softmax_scale=None,
-            causal=True,
-            window_size=(-1,-1),
-            softcap=0.0,
-            alibi_slopes=None,
-            deterministic=True,
-            return_attn_probs=return_attn_probs
-        )
-        
-        attn_probs = None
-        if return_attn_probs:
-            if isinstance(attn_output_from_usp, tuple) and len(attn_output_from_usp) > 1:
-                attn_ctx_output = attn_output_from_usp[0]
-                attn_probs = attn_output_from_usp[1] 
-            else:
-                attn_ctx_output = attn_output_from_usp 
-        else:
-            attn_ctx_output = attn_output_from_usp
+        # 5) chunked ring-flash
+        # split into 4 KV chunks to save peak memory
+        M = 4
+        attn_accum = torch.zeros_like(q_rope)
+        for k_chunk, v_chunk in zip(current_k.chunk(M, dim=1), current_v.chunk(M, dim=1)):
+            out = self.usp_attn(
+                q_rope, k_chunk, v_chunk,
+                dropout_p = config.DROPOUT if self.training else 0.0,
+                softmax_scale=None,
+                causal=True,
+                window_size=(-1, -1),
+                softcap=0.0,
+                alibi_slopes=None,
+                deterministic=True,
+                return_attn_probs=False
+            )
+            # out is (B, T_new, n_head, head_dim)
+            attn_accum += out
 
-        attn_ctx_output_reshaped = attn_ctx_output.reshape(B, T_new, C)
-        
-        y = self.proj(attn_ctx_output_reshaped)
+        attn_ctx = attn_accum.reshape(B, T_new, C)
+
+        # 6) final projection
+        y = self.proj(attn_ctx)
 
         if return_attn_probs:
-            return y, current_k, current_v, attn_probs 
+            raise NotImplementedError("return_attn_probs not supported with chunking")
         return y, current_k, current_v
 
 # -----------------------------------------------------------------------------#
