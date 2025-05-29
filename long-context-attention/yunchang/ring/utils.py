@@ -37,7 +37,7 @@ def update_out_and_lse(
     if out is None:
         if slice_ is not None:
             raise RuntimeError("first update_out_and_lse should not pass slice_ args")
-        out = block_out.to(torch.float32)
+        out = block_out.to(torch.bfloat16)
         lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
