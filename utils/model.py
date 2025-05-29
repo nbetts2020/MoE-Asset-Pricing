@@ -611,7 +611,7 @@ class SparseMoELanguageModel(nn.Module):
         x = self.dropout_emb(x)
 
         for blk in self.blocks:
-            x, _ = blk(x, mask=mask)
+            x, aux_loss, _, _ = blk(x, mask=mask)
 
         x = self.ln_f(x)
 
@@ -801,21 +801,62 @@ class SparseMoELanguageModel(nn.Module):
     
         return final_loss
         
-    def get_embeddings(self, input_ids, pool=True):
-        """Gets final layer embeddings, with optional mean pooling."""
-        x = self.forward_embeddings_only(input_ids, attention_mask=None)
-        B, T, C = x.shape
-        device = x.device
+    def get_embeddings(self, input_ids: torch.Tensor, pool: bool = True):
+        """
+        Memory-efficient distributed pooling of final hidden states.
+        Instead of all-gathering the full sequence,
+        we compute a local sum + count then all-reduce.
+        Returns:
+          (B, D) if pool=True  or  (B, T, D) otherwise
+        """
+        # 1) run your usual forward_embeddings_only up through ln_f,
+        #    but shard the sequence exactly as in forward_next_token_efficient
+        world = dist.is_initialized()
+        world_size = dist.get_world_size() if world else 1
+        rank       = dist.get_rank()      if world else 0
+        T          = self.block_size
+        B, _       = input_ids.shape
 
-        if pool:
-            ids = self._pad_or_trim(input_ids, T)
-            pad_id = self.tokenizer.pad_token_id
-            mask = (ids != pad_id).float().unsqueeze(-1).to(device)
-            summed = (x * mask).sum(dim=1)
-            count = mask.sum(dim=1).clamp(min=1e-6)
-            return summed / count
+        # pad/trim
+        ids_full = self._pad_or_trim(input_ids, T)           # (B, T)
+        if world_size > 1:
+            T_loc = T // world_size
+            start = rank * T_loc
+            end   = start + T_loc
+            ids_local = ids_full[:, start:end]               # (B, T_loc)
         else:
-            return x
+            ids_local = ids_full
+            T_loc = T
+
+        # build mask
+        pad_id = self.tokenizer.pad_token_id
+        mask_local = (ids_local != pad_id).float().unsqueeze(-1)  # (B, T_loc, 1)
+
+        # embed + dropout + transformer blocks (local only)
+        x = self.token_embedding_table(ids_local)            # (B, T_loc, D)
+        x = self.dropout_emb(x)
+        for blk in self.blocks:
+            x, aux_loss, _, _ = blk(x, mask=mask_local.squeeze(-1))
+        x = self.ln_f(x)                                     # (B, T_loc, D)
+
+        if not pool:
+            # if you want the full sequence back, you could all-gather here,
+            # but since Phase 4 only ever uses pool=True, we leave this minimal.
+            raise NotImplementedError("Sequence return not supported in this helper")
+
+        # 2) local pooling
+        sum_local   = (x * mask_local).sum(dim=1)             # (B, D)
+        count_local =     mask_local.sum(dim=1)              # (B, 1)
+
+        # 3) all-reduce across ranks
+        if world_size > 1:
+            dist.all_reduce(sum_local,   op=dist.ReduceOp.SUM)
+            dist.all_reduce(count_local, op=dist.ReduceOp.SUM)
+
+        # 4) final mean
+        pooled = sum_local / count_local.clamp(min=1.0)      # (B, D)
+        return pooled
+
 
 # -----------------------------------------------------------------------------#
 #  helpers to extend context length
