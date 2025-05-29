@@ -29,7 +29,7 @@ GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(
 
 # Add special tokens
 special_tokens = {
-    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<eot>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ', ' </STOCK PRICE 30 DAYS OUT>']
+    'additional_special_tokens': ['<bot>', '<start_latent>', '<end_latent>', '<eot>', '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ', '</STOCK PRICE 30 DAYS OUT>']
 }
 GLOBAL_TOKENIZER.add_special_tokens(special_tokens)
 # Set pad token to eos
@@ -240,7 +240,10 @@ class PrecomputedBootstrapDataset(Dataset):
 
         # tokenize each of the K texts
         all_ids = []
+        self.tokenizer.truncation_side = "left"
         for txt in texts:
+            label_tag = f"<STOCK PRICE 30 DAYS OUT>: {label:.2f} </STOCK PRICE 30 DAYS OUT>"
+            txt = txt + " " + label_tag
             enc = self.tokenizer(
                 txt,
                 truncation=True,
@@ -312,7 +315,7 @@ def prepare_ft_dataloader(
                 lambda x: rreplace(
                     x,
                     "<30 DAY LABEL>",
-                    "<STOCK PRICE 30 DAYS OUT>:",
+                    "<STOCK PRICE 30 DAYS OUT>: ",
                     1,
                 ) + " </STOCK PRICE 30 DAYS OUT>"
             )
@@ -332,7 +335,7 @@ def prepare_ft_dataloader(
     # ───────────────────────────────────────────────────────────────────────
     else:
         # BOOTSTRAP (K-text) DATASETS (stages 3–8)
-        text_cols = [f"iteration_text_{i}" for i in range(1, 27)]
+        text_cols = [f"iteration_text_{i}" for i in range(1, 26)]
         label_col = "weighted_avg_720_hrs"
 
         if streaming:
