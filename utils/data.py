@@ -331,27 +331,37 @@ def prepare_ft_dataloader(
     #  BOOTSTRAP (K-text) DATASETS (stages 3-8)                             #
     # ───────────────────────────────────────────────────────────────────────
     else:
-        df = pd.read_parquet(file_path)
-        os.remove(file_path)
-
-        text_cols = [f"text_iteration_{i}" for i in range(1, 27)]
+        # BOOTSTRAP (K-text) DATASETS (stages 3–8)
+        text_cols = [f"iteration_text_{i}" for i in range(1, 27)]
         label_col = "weighted_avg_720_hrs"
 
-        label_tag = df[label_col].map(
-            lambda v: f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
-        )
-        for col in text_cols:
-            df[col] = df[col] + " " + label_tag
+        if streaming:
+            # stream directly from the Parquet file, one row at a time
+            source = file_path
+        else:
+            # load into memory and then delete the file
+            df = pd.read_parquet(file_path)
+            os.remove(file_path)
 
-        dataset   = PrecomputedBootstrapDataset(
-            df,
-            tokenizer   = tokenizer,
-            block_size  = block_size,
-            text_columns= text_cols,
-            label_column= label_col,
+            # append the label tag to each text column in-memory
+            label_tag = df[label_col].map(
+                lambda v: f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
+            )
+            for col in text_cols:
+                df[col] = df[col] + " " + label_tag
+
+            source = df
+
+        dataset = PrecomputedBootstrapDataset(
+            source,
+            tokenizer    = tokenizer,
+            block_size   = block_size,
+            text_columns = text_cols,
+            label_column = label_col,
+            streaming    = streaming
         )
-        collate    = bootstrap_collate_fn
-        drop_last  = (stage < 8)
+        collate   = bootstrap_collate_fn
+        drop_last = (stage < 8)
 
     # ───────────────────────────────────────────────────────────────────────
     #  DISTRIBUTED SAMPLING (unchanged)                                     #
@@ -368,11 +378,11 @@ def prepare_ft_dataloader(
 
     return DataLoader(
         dataset,
-        batch_size = config.BATCH_SIZE,
-        shuffle    = (shuffle and sampler is None),
-        sampler    = sampler,
-        num_workers= 0,
-        collate_fn = collate,
-        pin_memory = True,
-        drop_last  = drop_last,
+        batch_size  = config.BATCH_SIZE,
+        shuffle     = (shuffle and sampler is None),
+        sampler     = sampler,
+        num_workers = 0,
+        collate_fn  = collate,
+        pin_memory  = True,
+        drop_last   = drop_last,
     )
