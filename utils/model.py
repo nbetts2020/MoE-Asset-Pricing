@@ -390,7 +390,7 @@ class SparseMoELanguageModel(nn.Module):
             special = {
                 'additional_special_tokens': [
                     '<bot>', '<start_latent>', '<end_latent>', '<eot>',
-                    '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ', ' </STOCK PRICE 30 DAYS OUT>'
+                    '<reasoning>', '</reasoning>', '<STOCK PRICE 30 DAYS OUT>: ', '</STOCK PRICE 30 DAYS OUT>'
                 ]
             }
             self.tokenizer.add_special_tokens(special)
