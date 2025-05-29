@@ -183,7 +183,8 @@ def train_model(
             )
 
         logging.info(f"Loaded checkpoint from Phase {min_stage} ('{prev_tag}')")
-
+        
+    real_model.ebm = real_model.ebm.to(torch.bfloat16)
     # ===================================================================== #
     #  PHASE 1 – Normal pre-training
     # ===================================================================== #
@@ -589,98 +590,179 @@ def train_model(
     # PHASE 4: EBM Fine-Tuning (ft_dataset_3-7) + Validation (ft_dataset_8)
     # ------------------------------------------------------------------------
     if 4 in args.stages:
-
         logging.info("=== Starting EBM Fine-Tuning Phase ===")
-        ebm_optimizer = torch.optim.Adam(model.ebm.parameters(), lr=args.ebm_lr)
-        margin = getattr(args, "ebm_margin", 1.0)
-        ebm_epochs = 1
+    
+        ebm_optimizer = torch.optim.Adam(real_model.ebm.parameters(), lr=args.ebm_lr)
+        margin        = getattr(args, "ebm_margin", 1.0)
+        ebm_epochs    = getattr(args, "ebm_epochs", 1)
+    
+        fw_count = 0  # total forwards seen so far
+    
         for epoch in range(1, ebm_epochs + 1):
             real_model.ebm.train()
             total_loss = 0.0
-            steps = 0
-
+            steps      = 0
+    
             for stage in range(3, 8):
-                ebm_loader = prepare_ft_dataloader(
+                loader = prepare_ft_dataloader(
                     tokenizer,
-                    block_size=config.BLOCK_SIZE,
-                    shuffle=True,
-                    args=args,
-                    stage=stage,
-                    streaming=True
+                    block_size = config.BLOCK_SIZE,
+                    shuffle    = True,
+                    args       = args,
+                    stage      = stage,
+                    streaming  = True
                 )
-                for batch in ebm_loader:
-                    ids = batch['input_ids'].to(device)
-                    ids = pad_to_global(input_ids)
-                    B, K, T = ids.shape
-                    flat_ids = ids.view(B*K, T)
-
+    
+                for idx, batch in enumerate(loader):
+                    print(idx, len(loader), "progress!! 4")
+                    ids        = batch["input_ids"].to(device)   # (B, K, T)
+                    true_price = batch["labels"].to(device)      # (B,)
+    
+                    B, K, T = ids.size()
+    
+                    # 1) Embedding forward for B*K sequences
+                    flat_ids = ids.view(B * K, T)
                     with torch.no_grad():
-                        embs = real_model.get_embeddings(flat_ids, pool=True)
-                    embs = embs.view(B, K, -1)
-
-                    flat_embs = embs.view(B*K, -1)
-                    energies = real_model.ebm(flat_embs).view(B, K)
-
-                    pos_idx = energies.argmin(dim=1)
+                        embs = real_model.get_embeddings(flat_ids, pool=True)  # (B*K, D)
+                    fw_count += B * K
+                    print(fw_count, "fw_count1")
+    
+                    embs = embs.view(B, K, -1)  # (B, K, D)
+    
+                    # 2) Greedy-generation forwards
+                    preds = []
+                    for b in range(B):
+                        batch_preds = []
+                        for k in range(K):
+                            gen_ids = greedy_generate_tail(
+                                real_model,
+                                ids[b, k : k+1, :],  # (1, T)
+                                max_new_tokens=20
+                            )[0]  # (T_new,)
+    
+                            fw_count += gen_ids.size(0)
+                            print(fw_count, "fw_count2")
+    
+                            text = tokenizer.decode(
+                                torch.cat([ids[b, k : k+1, :], gen_ids.unsqueeze(0)], dim=1)[0],
+                                skip_special_tokens=True
+                            )
+                            val = extract_label_value(text)
+                            batch_preds.append(val if val is not None else float("inf"))
+                        preds.append(batch_preds)
+                    preds = torch.tensor(preds, device=device)  # (B, K)
+    
+                    # 3) Compute residuals & find pos_idx
+                    true_exp = true_price.unsqueeze(1).expand_as(preds)
+                    residuals = torch.abs(preds - true_exp)  # (B, K)
+                    pos_idx   = residuals.argmin(dim=1)      # (B,)
+    
+                    # 4) EBM scoring forward for B*K embeddings
+                    flat_embs = embs.view(B * K, -1)
+                    energies  = real_model.ebm(flat_embs).view(B, K)  # (B, K)
+                    fw_count += B * K
+                    print(fw_count, "fw_count3")
+    
+                    # 5) Margin loss
                     pos_en = energies[torch.arange(B), pos_idx]
-                    neg_mask = torch.ones_like(energies, dtype=torch.bool)
-                    neg_mask[torch.arange(B), pos_idx] = False
-                    neg_en = energies[neg_mask].view(B, K-1)
-
-                    loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                    mask   = torch.ones_like(energies, dtype=torch.bool)
+                    mask[torch.arange(B), pos_idx] = False
+                    neg_en = energies[mask].view(B, K-1)
+                    loss   = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+    
                     ebm_optimizer.zero_grad()
                     loss.backward()
                     ebm_optimizer.step()
-
+    
                     total_loss += loss.item()
-                    steps += 1
-
-            logging.info(f"[EBM FT] Epoch {epoch}/{args.ebm_epochs}, Avg Loss: {total_loss/steps:.4f}")
-
-        # validation on ft_dataset_8
+                    steps      += 1
+    
+            logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs} — Avg Loss {total_loss/steps:.4f}")
+    
+        # --- Validation (same forward-counter logic, without backward) --- #
         logging.info("=== EBM Validation ===")
         real_model.ebm.eval()
         val_loader = prepare_ft_dataloader(
             tokenizer,
-            block_size=config.BLOCK_SIZE,
-            shuffle=False,
-            args=args,
-            stage=8,
-            streaming=True
+            block_size = config.BLOCK_SIZE,
+            shuffle    = False,
+            args       = args,
+            stage      = 8,
+            streaming  = True
         )
         val_loss = 0.0
-        steps = 0
+        steps    = 0
+    
         with torch.no_grad():
             for batch in val_loader:
-                ids = batch['input_ids'].to(device)
-                ids = pad_to_global(ids)
-                B, K, T = ids.shape
-                flat_ids = ids.view(B*K, T)
-                embs = real_model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
+                ids        = batch["input_ids"].to(device)   # (B, K, T)
+                true_price = batch["labels"].to(device)      # (B,)
+    
+                B, K, T = ids.size()
+                flat_ids = ids.view(B * K, T)
+                embs     = real_model.get_embeddings(flat_ids, pool=True).view(B, K, -1)
+    
+                fw_count += B * K
+                if fw_count % 100 == 0:
+                    print(f"[Phase 4] Forward count: {fw_count}")
+    
+                preds = []
+                for b in range(B):
+                    batch_preds = []
+                    for k in range(K):
+                        gen_ids = greedy_generate_tail(
+                            real_model,
+                            ids[b, k : k+1, :],
+                            max_new_tokens=20
+                        )[0]
+                        fw_count += gen_ids.size(0)
+                        if fw_count % 100 == 0:
+                            print(f"[Phase 4] Forward count: {fw_count}")
+    
+                        text = tokenizer.decode(
+                            torch.cat([ids[b, k : k+1, :], gen_ids.unsqueeze(0)], dim=1)[0],
+                            skip_special_tokens=True
+                        )
+                        val = extract_label_value(text)
+                        batch_preds.append(val if val is not None else float("inf"))
+                    preds.append(batch_preds)
+                preds     = torch.tensor(preds, device=device)
+                residuals = torch.abs(preds - true_price.unsqueeze(1))
+                pos_idx   = residuals.argmin(dim=1)
+    
                 energies = real_model.ebm(embs.view(B*K, -1)).view(B, K)
-                pos_idx = energies.argmin(dim=1)
+                fw_count += B * K
+                if fw_count % 100 == 0:
+                    print(f"[Phase 4] Forward count: {fw_count}")
+    
                 pos_en = energies[torch.arange(B), pos_idx]
-                neg_mask = torch.ones_like(energies, dtype=torch.bool)
-                neg_mask[torch.arange(B), pos_idx] = False
-                neg_en = energies[neg_mask].view(B, K-1)
-                loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                mask   = torch.ones_like(energies, dtype=torch.bool)
+                mask[torch.arange(B), pos_idx] = False
+                neg_en = energies[mask].view(B, K-1)
+                loss   = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+    
                 val_loss += loss.item()
-                steps += 1
-        logging.info(f"[EBM Val] Avg Loss: {val_loss/steps:.4f}")
-
-        # save final model+EBM
+                steps    += 1
+    
+        logging.info(f"[EBM Val] Avg Loss {val_loss/steps:.4f}")
+    
+        # --- Save & upload final checkpoint --- #
         final_tag = "model_with_ebm"
         final_dir = os.path.join(args.save_dir, final_tag)
         os.makedirs(final_dir, exist_ok=True)
+    
         if use_deepspeed:
             engine.save_checkpoint(args.save_dir, tag=final_tag, client_state={})
         else:
-            torch.save(model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
-        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
+            torch.save(real_model.state_dict(), os.path.join(final_dir, "model_with_ebm.pth"))
+    
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
             upload_checkpoint_to_s3(
-                local_dir=os.path.join(args.save_dir, STAGE_TAG[4]),
-                bucket=args.bucket,
-                remote_dir=f"model/{STAGE_TAG[4]}"
+                local_dir  = final_dir,
+                bucket     = args.bucket,
+                remote_dir = f"model/{final_tag}"
             )
+    
+        logging.info("=== Phase 4 complete: EBM fine-tuned and saved ===")
 
         logging.info("Training complete.")
