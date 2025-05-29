@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 TOKENIZER_NAME = getattr(config, "TOKENIZER_NAME", "hf-internal-testing/llama-tokenizer")
 GLOBAL_TOKENIZER = LlamaTokenizerFast.from_pretrained(
     TOKENIZER_NAME,
-    model_max_length=config.CONTEXT_WINDOW
+    model_max_length=config.BLOCK_SIZE
 )
 
 # Add special tokens
