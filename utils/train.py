@@ -251,6 +251,7 @@ def train_model(
                 loss = real_model.forward_next_token_efficient(
                     input_ids, reduction="mean"
                 )
+                print(loss, "loss!!")
 
                 if engine:
                     engine.zero_grad(); engine.backward(loss); engine.step()
@@ -608,7 +609,7 @@ def train_model(
             total_loss = 0.0
             steps      = 0
     
-            for stage in range(3, 8):
+            for stage in range(3, 4):
                 loader = prepare_ft_dataloader(
                     tokenizer,
                     block_size = config.BLOCK_SIZE,
@@ -690,6 +691,7 @@ def train_model(
                     mask[torch.arange(B), pos_idx] = False
                     neg_en = energies[mask].view(B, K-1)
                     loss   = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                    print(loss, "loss!!")
     
                     ebm_optimizer.zero_grad()
                     loss.backward()
@@ -778,6 +780,7 @@ def train_model(
                 mask[torch.arange(B), pos_idx] = False
                 neg_en = energies[mask].view(B, K-1)
                 loss   = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                print(loss, "loss!!")
     
                 val_loss += loss.item()
                 steps    += 1
