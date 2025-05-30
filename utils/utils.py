@@ -251,127 +251,163 @@ def load_rl_data(args, rl_rows: int = -1, chunk_start: int = 1, chunk_end: int =
         if rl_rows != -1 and accumulated >= rl_rows:
             break
 
-def process_run_dataset(run_dataset_filename, tokenizer, model, args, device,
-                        batch_size=500, current_offset=0, global_max=int(1e12),
-                        cache_dir="/tmp/hf_cache_datasets_run"):
-                            
-    import os, gc, shutil, torch
-    import pyarrow.parquet as pq
+def process_run_dataset(
+        run_dataset_filename,
+        tokenizer,
+        model,
+        args,
+        device,
+        batch_size     = 500,
+        current_offset = 0,
+        global_max     = int(1e12),
+        cache_dir      = "/tmp/hf_cache_datasets_run"):
+
+    import os, gc, shutil, torch, pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
-    from utils.train import greedy_generate_tail, extract_label_value
+    from utils.train import extract_label_value
+    from utils.metrics import OnlineMetrics
+            
+    # ------------------------------------------------------------------ #
+    #  Pre-computed tag IDs
+    # ------------------------------------------------------------------ #
+    PRICE_OPEN_IDS = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+    PRICE_TAG_LEN  = len(PRICE_OPEN_IDS)
+    PRICE_CLOSE_ID = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
+    REASON_OPEN_ID = tokenizer.convert_tokens_to_ids("<reasoning>")
+    REASON_CLOSE_ID = tokenizer.convert_tokens_to_ids("</reasoning>")
 
-    # precompute our marker IDs once
-    open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
-    m_len    = len(open_ids)
-    close_id = tokenizer.convert_tokens_to_ids(" </STOCK PRICE 30 DAYS OUT>")
-
+    # ------------------------------------------------------------------ #
+    #  Load the parquet split from HF Hub
+    # ------------------------------------------------------------------ #
     os.makedirs(cache_dir, exist_ok=True)
     file_path = hf_hub_download(
-        repo_id="nbettencourt/sc454k-preprocessed-dfs",
-        filename=run_dataset_filename,
-        repo_type="dataset",
-        cache_dir=cache_dir
+        repo_id   = "nbettencourt/sc454k-preprocessed-dfs",
+        filename  = run_dataset_filename,
+        repo_type = "dataset",
+        cache_dir = cache_dir,
     )
-    parquet_file = pq.ParquetFile(file_path)
+    pq_file = pq.ParquetFile(file_path)
 
-    overall_metrics = OnlineMetrics()
-    sector_metrics  = {}
-    processed_in_file = 0
+    overall   = OnlineMetrics()
+    by_sector = {}
+    processed = 0
 
-    for batch in parquet_file.iter_batches(batch_size=batch_size):
-        df_chunk = batch.to_pandas()
-        df_chunk = df_chunk.dropna(subset=['weighted_avg_720_hrs'])
-        df_chunk = df_chunk[df_chunk['weighted_avg_720_hrs'] > 0].reset_index(drop=True)
+    for batch in pq_file.iter_batches(batch_size=batch_size):
+        df = batch.to_pandas()
+        df = df.dropna(subset=["weighted_avg_720_hrs"])
+        df = df[df["weighted_avg_720_hrs"] > 0].reset_index(drop=True)
 
-        for idx, sample in df_chunk.iterrows():
-            if current_offset + processed_in_file + idx >= global_max:
+        for idx, row in df.iterrows():
+            if current_offset + processed + idx >= global_max:
                 break
+            sector = row.get("Sector", "Unknown")
 
-            sector = sample.get('Sector', "Unknown")
-
+            # ---------------------------------------------------------- #
+            #  1. Pick best context via EBM
+            # ---------------------------------------------------------- #
             try:
-                # build and tag your best_context
-                best_context = ebm_select_contexts(
-                    df=df_chunk, idx=idx, model=model,
-                    tokenizer=tokenizer, ebm_samples=args.ebm_num_samples,
-                    rl_module=rl_module
+                ctx = ebm_select_contexts(
+                    df           = df,
+                    idx          = idx,
+                    model        = model,
+                    tokenizer    = tokenizer,
+                    ebm_samples  = args.ebm_num_samples,
                 )
-                best_context = rreplace(
-                    best_context,
-                    "<30 DAY LABEL>",
-                    "<STOCK PRICE 30 DAYS OUT>:",
-                    1
-                ) + " </STOCK PRICE 30 DAYS OUT>"
 
-                # tokenize prefix
-                tokenizer.truncation_side = 'left'
-                encoding = tokenizer(
-                    best_context,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=config.BLOCK_SIZE,
-                    return_tensors="pt"
-                ).to(device)
-                input_ids = encoding["input_ids"]  # (1, T)
+                # Normalise label token
+                ctx = ctx.replace("<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>: ") \
+                         + " </STOCK PRICE 30 DAYS OUT>"
+            except Exception as e:
+                print(f"EBM error @ row {current_offset+processed+idx}: {e}")
+                continue
 
-                # locate open‐tag position
-                ids_list = input_ids[0].tolist()
-                marker_pos = next(
-                    (j + m_len for j in range(len(ids_list)-m_len+1)
-                     if ids_list[j:j+m_len] == open_ids),
-                    None
-                )
-                if marker_pos is None:
-                    continue
+            # ---------------------------------------------------------- #
+            #  2. Generate reasoning
+            #      prefix = ctx + '\n<reasoning>'
+            # ---------------------------------------------------------- #
+            tokenizer.truncation_side = "left"
+            prefix_ids = tokenizer(
+                ctx + "\n<reasoning>",
+                truncation=True,
+                padding="max_length",
+                max_length=args.block_size,
+                return_tensors="pt"
+            )["input_ids"].to(device)
 
-                # greedy generate until close tag
-                prefix   = input_ids[:, :marker_pos]
-                world_sz = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-                T_loc    = model.block_size // world_sz
-                cur      = prefix[:, -T_loc:].clone()
-                gen_toks = []
-
-                for _ in range(20):
+            gen_reason = []
+            with torch.no_grad():
+                cur = prefix_ids[:, -model.block_size // max(1, torch.distributed.get_world_size()):].clone()
+                for _ in range(1000):
                     hs     = model.forward_embeddings_only(cur)
                     logits = model.lm_head(hs)[:, -1, :]
                     nxt    = logits.argmax(-1, keepdim=True)
-                    gen_toks.append(nxt)
-                    if nxt.item() == close_id:
+                    if nxt.item() == REASON_CLOSE_ID:
                         break
-                    cur = torch.cat([cur, nxt], dim=1)[:, -T_loc:]
+                    gen_reason.append(nxt)
+                    cur = torch.cat([cur, nxt], dim=1)[:, -cur.size(1):]
 
-                gen_ids  = torch.cat(gen_toks, dim=1)
-                full_ids = torch.cat([prefix, gen_ids], dim=1)[0]
-                decoded  = tokenizer.decode(full_ids, skip_special_tokens=True)
-                pred_value = extract_label_value(decoded)
-                if pred_value is None:
-                    continue
+            # close tag if not seen
+            if not gen_reason or gen_reason[-1].item() != REASON_CLOSE_ID:
+                gen_reason.append(torch.tensor([[REASON_CLOSE_ID]], device=device))
 
-            except Exception as e:
-                print(f"Error processing row {current_offset + processed_in_file + idx}: {e}")
+            reasoning_ids = torch.cat(gen_reason, dim=1)
+            reasoning_txt = tokenizer.decode(reasoning_ids[0], skip_special_tokens=False)
+
+            # ---------------------------------------------------------- #
+            # 3. Predict price
+            #    prefix = ctx + '\n<reasoning>' + reasoning + '</reasoning>\n<STOCK PRICE 30 DAYS OUT>: '
+            # ---------------------------------------------------------- #
+            price_prefix = f"{ctx}\n<reasoning>{reasoning_txt}</reasoning>\n<STOCK PRICE 30 DAYS OUT>: "
+            prefix_ids = tokenizer(
+                price_prefix,
+                truncation=True,
+                padding="max_length",
+                max_length=args.block_size,
+                return_tensors="pt"
+            )["input_ids"].to(device)
+
+            price_toks = []
+            with torch.no_grad():
+                cur = prefix_ids[:, -model.block_size // max(1, torch.distributed.get_world_size()):].clone()
+                for _ in range(10):
+                    hs     = model.forward_embeddings_only(cur)
+                    logits = model.lm_head(hs)[:, -1, :]
+                    nxt    = logits.argmax(-1, keepdim=True)
+                    price_toks.append(nxt)
+                    if nxt.item() == PRICE_CLOSE_ID:
+                        break
+                    cur = torch.cat([cur, nxt], dim=1)[:, -cur.size(1):]
+
+            full_ids = torch.cat([prefix_ids, torch.cat(price_toks, dim=1)], dim=1)[0]
+            decoded  = tokenizer.decode(full_ids, skip_special_tokens=False)
+            pred_val = extract_label_value(decoded)
+            if pred_val is None:
                 continue
 
-            actual   = sample['weighted_avg_720_hrs']
-            oldprice = sample['weighted_avg_0_hrs']
-            rf       = sample['Risk_Free_Rate']
+            # ---------------------------------------------------------- #
+            # 4. Update running metrics
+            # ---------------------------------------------------------- #
+            actual   = row["weighted_avg_720_hrs"]
+            oldprice = row["weighted_avg_0_hrs"]
+            rf       = row["Risk_Free_Rate"]
 
-            overall_metrics.update(pred_value, actual, oldprice, rf)
-            sector_metrics.setdefault(sector, OnlineMetrics()) \
-                          .update(pred_value, actual, oldprice, rf)
+            overall.update(pred_val, actual, oldprice, rf)
+            by_sector.setdefault(sector, OnlineMetrics()) \
+                     .update(pred_val, actual, oldprice, rf)
 
-            print(f"Processed row {current_offset + processed_in_file + idx}: predicted price {pred_value}")
+            print(f"Row {current_offset+processed+idx}: pred {pred_val:.2f}")
 
-        processed_in_file += len(df_chunk)
-        del df_chunk
+        processed += len(df)
+        del df
         gc.collect()
         torch.cuda.empty_cache()
-        if current_offset + processed_in_file >= global_max:
+        if current_offset + processed >= global_max:
             break
 
-    # cleanup
-    if os.path.exists(file_path): os.remove(file_path)
+    # tidy up
+    os.remove(file_path)
     shutil.rmtree(cache_dir, ignore_errors=True)
-    return overall_metrics, sector_metrics, processed_in_file
+    return overall, by_sector, processed
                             
 def load_model_weights(model, weights_path, device):
     if os.path.exists(weights_path):
@@ -464,9 +500,25 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
         except Exception as e:
             logging.error(f"Error uploading RL Attention module to S3: {e}")
 
-def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, rl_module=None):
+def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples):
+    """
+    Pick the context whose EBM energy is lowest (|energy| ~= best match).
+
+    Args
+    ----
+    df : pd.DataFrame            – dataset with columns iteration_{i}_text
+    idx : int                    – row index to evaluate
+    model : torch.nn.Module      – model whose forward returns (_, energy, _)
+    tokenizer : transformers.PreTrainedTokenizer
+    ebm_samples : int            – how many of the available candidates to score
+
+    Returns
+    -------
+    str  – the selected context text
+    """
     import random
     import numpy as np
+    import torch
     from utils.config import config
 
     row = df.iloc[idx]
@@ -478,45 +530,29 @@ def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, rl_module=None):
     if not candidates:
         raise ValueError("No candidate contexts found for this sample.")
 
-    if len(candidates) > ebm_samples:
-        sampled_candidates = random.sample(candidates, ebm_samples)
-    else:
-        sampled_candidates = candidates
+    sampled = random.sample(candidates, min(len(candidates), ebm_samples))
 
-    candidate_energies = []
+    energies = []
     device = next(model.parameters()).device
+    tokenizer.truncation_side = "left"
 
-    with torch.no_grad():
-        with torch.amp.autocast('cuda'):
-            for candidate in sampled_candidates:
-                if rl_module is not None:
-                    downsampled, _, _ = rl_module(candidate, model=model)
-                    mean_emb = downsampled.mean(dim=1)  # (1, embed_dim)
-                else:
-                    tokenizer.truncation_side = 'left'
-                    encoding = tokenizer(
-                        candidate,
-                        truncation=True,
-                        padding="max_length",
-                        max_length=config.BLOCK_SIZE,
-                        return_tensors="pt"
-                    ).to(device)
-                    input_ids = encoding["input_ids"]
-                    _, energy, _ = model(input_ids=input_ids)  # Get ebm_energy from forward
-                    mean_emb = None  # Not needed since energy is direct output
+    model.eval()
+    with torch.no_grad(), torch.amp.autocast("cuda"):
+        for text in sampled:
+            enc = tokenizer(
+                text,
+                truncation=True,
+                padding="max_length",
+                max_length=config.BLOCK_SIZE,
+                return_tensors="pt"
+            ).to(device)
 
-                # Use ebm_energy directly if no RL module, otherwise compute energy from RL embeddings
-                if rl_module is None:
-                    energy_value = energy.item()
-                else:
-                    # If RL is used, assume model can still compute energy from mean_emb
-                    _, energy, _ = model(input_ids=None, embeddings=mean_emb)
-                    energy_value = energy.item()
+            # forward() expected to return (logits, energy, extras)
+            _, energy, _ = model(input_ids=enc["input_ids"])
+            energies.append(float(energy))
 
-                candidate_energies.append(energy_value)
-
-    best_idx = np.argmin([abs(e) for e in candidate_energies])
-    return sampled_candidates[best_idx]
+    best_idx = int(np.argmin(np.abs(energies)))
+    return sampled[best_idx]
 
 def get_model_from_hf(model_repo_id, device):
     """
