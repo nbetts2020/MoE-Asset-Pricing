@@ -194,7 +194,7 @@ def train_model(
 
         open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
         m_len    = len(open_ids)
-        close_id = tokenizer.convert_tokens_to_ids(" </STOCK PRICE 30 DAYS OUT>")
+        close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
 
         for epoch in range(1, PRETRAIN_EPOCHS + 1):
             real_model.train()
