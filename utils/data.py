@@ -96,12 +96,14 @@ class PrecomputedDataset(Dataset):
         tokenizer,
         block_size: int,
         mask_fraction: float = 1.0,
-        streaming: bool = False
+        streaming: bool = False,
+        stage = 0
     ):
         self.streaming      = streaming
         self.tokenizer      = tokenizer
         self.block_size     = block_size
         self.mask_fraction  = float(mask_fraction)
+        self.stage = stage
 
         self.latent_id = tokenizer.convert_tokens_to_ids("<bot>")
         self.start_id  = tokenizer.convert_tokens_to_ids("<reasoning>")
@@ -137,12 +139,15 @@ class PrecomputedDataset(Dataset):
         row        = self._get_row(idx)
         text       = row.get("text", "")
         raw_label  = row.get("weighted_avg_720_hrs", 0.0)
-
-        label_str  = (
-            f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f} "
-            f"</STOCK PRICE 30 DAYS OUT>"
-        )
-        new_text   = text + label_str
+    
+        if self.stage == 2:
+            new_text = text + " </STOCK PRICE 30 DAYS OUT>"
+        else:
+            label_str  = (
+                f"\n<STOCK PRICE 30 DAYS OUT>: {raw_label:.2f} "
+                f"</STOCK PRICE 30 DAYS OUT>"
+            )
+            new_text   = text + label_str
 
         self.tokenizer.truncation_side = "left"
         enc  = self.tokenizer(
@@ -191,7 +196,7 @@ class PrecomputedBootstrapDataset(Dataset):
     """
     def __init__(
         self,
-        source,                    # either pd.DataFrame or str(path-to-parquet)
+        source,
         tokenizer,
         block_size: int,
         text_columns: list[str],
@@ -308,17 +313,6 @@ def prepare_ft_dataloader(
         else:
             df_or_path = pd.read_parquet(file_path)
             os.remove(file_path)
-
-            # label-tag replacement is only needed in-memory; the streaming
-            # dataset can do it on-the-fly if you wish.
-            df_or_path["text"] = df_or_path["text"].apply(
-                lambda x: rreplace(
-                    x,
-                    "<30 DAY LABEL>",
-                    "<STOCK PRICE 30 DAYS OUT>: ",
-                    1,
-                ) + " </STOCK PRICE 30 DAYS OUT>"
-            )
 
         dataset = PrecomputedDataset(
             df_or_path,
