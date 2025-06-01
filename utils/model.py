@@ -150,44 +150,75 @@ class MultiHeadAttention(nn.Module):
         mask: torch.Tensor = None,
         past_k: torch.Tensor = None,
         past_v: torch.Tensor = None,
-        return_attn_probs: bool = False
+        *,                       # force keyword-use
+        local_only: bool = False
     ):
+        """
+        When local_only=True we *completely avoid* the YunChang USP / ring-flash
+        code-path and fall back to a single-GPU scaled-dot-product attention.
+        """
         B, T_new, C = x.shape
-        device = x.device
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-        # 1) project + split
-        qkv = self.qkv(x)
-        q_new, k_new, v_new = qkv.view(B, T_new, self.n_head, 3 * self.head_dim).split(self.head_dim, dim=-1)
-
-        # 2) RoPE
-        start = past_k.shape[1] if past_k is not None else 0
-        total_len = start + T_new
+        device      = x.device
+    
+        # (1) project to packed QKV and split -----------------------------------
+        qkv          = self.qkv(x)
+        q_new, k_new, v_new = qkv.view(
+            B, T_new, self.n_head, 3 * self.head_dim
+        ).split(self.head_dim, dim=-1)
+    
+        # (2) rotary positional embedding ---------------------------------------
+        start      = past_k.shape[1] if past_k is not None else 0
+        total_len  = start + T_new
         self.update_rope(total_len)
         sin = self.rope_sin[start:start+T_new].to(device=device, dtype=x.dtype)
         cos = self.rope_cos[start:start+T_new].to(device=device, dtype=x.dtype)
         q_rope, k_rope = apply_rope(q_new, k_new, sin, cos)
         v_rope = v_new
-
-        # 3) KV cache
-        if past_k is not None:
-            current_k = torch.cat([past_k, k_rope], dim=1)
-            current_v = torch.cat([past_v, v_rope], dim=1)
-        else:
-            current_k, current_v = k_rope, v_rope
-
-        # 4) trim to max cache
-        MAX = int(config.BLOCK_SIZE / world_size)
+    
+        # -----------------------------------------------------------------------
+        # FAST PATH  — **single-GPU** causal SDPA  (no NCCL collectives)
+        # -----------------------------------------------------------------------
+        if local_only or (not dist.is_initialized()) or dist.get_world_size() == 1:
+            # reshape to (B·H, T, D_h)
+            q = q_rope.transpose(1, 2).reshape(B * self.n_head, T_new, self.head_dim)
+            k = k_rope.transpose(1, 2).reshape(B * self.n_head, T_new, self.head_dim)
+            v = v_rope.transpose(1, 2).reshape(B * self.n_head, T_new, self.head_dim)
+    
+            attn = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,    # q, k, v
+                attn_mask=None,
+                dropout_p=0.0,   # inference path
+                is_causal=True
+            )                                                   # (B·H, T, D_h)
+    
+            attn_ctx = attn.reshape(B, self.n_head, T_new, self.head_dim) \
+                           .transpose(1, 2)                     # (B, T, H, D_h)
+            attn_ctx = attn_ctx.reshape(B, T_new, C)            # (B, T, D)
+    
+            y = self.proj(attn_ctx)
+            # we still return “fake” caches so the caller’s signature matches
+            return y, None, None
+        # -----------------------------------------------------------------------
+        # SLOW / ORIGINAL PATH — YunChang USP ring-flash (needs NCCL) -----------
+        # -----------------------------------------------------------------------
+        # (identical to what you already had)
+        current_k, current_v = (
+            (torch.cat([past_k, k_rope], dim=1),
+             torch.cat([past_v, v_rope], dim=1))
+            if past_k is not None else (k_rope, v_rope)
+        )
+    
+        MAX = int(config.BLOCK_SIZE // max(1, dist.get_world_size()))
         if current_k.shape[1] > MAX:
-            current_k = current_k[:, -MAX:, :, :]
-            current_v = current_v[:, -MAX:, :, :]
-
-        # 5) chunked ring-flash
-        # split into 4 KV chunks to save peak memory
-        M = 1
+            current_k = current_k[:, -MAX:]
+            current_v = current_v[:, -MAX:]
+    
         attn_accum = torch.zeros_like(q_rope)
-        for k_chunk, v_chunk in zip(current_k.chunk(M, dim=1), current_v.chunk(M, dim=1)):
-            out = self.usp_attn(
+        for k_chunk, v_chunk in zip(
+            current_k.chunk(1, dim=1),      # split = 1 ⇒ keep memory the same
+            current_v.chunk(1, dim=1)
+        ):
+            attn_accum += self.usp_attn(
                 q_rope, k_chunk, v_chunk,
                 dropout_p = config.DROPOUT if self.training else 0.0,
                 softmax_scale=None,
@@ -196,20 +227,12 @@ class MultiHeadAttention(nn.Module):
                 softcap=0.0,
                 alibi_slopes=None,
                 deterministic=True,
-                return_attn_probs=False
+                return_attn_probs=False,
             )
-            # out is (B, T_new, n_head, head_dim)
-            attn_accum += out
-
+    
         attn_ctx = attn_accum.reshape(B, T_new, C)
-
-        # 6) final projection
-        y = self.proj(attn_ctx)
-
-        if return_attn_probs:
-            raise NotImplementedError("return_attn_probs not supported with chunking")
-        return y, current_k, current_v
-
+        return self.proj(attn_ctx), current_k, current_v
+        
 # -----------------------------------------------------------------------------#
 #  Mixture-of-Experts blocks
 # -----------------------------------------------------------------------------#
@@ -269,73 +292,84 @@ class SparseMoE(nn.Module):
         self.cap_factor = cap_factor
         self.num_experts = n_exp
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor, *, local_only: bool = False):
         """
-        hidden_states: (B, T, d)
-        returns: (B, T, d), aux_loss
+        Parameters
+        ----------
+        local_only : bool
+            If True, *do not* call any distributed collectives.  Used during
+            generation / quick-eval where only the calling rank is active.
         """
         B, T, d = hidden_states.shape
         num_tokens = B * T
         flat = hidden_states.view(num_tokens, d)
 
+        # utils/model.py  — inside SparseMoE.forward, right after you flatten
+        if not local_only and dist.is_initialized():
+            # Force-materialise every expert’s params once so ZeRO gathers are aligned
+            with GatheredParameters(
+                    [p for exp in self.experts for p in exp.parameters()],
+                    modifier_rank=None):
+                pass
+
         # 1) Routing
         top_vals, top_inds, dense_probs = self.router(flat)
 
-        # 2) Compute capacity and mask
-        num_tokens_tensor = torch.tensor(num_tokens, device=flat.device)
-        if dist.is_initialized():
+        # 2) Capacity / mask --------------------------------------------------
+        if local_only or (not dist.is_initialized()):
+            global_tokens = num_tokens          # single-rank view
+        else:
+            num_tokens_tensor = torch.tensor(num_tokens, device=flat.device)
             dist.all_reduce(num_tokens_tensor, op=dist.ReduceOp.SUM)
-        global_tokens = num_tokens_tensor.item()
+            global_tokens = int(num_tokens_tensor.item())
+
         capacity = math.ceil(self.cap_factor * global_tokens / self.num_experts)
 
-        mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
+        mask = torch.zeros(
+            num_tokens, self.num_experts, device=flat.device, dtype=torch.bool
+        )
         mask.scatter_(1, top_inds, True)
 
-        # 3) Enforce capacity
-        cumsum = torch.cumsum(mask.long(), dim=0)
+        # 3) Enforce capacity (same as before)
+        cumsum   = torch.cumsum(mask.long(), dim=0)
         position = cumsum * mask - 1
-        keep = (position < capacity) & mask
-        kept = torch.where(keep)
-        tok_idx, exp_slot = kept  # exp_slot is which expert slot
+        keep     = (position < capacity) & mask
+        tok_idx, exp_slot = torch.where(keep)
 
-        # 4) Gather expert indices & weights
-        exp_idx = exp_slot
-        gate_vals = dense_probs[tok_idx, exp_slot].unsqueeze(1)
+        exp_idx    = exp_slot
+        gate_vals  = dense_probs[tok_idx, exp_slot].unsqueeze(1)
 
-        # 5) Dispatch to experts in sorted order for efficiency
-        final = torch.zeros_like(flat)
+        # 4) Dispatch to experts (unchanged)
+        final      = torch.zeros_like(flat)
         sorted_idx = torch.argsort(exp_idx)
-
-        seg_boundaries = torch.cat([
+        segs = torch.cat([
             torch.tensor([0], device=flat.device),
             torch.where(exp_idx[sorted_idx][:-1] != exp_idx[sorted_idx][1:])[0] + 1,
             torch.tensor([sorted_idx.numel()], device=flat.device),
         ])
 
-        for i in range(len(seg_boundaries) - 1):
-            s = seg_boundaries[i].item()
-            e = seg_boundaries[i + 1].item()
+        for i in range(len(segs) - 1):
+            s, e = segs[i].item(), segs[i+1].item()
             if s >= e:
                 continue
             expert_i = exp_idx[sorted_idx[s]].item()
-            idxs = tok_idx[sorted_idx[s:e]]
-            gv = gate_vals[sorted_idx[s:e]]
-            out = self.experts[expert_i](flat[idxs])
+            idxs     = tok_idx[sorted_idx[s:e]]
+            gv       = gate_vals[sorted_idx[s:e]]
+            out      = self.experts[expert_i](flat[idxs])
             final.index_add_(0, idxs, out * gv)
 
-        # 6) Compute auxiliary load‐balancing loss
+        # 5) Aux load-balancing loss  (skip during inference)
         aux_loss = torch.tensor(0.0, device=flat.device)
-        if self.training:
-            frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
-            frac_probs = dense_probs.mean(dim=0)
-            aux_loss = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
+        if self.training and (not local_only):
+            frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() \
+                            / max(global_tokens, 1)
+            frac_probs  = dense_probs.mean(dim=0)
+            aux_loss    = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
 
-        # 7) Reshape back to (B, T, d)
         return final.view(B, T, d), aux_loss
 
-
 class Block(nn.Module):
-    """Transformer block using USP Attention and SparseMoE FFN, with KV-cache support."""
+    """Transformer block (USP attention + Sparse-MoE FFN)."""
     def __init__(self, d: int, n_head: int, n_exp: int, top_k: int):
         super().__init__()
         self.ln1 = nn.LayerNorm(d)
@@ -349,19 +383,26 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         past_k: Optional[torch.Tensor] = None,
         past_v: Optional[torch.Tensor] = None,
+        *,                      # force keyword-only
+        local_only: bool = False
     ):
-        # 1) Self-attn with cache
-        x_norm = self.ln1(x)
-        attn_out, k, v = self.sa(x_norm, mask=mask, past_k=past_k, past_v=past_v)
+        # ── 1. self-attention ────────────────────────────────────────────────
+        x_norm          = self.ln1(x)
+        attn_out, k, v  = self.sa(
+            x_norm,
+            mask      = mask,
+            past_k    = past_k,
+            past_v    = past_v,
+            local_only = local_only,
+        )
         x = x + attn_out
 
-        # 2) MoE feed-forward
-        ff_in = self.ln2(x)
-        moe_out, aux_loss = self.moe(ff_in)
-        x = x + moe_out
+        # ── 2. sparse-MoE FFN  (was missing local_only) ─────────────────────
+        ff_in           = self.ln2(x)
+        moe_out, aux    = self.moe(ff_in, local_only = local_only)  # ★ NEW
+        x               = x + moe_out
 
-        # 3) Return updated hidden + aux loss + new cache
-        return x, aux_loss, k, v
+        return x, aux, k, v
 
 # -----------------------------------------------------------------------------#
 #  Sparse-MoE Language Model
@@ -590,38 +631,57 @@ class SparseMoELanguageModel(nn.Module):
 
         return loss
 
-    def forward_embeddings_only(self, input_ids, attention_mask=None):
-        """Forward pass returning final hidden states (before LM head)."""
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        device = input_ids.device
-        T = self.block_size
-
-        ids = self._pad_or_trim(input_ids, T)
-        B, _ = ids.shape
-
-        if attention_mask is None:
-            pad_id = self.tokenizer.pad_token_id
-            mask = (ids != pad_id).to(device)
-        else:
-            mask = self._pad_or_trim(attention_mask.long(), T).bool()
-
-        # ring attention works on full context, so no split
-        x = self.token_embedding_table(ids)
-        x = self.dropout_emb(x)
-
+    # -----------------------------------------------------
+    def forward_embeddings_only(
+        self,
+        input_ids,
+        attention_mask=None,
+        *,                       # force keyword-use
+        gather_full: bool = True,
+        local_only:  bool = False
+    ) -> torch.Tensor:
+        """
+        Return final hidden states (before LM head).
+    
+        Parameters
+        ----------
+        gather_full : bool, default = True
+            If True (all training paths) → all-gather every rank’s slice so the
+            caller receives the **full** (B × T × D) tensor.
+    
+            If False (generation / quick eval) → keep only the local slice and
+            avoid the heavyweight all-gather.
+    
+        local_only : bool, default = False
+            When True we *also* bypass YunChang’s sequence-parallel attention and
+            run a simple single-GPU SDPA kernel.  **No NCCL collectives at all.**
+        """
+        # ── shape alignment ────────────────────────────────────────────────────
+        device      = input_ids.device
+        world_size  = 1 if local_only else (dist.get_world_size()
+                                            if dist.is_initialized() else 1)
+        T           = self.block_size
+    
+        ids  = self._pad_or_trim(input_ids, T)                  # (B, T)
+        mask = (
+            (ids != self.tokenizer.pad_token_id).to(device)
+            if attention_mask is None
+            else self._pad_or_trim(attention_mask.long(), T).bool()
+        )
+    
+        # ── encoder (we’ll hand `local_only` down to each Block) ───────────────
+        x = self.dropout_emb(self.token_embedding_table(ids))
         for blk in self.blocks:
-            x, aux_loss, _, _ = blk(x, mask=mask)
-
-        x = self.ln_f(x)
-
-        if world_size > 1:
+            x, _, _, _ = blk(x, mask=mask, local_only=local_only)   # ★
+        x = self.ln_f(x)                                            # (B, T, D)
+    
+        # ── optional all-gather ────────────────────────────────────────────────
+        if world_size > 1 and gather_full:
             shards = [torch.empty_like(x) for _ in range(world_size)]
             dist.all_gather(shards, x.contiguous())
-            x_full = torch.cat(shards, dim=1)
-        else:
-            x_full = x
-        return x_full
+            x = torch.cat(shards, dim=1)                            # (B, T_glb, D)
+    
+        return x
 
     # ------------------------------------------------------------------ #
     #  Coconut latent-reasoning forward  (k = 1, memory-friendly)         #
