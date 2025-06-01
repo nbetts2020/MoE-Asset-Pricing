@@ -46,26 +46,81 @@ def extract_label_value(decoded_text):
         logging.error(f"Bad float '{num}' in \"{decoded_text}\"")
         return None
 
-def greedy_generate_tail(model, input_ids, max_new_tokens=20):
+def save_checkpoint(*, engine, model, save_dir: str, tag: str,
+                    bucket: str | None = None):
     """
-    Greedy-generate up to `max_new_tokens` *without* extending RoPE.
-    Only the last T_local tokens of the prefix are fed to each rank.
-    Returns the newly generated ids (B × T_new).
-    """
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    T_local    = model.block_size // world_size
+    Save `model` (or `engine.module`) under save_dir/<tag>/.
 
-    cur = input_ids[:, -T_local:].clone()          # keep last T_local tokens
-    generated = []
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            hs     = model.forward_embeddings_only(cur)      # (B, t, C)
-            logits = model.lm_head(hs)                       # (B, t, V)
-            nxt    = logits[:, -1, :].argmax(-1, keepdim=True)  # (B,1)
-            generated.append(nxt)
-            cur = torch.cat([cur, nxt], dim=1)
-            cur = cur[:, -T_local:]          # always trim to T_local
-    return torch.cat(generated, dim=1)       # (B, max_new_tokens)
+    Works for:
+      • DeepSpeed ZeRO-3 (engine!=None) – uses engine.save_checkpoint  
+      • Plain PyTorch            – torch.save(model.state_dict(), …)
+
+    If `bucket` is given and we’re on rank-0, also sync to S3.
+    """
+    rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
+
+    if engine is not None:                       # DeepSpeed path
+        if rank0:
+            print(f"[save] DeepSpeed checkpoint → {save_dir} (tag={tag})")
+        engine.save_checkpoint(save_dir, tag=tag)
+
+    else:                                        # plain torch path
+        ckpt_dir = os.path.join(save_dir, tag)
+        if rank0:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(ckpt_dir, "model.pth"))
+
+    if bucket and rank0:
+        upload_checkpoint_to_s3(
+            local_dir=os.path.join(save_dir, tag),
+            bucket=bucket,
+            remote_dir=f"model/{tag}",
+        )
+
+@torch.no_grad()
+def quick_eval_sample(model, tokenizer, batch, *,
+                      device, open_ids, close_id, m_len):
+    """
+    Greedy-generate one mini-batch **on a single GPU** (no NCCL, no ZeRO
+    gathers).  Returns a list of (true_price, pred_string).
+    """
+    model.eval()
+
+    sample_ids  = batch["input_ids"][:5].to(device)
+    true_prices = batch["labels"][:5].tolist()
+    preds       = []
+
+    for ids in sample_ids:
+        ids_list = ids.tolist()
+        marker   = next(
+            (j + m_len for j in range(len(ids_list) - m_len + 1)
+             if ids_list[j : j + m_len] == open_ids),
+            None,
+        )
+        if marker is None:
+            preds.append("〈n/a〉"); continue
+
+        prefix   = ids[:marker].unsqueeze(0)          # (1, L)
+        cur      = prefix[:, -model.block_size:]      # local-only path
+        gen      = []
+
+        while len(gen) < 20:
+            hs  = model.forward_embeddings_only(cur,
+                                                gather_full=False,
+                                                local_only = True)
+            nxt = model.lm_head(hs)[:, -1, :].argmax(-1, keepdim=True)
+            gen.append(nxt)
+            if nxt.item() == close_id: break
+            cur = torch.cat([cur, nxt], 1)[:, -model.block_size:]
+
+        full   = torch.cat([prefix, torch.cat(gen, 1)], 1)[0]
+        decoded= tokenizer.decode(full, skip_special_tokens=False)
+        val    = extract_label_value(decoded)          # your util
+        preds.append(f"{val:.2f}" if val is not None else "〈n/a〉")
+
+    model.train()
+    return list(zip(true_prices, preds))
+
 
 @torch.no_grad()
 def local_logits(model, ids_local, mask_local):
@@ -186,122 +241,88 @@ def train_model(
         
     real_model.ebm = real_model.ebm.to(torch.bfloat16)
     # ===================================================================== #
-    #  PHASE 1 – Normal pre-training
+    #  PHASE 1 – Normal pre-training (updated)                              #
     # ===================================================================== #
     if 1 in args.stages:
-        logging.info(f"→ Phase 1: normal pre-training (rank {rank})")
         PRETRAIN_EPOCHS = epochs
-
+        logging.info(f"→ Phase 1: normal pre-training for {PRETRAIN_EPOCHS} epoch(s)")
+    
         open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
         m_len    = len(open_ids)
         close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
-
+    
         for epoch in range(1, PRETRAIN_EPOCHS + 1):
             real_model.train()
             epoch_loss = 0.0
+    
+            # ————————————— mini-batch loop —————————————
             for step, batch in enumerate(dataloader):
-                print(step, len(dataloader), "progress!!")
-                # -------- quick sanity print every 150 mini-batches ----------
-                if (step + 1) % 150 == 0:
-                    with torch.no_grad():
-                        sample_ids  = batch["input_ids"][:5].to(device)
-                        true_prices = batch["labels"][:5].tolist()
-                        preds = []
-
-                        for ids in sample_ids:
-                            ids_list = ids.tolist()
-                            marker_pos = next(
-                                (j + m_len for j in range(len(ids_list) - m_len + 1)
-                                 if ids_list[j:j + m_len] == open_ids),
-                                None,
-                            )
-                            if marker_pos is None:
-                                preds.append("〈n/a〉")
-                                continue
-
-                            # greedy‐generate until the closing tag appears
-                            prefix     = ids[:marker_pos].unsqueeze(0)
-                            world_size = dist.get_world_size() if dist.is_initialized() else 1
-                            T_local    = real_model.block_size // world_size
-                            cur        = prefix[:, -T_local:].clone()
-                            gen_tokens = []
-
-                            for _ in range(20):
-                                hs     = real_model.forward_embeddings_only(cur)
-                                logits = real_model.lm_head(hs)[:, -1, :]
-                                nxt    = logits.argmax(-1, keepdim=True)
-                                gen_tokens.append(nxt)
-                                if nxt.item() == close_id:
-                                    break
-                                cur = torch.cat([cur, nxt], dim=1)[:, -T_local:]
-
-                            gen_ids  = torch.cat(gen_tokens, dim=1)
-                            full_ids = torch.cat([prefix, gen_ids], dim=1)[0]
-                            decoded  = tokenizer.decode(full_ids, skip_special_tokens=False)
-                            val      = extract_label_value(decoded)
-                            preds.append(f"{val:.2f}" if val is not None else "〈n/a〉")
-
-                        if rank == 0:
-                            for i, pred in enumerate(preds):
-                                print(f"[b{step+1} s{i}] true → {true_prices[i]:.2f}, pred → {pred}")
-
-                # ------------------------------------------------------------
-
                 input_ids = pad_to_global(batch["input_ids"].to(device))
-                loss = real_model.forward_next_token_efficient(
-                    input_ids, reduction="mean"
-                )
-                print(loss, "loss!!")
-
-                if engine:
+                loss      = real_model.forward_next_token_efficient(input_ids, reduction="mean")
+    
+                if engine:                       # DeepSpeed
                     engine.zero_grad(); engine.backward(loss); engine.step()
-                else:
-                    adam_optimizer.zero_grad()
-                    loss.backward()
+                else:                            # plain PyTorch
+                    adam_optimizer.zero_grad(); loss.backward()
                     torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
                     adam_optimizer.step()
-
+    
                 # regularisers / replay
-                if args.use_si and si:
-                    si.update_weights(real_model)
+                if args.use_si  and si : si.update_weights(real_model)
                 if args.use_ewc and ewc:
-                    for ewc_inst in ewc:
-                        loss = loss + args.lambda_ewc * ewc_inst.penalty(real_model)
+                    for ew in ewc: loss += args.lambda_ewc * ew.penalty(real_model)
                 if replay_buffer and len(replay_buffer.buffer):
                     loss += replay_buffer.replay_and_calculate_loss(
-                        model=real_model,
-                        tokenizer=tokenizer,
+                        model=real_model, tokenizer=tokenizer,
                         replay_batch_size=args.replay_batch_size,
-                        device=device,
-                        alpha=args.replay_buffer_weight,
+                        device=device, alpha=args.replay_buffer_weight,
                     )
-
                 epoch_loss += loss.item()
-
-            logging.info(
-                f"[Phase 1] Epoch {epoch}/{PRETRAIN_EPOCHS} — "
-                f"avg loss {epoch_loss/len(dataloader):.4f}"
+    
+            # ——————— epoch summary ———————
+            avg_loss = epoch_loss / len(dataloader)
+            logging.info(f"[Phase 1] Epoch {epoch}/{PRETRAIN_EPOCHS} — avg loss {avg_loss:.4f}")
+    
+            # 1️⃣ barrier before the sample
+            if dist.is_initialized():
+                dist.barrier()
+    
+            # —— light single-example sample *on every rank* ——
+            small_batch = {
+                "input_ids": batch["input_ids"][:1].to(device),
+                "labels"   : batch["labels"][:1],
+            }
+            model_for_sample = engine.module if engine else real_model
+            sample_results   = quick_eval_sample(
+                model_for_sample,
+                tokenizer,
+                small_batch,
+                device=device,
+                open_ids=open_ids,
+                close_id=close_id,
+                m_len=m_len,
             )
-
-        # save after phase 1
-        tag = STAGE_TAG[1]
-        if engine:
-            engine.save_checkpoint(args.save_dir, tag=tag)
-        else:
-            os.makedirs(os.path.join(args.save_dir, tag), exist_ok=True)
-            torch.save(
-                real_model.state_dict(),
-                os.path.join(args.save_dir, tag, "model.pth"),
+    
+            # print only on rank-0, but every rank ran the forward → no NCCL mismatch
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                for i, (true_p, pred) in enumerate(sample_results):
+                    print(f"[Epoch {epoch} sample {i}] true → {true_p:.2f}, pred → {pred}")
+    
+            # 2️⃣ barrier after the sample
+            if dist.is_initialized():
+                dist.barrier()
+    
+            # ——————— checkpoint ———————
+            save_checkpoint(
+                engine   = engine if use_deepspeed else None,
+                model    = real_model,
+                save_dir = args.save_dir,
+                tag      = STAGE_TAG[1],
+                bucket   = args.bucket,
             )
-        if not torch.distributed.is_initialized() or dist.get_rank() == 0:
-            upload_checkpoint_to_s3(
-                local_dir=os.path.join(args.save_dir, STAGE_TAG[1]),
-                bucket=args.bucket,
-                remote_dir=f"model/{STAGE_TAG[1]}"
-            )
-
+    
         if getattr(args, "stage_1_only", False):
-            logging.info("stage_1_only=True → stopping after phase 1")
+            logging.info("stage_1_only=True → stopping after Phase 1")
             return
 
     # ===================================================================== #
