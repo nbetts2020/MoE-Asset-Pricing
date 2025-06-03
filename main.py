@@ -272,43 +272,44 @@ def main():
     # ------------------ RUN (INFERENCE) MODE ------------------
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
-        if not args.test and not all([args.stock, args.date, args.text, args.bucket]):
-            raise ValueError("For non-test 'run' mode, provide --stock, --date, --text, and --bucket.")
-
-        consolidated_model_path = os.path.join(args.save_dir, "consolidated_final.pth")
-
-        # Download the consolidated checkpoint
+        mp_size = int(os.environ.get("WORLD_SIZE", "1"))
+        is_multi = mp_size > 1
+        ckpt_file = "consolidated_final.pth" if is_multi else "model_full.pth"
+        ckpt_path = os.path.join(args.save_dir, ckpt_file)
+        
+        if not args.test and is_multi and not all([args.stock, args.date, args.text, args.bucket]):
+            raise ValueError("For non-test multi-GPU run, provide --stock, --date, --text, and --bucket.")
+        
+        # Download whichever checkpoint we need
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
-            if not os.path.exists(consolidated_model_path):
-                logging.error(f"Consolidated checkpoint not found at {consolidated_model_path} after S3 download")
-                raise FileNotFoundError(f"Expected consolidated checkpoint at {consolidated_model_path}")
-
+            if not os.path.exists(ckpt_path):
+                logging.error(f"Checkpoint not found at {ckpt_path} after S3 download")
+                raise FileNotFoundError(f"Expected checkpoint at {ckpt_path}")
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-
-        if not os.path.exists(consolidated_model_path):
-            logging.error(f"Consolidated checkpoint missing at {consolidated_model_path}")
-            raise FileNotFoundError(f"Consolidated checkpoint not found at {consolidated_model_path}")
-
-        # Basic model creation; do NOT .to(device) if we plan to use DeepSpeed inference
+        if not os.path.exists(ckpt_path):
+            logging.error(f"Checkpoint missing at {ckpt_path}")
+            raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
+        
+        # Load model weights
         model, _ = initialize_model(args, device, init_from_scratch=False)
-        model.load_state_dict(torch.load(consolidated_model_path, map_location="cpu"))  # Load on CPU first
-
-        # ------------------ Multi-GPU Inference with DeepSpeed ------------------
-        mp_size = int(os.environ.get("WORLD_SIZE", 1))
-        model = deepspeed.init_inference(
-            model,
-            mp_size=mp_size,
-            dtype=torch.bfloat16,
-            replace_method="auto",
-            config=args.deepspeed_config
-        )
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+        
+        if is_multi:
+            model = deepspeed.init_inference(
+                model,
+                mp_size=mp_size,
+                dtype=torch.bfloat16,
+                replace_method="auto",
+                config=args.deepspeed_config
+            )
+        else:
+            model.to(device)
+        
         model.eval()
-        logging.info(
-            f"Rank {current_rank}: Main transformer model loaded from {consolidated_model_path} "
-            f"with mp_size={mp_size}"
-        )
+        logging.info(f"Rank {current_rank}: Model loaded from {ckpt_path} (mp_size={mp_size})")
 
         # ---------- Actual Inference Logic ----------
         if not args.test:
