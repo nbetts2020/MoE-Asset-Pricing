@@ -78,51 +78,6 @@ def save_checkpoint(*, engine, model, save_dir: str, tag: str,
         )
 
 @torch.no_grad()
-def quick_eval_sample(model, tokenizer, batch, *,
-                      device, open_ids, close_id, m_len):
-    """
-    Greedy-generate one mini-batch **on a single GPU** (no NCCL, no ZeRO
-    gathers).  Returns a list of (true_price, pred_string).
-    """
-    model.eval()
-
-    sample_ids  = batch["input_ids"][:5].to(device)
-    true_prices = batch["labels"][:5].tolist()
-    preds       = []
-
-    for ids in sample_ids:
-        ids_list = ids.tolist()
-        marker   = next(
-            (j + m_len for j in range(len(ids_list) - m_len + 1)
-             if ids_list[j : j + m_len] == open_ids),
-            None,
-        )
-        if marker is None:
-            preds.append("〈n/a〉"); continue
-
-        prefix   = ids[:marker].unsqueeze(0)          # (1, L)
-        cur      = prefix[:, -model.block_size:]      # local-only path
-        gen      = []
-
-        while len(gen) < 20:
-            hs  = model.forward_embeddings_only(cur,
-                                                gather_full=False,
-                                                local_only = True)
-            nxt = model.lm_head(hs)[:, -1, :].argmax(-1, keepdim=True)
-            gen.append(nxt)
-            if nxt.item() == close_id: break
-            cur = torch.cat([cur, nxt], 1)[:, -model.block_size:]
-
-        full   = torch.cat([prefix, torch.cat(gen, 1)], 1)[0]
-        decoded= tokenizer.decode(full, skip_special_tokens=False)
-        val    = extract_label_value(decoded)          # your util
-        preds.append(f"{val:.2f}" if val is not None else "〈n/a〉")
-
-    model.train()
-    return list(zip(true_prices, preds))
-
-
-@torch.no_grad()
 def local_logits(model, ids_local, mask_local):
     x = model.token_embedding_table(ids_local)
     x = model.dropout_emb(x)
@@ -283,35 +238,7 @@ def train_model(
             avg_loss = epoch_loss / len(dataloader)
             logging.info(f"[Phase 1] Epoch {epoch}/{PRETRAIN_EPOCHS} — avg loss {avg_loss:.4f}")
     
-            # 1️⃣ barrier before the sample
-            if dist.is_initialized():
-                dist.barrier()
-    
-            # —— light single-example sample *on every rank* ——
-            small_batch = {
-                "input_ids": batch["input_ids"][:1].to(device),
-                "labels"   : batch["labels"][:1],
-            }
-            model_for_sample = engine.module if engine else real_model
-            sample_results   = quick_eval_sample(
-                model_for_sample,
-                tokenizer,
-                small_batch,
-                device=device,
-                open_ids=open_ids,
-                close_id=close_id,
-                m_len=m_len,
-            )
-    
-            # print only on rank-0, but every rank ran the forward → no NCCL mismatch
-            if (not dist.is_initialized()) or dist.get_rank() == 0:
-                for i, (true_p, pred) in enumerate(sample_results):
-                    print(f"[Epoch {epoch} sample {i}] true → {true_p:.2f}, pred → {pred}")
-    
-            # 2️⃣ barrier after the sample
-            if dist.is_initialized():
-                dist.barrier()
-    
+
             # ——————— checkpoint ———————
             save_checkpoint(
                 engine   = engine if use_deepspeed else None,
