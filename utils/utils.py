@@ -305,59 +305,58 @@ def process_run_dataset(
             # ---------------------------------------------------------- #
             #  1. Pick best context via EBM
             # ---------------------------------------------------------- #
-            try:
-                ctx = ebm_select_contexts(
-                    df           = df,
-                    idx          = idx,
-                    model        = model,
-                    tokenizer    = tokenizer,
-                    ebm_samples  = args.ebm_num_samples,
-                )
-
-                # Normalise label token
-                ctx = ctx.replace("<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>: ") \
-                         + " </STOCK PRICE 30 DAYS OUT>"
-            except Exception as e:
-                print(f"EBM error @ row {current_offset+processed+idx}: {e}")
-                continue
+            ctx = ebm_select_contexts(
+                df           = df,
+                idx          = idx,
+                model        = model,
+                tokenizer    = tokenizer,
+                ebm_samples  = 1 if args.no_ebm else args.ebm_num_samples,
+            )
+            
+            # Normalise label token
+            ctx = ctx.replace("<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>: ") \
+                     + " </STOCK PRICE 30 DAYS OUT>"
 
             # ---------------------------------------------------------- #
             #  2. Generate reasoning
             #      prefix = ctx + '\n<reasoning>'
             # ---------------------------------------------------------- #
             tokenizer.truncation_side = "left"
-            prefix_ids = tokenizer(
-                ctx + "\n<reasoning>",
-                truncation=True,
-                padding="max_length",
-                max_length=args.block_size,
-                return_tensors="pt"
-            )["input_ids"].to(device)
-
-            gen_reason = []
-            with torch.no_grad():
-                cur = prefix_ids[:, -model.block_size // max(1, torch.distributed.get_world_size()):].clone()
-                for _ in range(1000):
-                    hs     = model.forward_embeddings_only(cur)
-                    logits = model.lm_head(hs)[:, -1, :]
-                    nxt    = logits.argmax(-1, keepdim=True)
-                    if nxt.item() == REASON_CLOSE_ID:
-                        break
-                    gen_reason.append(nxt)
-                    cur = torch.cat([cur, nxt], dim=1)[:, -cur.size(1):]
-
-            # close tag if not seen
-            if not gen_reason or gen_reason[-1].item() != REASON_CLOSE_ID:
-                gen_reason.append(torch.tensor([[REASON_CLOSE_ID]], device=device))
-
-            reasoning_ids = torch.cat(gen_reason, dim=1)
-            reasoning_txt = tokenizer.decode(reasoning_ids[0], skip_special_tokens=False)
+            if args.no_reasoning:
+                continue
+            else:
+                prefix_ids = tokenizer(
+                    ctx + "\n<reasoning>",
+                    truncation=True,
+                    padding="max_length",
+                    max_length=args.block_size,
+                    return_tensors="pt"
+                )["input_ids"].to(device)
+    
+                gen_reason = []
+                with torch.no_grad():
+                    cur = prefix_ids[:, -model.block_size // max(1, torch.distributed.get_world_size()):].clone()
+                    for _ in range(1000):
+                        hs     = model.forward_embeddings_only(cur)
+                        logits = model.lm_head(hs)[:, -1, :]
+                        nxt    = logits.argmax(-1, keepdim=True)
+                        if nxt.item() == REASON_CLOSE_ID:
+                            break
+                        gen_reason.append(nxt)
+                        cur = torch.cat([cur, nxt], dim=1)[:, -cur.size(1):]
+    
+                # close tag if not seen
+                if not gen_reason or gen_reason[-1].item() != REASON_CLOSE_ID:
+                    gen_reason.append(torch.tensor([[REASON_CLOSE_ID]], device=device))
+    
+                reasoning_ids = torch.cat(gen_reason, dim=1)
+                reasoning_txt = tokenizer.decode(reasoning_ids[0], skip_special_tokens=False)
 
             # ---------------------------------------------------------- #
             # 3. Predict price
             #    prefix = ctx + '\n<reasoning>' + reasoning + '</reasoning>\n<STOCK PRICE 30 DAYS OUT>: '
             # ---------------------------------------------------------- #
-            price_prefix = f"{ctx}\n<reasoning>{reasoning_txt}</reasoning>\n<STOCK PRICE 30 DAYS OUT>: "
+            price_prefix = "\n<STOCK PRICE 30 DAYS OUT>: " if args.no_reasoning else f"{ctx}\n<reasoning>{reasoning_txt}</reasoning>\n<STOCK PRICE 30 DAYS OUT>: "
             prefix_ids = tokenizer(
                 price_prefix,
                 truncation=True,
