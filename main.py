@@ -328,10 +328,6 @@ def main():
             print(f"Predicted Price: {output.item()}")
 
         else:
-            # 'test' inference: iterating over data, computing metrics
-            if not args.use_ebm:
-                raise ValueError("Test mode requires --use_ebm for integrated EBM logic.")
-
             if args.percent_data < 100:
                 global_max = int(0.01 * 453932 * (args.percent_data / 100))
             else:
