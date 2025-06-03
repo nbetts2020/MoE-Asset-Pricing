@@ -132,6 +132,8 @@ def main():
     parser.add_argument("--ebm_lr", type=float, default=1e-4, help="learning rate for Energy-Based Model fine‐tuning")
     parser.add_argument("--deepspeed_config", type=str, default="utils/deepspeed_config.json",
                         help="Path to the DeepSpeed config file")
+    parser.add_argument("--no_ebm", action="store_true", help="Turn off EBM for inference")
+    parser.add_argument("--no_reasoning", action="store_true", help="Turn off reasoning for inference")
     parser.add_argument("--stages", type=str, default="1,2,3,4", help="Comma-separated list of training stages to execute (1–4).")
 
     args = parser.parse_args()
