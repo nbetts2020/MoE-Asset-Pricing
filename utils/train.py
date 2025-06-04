@@ -228,8 +228,10 @@ def train_model(
     
             # ————————————— mini-batch loop —————————————
             for step, batch in enumerate(dataloader):
+                print(step, len(dataloader))
                 input_ids = pad_to_global(batch["input_ids"].to(device))
                 loss      = real_model.forward_next_token_efficient(input_ids, reduction="mean")
+                print(loss, "loss!!")
     
                 if engine:                       # DeepSpeed
                     engine.zero_grad(); engine.backward(loss); engine.step()
