@@ -241,6 +241,11 @@ def main():
         )
         print_debug_info("AFTER DEEPSPEED INIT")
 
+        if torch.distributed.is_initialized():
+            config.SP_RING_DEGREE = torch.distributed.get_world_size()
+        else:
+            config.SP_RING_DEGREE = 1
+
         # Prepare data
         train_loader = prepare_dataloader(
             epoch=1,
