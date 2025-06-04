@@ -454,24 +454,6 @@ def download_models_from_s3(bucket):
         logging.error(f"Error syncing 'models' directory: {e.stderr}")
         raise
 
-    try:
-        logging.info(f"Starting download of RL Attention file from s3://{bucket}/models/hAttention_rl.pth")
-        result = subprocess.run(
-            ["aws", "s3", "cp", f"s3://{bucket}/models/hAttention_rl.pth", "models/hAttention_rl.pth"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        logging.info(f"RL Attention file downloaded successfully.\n{result.stdout}")
-    except subprocess.CalledProcessError as e:
-        # If file is not found (404), log a warning and continue.
-        if "404" in e.stderr:
-            logging.warning(f"RL Attention file not found in bucket {bucket}. Continuing without it.")
-        else:
-            logging.error(f"Error downloading RL Attention file: {e.stderr}")
-            raise
-
 def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
     """
     Saves the RL hierarchical attention module's state dictionary to a file and,
