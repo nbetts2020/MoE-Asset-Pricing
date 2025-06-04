@@ -311,6 +311,7 @@ def process_run_dataset(
                 model        = model,
                 tokenizer    = tokenizer,
                 ebm_samples  = 1 if args.no_ebm else args.ebm_num_samples,
+                args = args
             )
             
             # Normalise label token
@@ -481,7 +482,7 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
         except Exception as e:
             logging.error(f"Error uploading RL Attention module to S3: {e}")
 
-def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples):
+def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, args):
     """
     Pick the context whose EBM energy is lowest (|energy| ~= best match).
 
@@ -512,6 +513,9 @@ def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples):
         raise ValueError("No candidate contexts found for this sample.")
 
     sampled = random.sample(candidates, min(len(candidates), ebm_samples))
+
+    if args.no_ebm:
+        return sampled[0]
 
     energies = []
     device = next(model.parameters()).device
