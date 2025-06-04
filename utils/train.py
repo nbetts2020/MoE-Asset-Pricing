@@ -55,27 +55,43 @@ def save_checkpoint(*, engine, model, save_dir: str, tag: str,
       • DeepSpeed ZeRO-3 (engine!=None) – uses engine.save_checkpoint  
       • Plain PyTorch            – torch.save(model.state_dict(), …)
 
-    If `bucket` is given and we’re on rank-0, also sync to S3.
+    After writing, if `bucket` is set, all DeepSpeed ranks will
+    synchronize and then each upload its own shard to S3. In the
+    pure‐PyTorch path (engine=None), only rank 0 uploads.
     """
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
 
-    if engine is not None:                       # DeepSpeed path
+    if engine is not None:
+        # ── DeepSpeed path: every rank writes its own shard locally ──
         if rank0:
             print(f"[save] DeepSpeed checkpoint → {save_dir} (tag={tag})")
         engine.save_checkpoint(save_dir, tag=tag)
 
-    else:                                        # plain torch path
+        if bucket:
+            # wait for all ranks to finish writing
+            if dist.is_initialized():
+                dist.barrier()
+
+            # now each rank uploads whatever is in save_dir/<tag>/ to S3
+            upload_checkpoint_to_s3(
+                local_dir=os.path.join(save_dir, tag),
+                bucket=bucket,
+                remote_dir=f"model/{tag}"
+            )
+
+    else:
+        # ── plain PyTorch path: only rank 0 saves and uploads ──
         ckpt_dir = os.path.join(save_dir, tag)
         if rank0:
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(ckpt_dir, "model.pth"))
 
-    if bucket and rank0:
-        upload_checkpoint_to_s3(
-            local_dir=os.path.join(save_dir, tag),
-            bucket=bucket,
-            remote_dir=f"model/{tag}",
-        )
+            if bucket:
+                upload_checkpoint_to_s3(
+                    local_dir=ckpt_dir,
+                    bucket=bucket,
+                    remote_dir=f"model/{tag}"
+                )
 
 @torch.no_grad()
 def local_logits(model, ids_local, mask_local):
@@ -329,25 +345,27 @@ def train_model(
         real_model.train()
         epoch_loss = 0.0
         dbg("entering training loop")
-
-        for idx, batch in enumerate(continual_loader):
-            print(idx, len(continual_loader))
-            bsz = batch["input_ids"].size(0)
-            if bsz != config.BATCH_SIZE:
-                dbg(f"Skipping stray batch of size {bsz}")
-                continue
-
-            input_ids = pad_to_global(batch["input_ids"].to(device))
-            loss      = real_model.forward_next_token_efficient(
-                            input_ids, reduction="mean"
-                        )
-            print(loss, "loss!!")
-
-            engine.zero_grad()
-            engine.backward(loss)
-            engine.step()
-
-            epoch_loss += loss.item()
+        PHASE2_EPOCHS = 5
+        for epoch in range(1, PHASE2_EPOCHS + 1):
+            print(epoch, PHASE2_EPOCHS)
+            for idx, batch in enumerate(continual_loader):
+                print(idx, len(continual_loader))
+                bsz = batch["input_ids"].size(0)
+                if bsz != config.BATCH_SIZE:
+                    dbg(f"Skipping stray batch of size {bsz}")
+                    continue
+    
+                input_ids = pad_to_global(batch["input_ids"].to(device))
+                loss      = real_model.forward_next_token_efficient(
+                                input_ids, reduction="mean"
+                            )
+                print(loss, "loss!!")
+    
+                engine.zero_grad()
+                engine.backward(loss)
+                engine.step()
+    
+                epoch_loss += loss.item()
 
         logging.info(f"[Phase 2] Avg loss {epoch_loss/len(continual_loader):.4f}")
 
@@ -425,24 +443,27 @@ def train_model(
         epoch_loss = 0.0
         dbg("entering training loop")
 
-        for idx, batch in enumerate(continual_loader):
-            print(idx, len(continual_loader))
-            bsz = batch["input_ids"].size(0)
-            if bsz != config.BATCH_SIZE:
-                dbg(f"Skipping stray batch of size {bsz}")
-                continue
-
-            input_ids = pad_to_global(batch["input_ids"].to(device))
-            loss      = real_model.forward_next_token_efficient(
-                            input_ids, reduction="mean"
-                        )
-            print(loss, "loss!!")
-
-            engine.zero_grad()
-            engine.backward(loss)
-            engine.step()
-
-            epoch_loss += loss.item()
+        PHASE3_EPOCHS = 5
+        for epoch in range(1, PHASE3_EPOCHS + 1):
+            print(epoch, PHASE3_EPOCHS)
+            for idx, batch in enumerate(continual_loader):
+                print(idx, len(continual_loader))
+                bsz = batch["input_ids"].size(0)
+                if bsz != config.BATCH_SIZE:
+                    dbg(f"Skipping stray batch of size {bsz}")
+                    continue
+    
+                input_ids = pad_to_global(batch["input_ids"].to(device))
+                loss      = real_model.forward_next_token_efficient(
+                                input_ids, reduction="mean"
+                            )
+                print(loss, "loss!!")
+    
+                engine.zero_grad()
+                engine.backward(loss)
+                engine.step()
+    
+                epoch_loss += loss.item()
 
         logging.info(f"[Phase 3] Avg loss {epoch_loss/len(continual_loader):.4f}")
 
@@ -541,133 +562,120 @@ def train_model(
     if 4 in args.stages:
         logging.info("=== Starting EBM Fine-Tuning Phase ===")
     
-        # ── freeze backbone, train only EBM ─────────────────────────────
+        # freeze backbone, train only the small EBM head
         for p in real_model.parameters():
             p.requires_grad_(False)
         for p in real_model.ebm.parameters():
             p.requires_grad_(True)
     
-        ebm_optimizer = torch.optim.AdamW(real_model.ebm.parameters(),
-                                          lr=args.ebm_lr)
-        margin     = getattr(args, "ebm_margin", 1.0)
+        ebm_opt   = torch.optim.AdamW(real_model.ebm.parameters(), lr=args.ebm_lr)
+        margin    = getattr(args, "ebm_margin", 1.0)
         ebm_epochs = getattr(args, "ebm_epochs", 1)
     
-        # token-id helpers
-        open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ",
-                             add_special_tokens=False).input_ids
-        m_len    = len(open_ids)
-        close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
+        open_ids  = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+        m_len     = len(open_ids)
+        close_id  = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
     
-        fw_count = 0
-    
-        # ---------------------------- TRAIN ----------------------------
         for epoch in range(1, ebm_epochs + 1):
             real_model.ebm.train()
-            total_loss, steps = 0.0, 0
+            total_loss, steps = 0., 0
     
-            for stage in range(3, 4):                    # ft_datasets 3-7
-                loader = prepare_ft_dataloader(
-                    tokenizer, block_size=config.BLOCK_SIZE,
-                    shuffle=True, args=args, stage=stage, streaming=True
-                )
-    
-                for idx, batch in enumerate(loader):
-                    ids        = batch["input_ids"].to(device)   # (B,K,T)
-                    true_price = batch["labels"].to(device)      # (B,)
+            for stage in range(3, 4):                                    # ft_datasets 3-7
+                loader = prepare_ft_dataloader(tokenizer,
+                                               block_size=config.BLOCK_SIZE,
+                                               shuffle=True,
+                                               args=args, stage=stage,
+                                               streaming=True)
+                for batch in loader:
+                    ids        = batch["input_ids"].to(device)           # (B,K,T)
+                    true_price = batch["labels"].to(device)              # (B,)
                     B, K, T    = ids.shape
     
-                    # ---- 1. embed once (frozen backbone) ----------------
-                    flat_ids = ids.view(B*K, T)
-                    with torch.no_grad():
-                        embs = real_model.get_embeddings(flat_ids, pool=True)
-                    embs = embs.view(B, K, -1)                   # (B,K,D)
-                    fw_count += B * K
+                    # ---- 1. stream each candidate through frozen backbone ----
+                    emb_chunks = []
+                    for k_idx in range(K):
+                        ctx_ids = ids[:, k_idx, :]                       # (B,T)
+                        with torch.no_grad():                            # no backbone grads
+                            emb_k = real_model.get_embeddings(ctx_ids, pool=True)  # (B,D)
+                        emb_chunks.append(emb_k)
+                    embs = torch.stack(emb_chunks, dim=1)                # (B,K,D)
     
-                    # ---- 2. greedy decode → numeric preds --------------
-                    preds = torch.full((B, K), float("inf"),
-                                       device=device)
+                    # ---- 2. greedy decode numeric preds (unchanged) ----------
+                    preds = torch.full((B, K), float("inf"), device=device)
                     for b in range(B):
                         for k in range(K):
                             seq = ids[b, k].tolist()
                             try:
-                                j = next(i for i in range(T-m_len+1)
+                                j = next(i for i in range(T - m_len + 1)
                                          if seq[i:i+m_len] == open_ids)
                             except StopIteration:
                                 continue
                             prefix = ids[b, k, :j+m_len].unsqueeze(0)
                             cur = prefix.clone(); gen = []
                             for _ in range(10):
-                                hs = real_model.forward_embeddings_only(cur)
-                                nxt = real_model.lm_head(hs)[:, -1].argmax(-1,
-                                               keepdim=True)      # (1,1)
+                                hs  = real_model.forward_embeddings_only(cur)
+                                nxt = real_model.lm_head(hs)[:, -1].argmax(-1, keepdim=True)
                                 gen.append(nxt)
                                 if nxt.item() == close_id:
                                     break
-                                cur = torch.cat([cur, nxt], 1)
-                            full = torch.cat([prefix, *gen], 1)[0]
+                                cur = torch.cat([cur, nxt], dim=1)
+                            full = torch.cat([prefix, *gen], dim=1)[0]
                             val  = extract_label_value(
-                                       tokenizer.decode(full,
-                                                        skip_special_tokens=False))
+                                    tokenizer.decode(full, skip_special_tokens=False))
                             if val is not None:
                                 preds[b, k] = val
-                            fw_count += len(gen)
     
-                    # ---- 3. loss (margin-ranking) ----------------------
-                    true_exp  = true_price[:, None].expand_as(preds)
-                    pos_idx   = (preds-true_exp).abs().argmin(1)   # (B,)
-                    flat_embs = embs.view(B*K, -1).to(torch.bfloat16)
-                    energies  = real_model.ebm(flat_embs).view(B, K)
+                    # ---- 3. margin-ranking loss over K candidates ------------
+                    flat_embs = embs.view(B*K, -1).to(torch.bfloat16)     # (B·K,D)
+                    energies  = real_model.ebm(flat_embs).view(B, K)      # (B,K)
     
-                    pos_en = energies[torch.arange(B), pos_idx]
-                    mask   = torch.ones_like(energies, dtype=torch.bool)
+                    pos_idx   = (preds - true_price[:, None]).abs().argmin(dim=1)  # (B,)
+                    pos_en    = energies[torch.arange(B), pos_idx]                  # (B,)
+                    mask      = torch.ones_like(energies, dtype=torch.bool)
                     mask[torch.arange(B), pos_idx] = False
-                    neg_en = energies[mask].view(B, K-1)
+                    neg_en    = energies[mask].view(B, K-1)                          # (B,K-1)
     
-                    loss = F.relu(margin + pos_en[:, None] - neg_en).mean()
+                    loss = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
     
-                    # ---- 4. backward/step on EBM only -------------------
-                    ebm_optimizer.zero_grad()
+                    ebm_opt.zero_grad()
                     loss.backward()
-                    ebm_optimizer.step()
+                    ebm_opt.step()
     
                     total_loss += loss.item(); steps += 1
     
-            logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs} "
+            logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs}  "
                          f"AvgLoss={total_loss/steps:.4f}")
     
-        # ---------------------------- VALID ----------------------------
+        # ----------------------------- VALIDATION ----------------------------- #
         logging.info("=== EBM Validation (stage 8) ===")
         real_model.ebm.eval()
-        val_loader = prepare_ft_dataloader(
-            tokenizer, block_size=config.BLOCK_SIZE,
-            shuffle=False, args=args, stage=8, streaming=True
-        )
-        val_loss, steps = 0.0, 0
+        val_loader = prepare_ft_dataloader(tokenizer,
+                                           block_size=config.BLOCK_SIZE,
+                                           shuffle=False,
+                                           args=args, stage=8,
+                                           streaming=True)
+        val_loss, steps = 0., 0
         with torch.no_grad():
             for batch in val_loader:
-                ids        = batch["input_ids"].to(device)
-                true_price = batch["labels"].to(device)
+                ids        = batch["input_ids"].to(device)              # (B,K,T)
+                true_price = batch["labels"].to(device)                 # (B,)
                 B, K, T    = ids.shape
     
-                flat_ids = ids.view(B*K, T)
-                embs = real_model.get_embeddings(flat_ids, pool=True
-                        ).view(B, K, -1)
-                energies = real_model.ebm(
-                    embs.view(B*K, -1).to(torch.bfloat16)).view(B, K)
+                emb_chunks = []
+                for k_idx in range(K):
+                    emb_chunks.append(real_model.get_embeddings(ids[:, k_idx, :], pool=True))
+                embs = torch.stack(emb_chunks, dim=1)                   # (B,K,D)
+                energies = real_model.ebm(embs.view(B*K, -1).to(torch.bfloat16)).view(B, K)
     
-                # pick pos/neg as before
-                preds = torch.full((B, K), float("inf"), device=device)
-                # (reuse greedy decode loop if you need exact metrics)
-                pos_idx = torch.zeros(B, dtype=torch.long, device=device)
+                pos_idx = torch.zeros(B, dtype=torch.long, device=device)  # dummy baseline
                 pos_en  = energies[torch.arange(B), pos_idx]
-                neg_en  = energies.mean(1)                     # cheap proxy
+                neg_en  = energies.mean(dim=1)
                 loss    = F.relu(margin + pos_en - neg_en).mean()
     
                 val_loss += loss.item(); steps += 1
-    
         logging.info(f"[EBM Val] AvgLoss={val_loss/steps:.4f}")
     
-        # -------------------- save EBM-tuned model --------------------
+        # ----------------------------- SAVE ----------------------------------- #
         final_tag = "model_with_ebm"
         final_dir = os.path.join(args.save_dir, final_tag)
         os.makedirs(final_dir, exist_ok=True)
@@ -684,6 +692,6 @@ def train_model(
                                     remote_dir=f"model/{final_tag}")
     
         logging.info("=== Phase 4 complete ===")
-
-
+    
+    
         logging.info("Training complete.")
