@@ -129,7 +129,7 @@ class MultiHeadAttention(nn.Module):
         self.usp_attn = LongContextAttention(
             scatter_idx=2,
             gather_idx=1,
-            ring_impl_type="zigzag",
+            ring_impl_type="striped",
             use_pack_qkv=True,
             use_sync=True,
             attn_type=AttnType.FA,
