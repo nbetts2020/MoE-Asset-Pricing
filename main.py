@@ -218,16 +218,6 @@ def main():
     if args.mode == "train":
         print_debug_info("TRAIN MODE START")
     
-        # ── 1.  Configure seq-parallel degrees *before* building the model ──────
-        if dist.is_initialized():
-            # “True” ring attention: 1 × WORLD_SIZE mesh
-            config.SP_ULYSSES_DEGREE = 1
-            config.SP_RING_DEGREE    = dist.get_world_size()
-        else:
-            # Fallback to single-GPU ring on unit tests / local runs
-            config.SP_ULYSSES_DEGREE = 1
-            config.SP_RING_DEGREE    = 1
-    
         # ── 2.  Build the model with ZeRO.Init so parameters start sharded ──────
         with zero.Init(config_dict_or_path=args.deepspeed_config):
             model, initialized_from_scratch = initialize_model(
