@@ -13,12 +13,9 @@ import yunchang.hybrid.attn_layer as _yc_attn
 
 _SeqApply_orig = _yc_attn.SeqAllToAll4D.apply
 def _SeqApply_shim(*args, **kwargs):
-    # drop any kwargs and forward to real apply
-    if kwargs:
-        return _SeqApply_orig(*args)
-    return _SeqApply_orig(*args)
+    # Forward all args and kwargs to the real apply
+    return _SeqApply_orig(*args, **kwargs) # CORRECTED: Pass **kwargs
 _yc_attn.SeqAllToAll4D.apply = _SeqApply_shim
-
 
 import flash_attn.flash_attn_interface as _fai
 import flash_attn                       as _fa
@@ -129,7 +126,7 @@ class MultiHeadAttention(nn.Module):
         self.usp_attn = LongContextAttention(
             scatter_idx=2,
             gather_idx=1,
-            ring_impl_type="striped",
+            ring_impl_type="zigzag",
             use_pack_qkv=True,
             use_sync=True,
             attn_type=AttnType.FA,
