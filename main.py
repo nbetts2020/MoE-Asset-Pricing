@@ -217,22 +217,35 @@ def main():
     # ------------------ TRAIN MODE ------------------
     if args.mode == "train":
         print_debug_info("TRAIN MODE START")
-
-        # Use ZeRO.Init so parameters are sharded across GPUs from the start
+    
+        # ── 1.  Configure seq-parallel degrees *before* building the model ──────
+        if dist.is_initialized():
+            # “True” ring attention: 1 × WORLD_SIZE mesh
+            config.SP_ULYSSES_DEGREE = 1
+            config.SP_RING_DEGREE    = dist.get_world_size()
+        else:
+            # Fallback to single-GPU ring on unit tests / local runs
+            config.SP_ULYSSES_DEGREE = 1
+            config.SP_RING_DEGREE    = 1
+    
+        # ── 2.  Build the model with ZeRO.Init so parameters start sharded ──────
         with zero.Init(config_dict_or_path=args.deepspeed_config):
-            model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
-
-        # Apply custom initialization if needed
+            model, initialized_from_scratch = initialize_model(
+                args,
+                device,
+                init_from_scratch=True
+            )
+    
+        # Optional custom weight init
         if initialized_from_scratch:
             model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
-
-        # Prepare optimizer
+    
+        # ── 3.  Optimizer & DeepSpeed engine ────────────────────────────────────
         optimizers = prepare_optimizer(model, args)
         logging.info(f"LOCAL_RANK (train): {local_rank}")
         logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
-
-        # Initialize DeepSpeed Engine (ZeRO, etc.)
+    
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizers["main"],
@@ -240,13 +253,8 @@ def main():
             config=args.deepspeed_config
         )
         print_debug_info("AFTER DEEPSPEED INIT")
-
-        if torch.distributed.is_initialized():
-            config.SP_RING_DEGREE = torch.distributed.get_world_size()
-        else:
-            config.SP_RING_DEGREE = 1
-
-        # Prepare data
+    
+        # ── 4.  Data ────────────────────────────────────────────────────────────
         train_loader = prepare_dataloader(
             epoch=1,
             window_index=1,
@@ -257,8 +265,8 @@ def main():
             global_max=1e12,
             args=args
         )
-
-        # Train
+    
+        # ── 5.  Train ───────────────────────────────────────────────────────────
         train_model(
             model=engine,
             optimizer=optimizers,
@@ -273,7 +281,6 @@ def main():
             use_deepspeed=True
         )
         logging.info("Training completed.")
-
     # ------------------ RUN (INFERENCE) MODE ------------------
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
