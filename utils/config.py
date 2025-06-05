@@ -17,7 +17,7 @@ class Config:
     BATCH_SIZE = 16       # Effective batch size is 32 with 2 grad accumulation steps
     LAMBDA_EBM = 0.1
     SP_ULYSSES_DEGREE = 1
-    SP_RING_DEGREE    = 2
+    SP_RING_DEGREE    = 8
     LR_DECAY = 1      # Decay rate per layer
     LAMBDA_SI = 0.1      # Lambda val for synaptic intelligence
     COCONUT_MASK_STAGES = [0.0, 0.25, 0.50, 0.75, 1.0]  
