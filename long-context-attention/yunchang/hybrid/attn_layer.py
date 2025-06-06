@@ -67,9 +67,10 @@ class LongContextAttention(torch.nn.Module):
             qkv = torch.cat([query, key, value], dim=-1).contiguous()
             if ulysses_world_size > 1:
                 qkv = SeqAllToAll4D.apply(
-                    self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx, use_sync=self.use_sync
+                    self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx, self.use_sync
                 )
-            q_s, k_s, v_s = torch.chunk(qkv, 3, dim=0)
+            head_dim = query.size(-1)
+            q_s, k_s, v_s = torch.split(qkv, head_dim, dim=-1)
             out = self.ring_attn_fn(
                 q_s,
                 k_s,
@@ -89,13 +90,13 @@ class LongContextAttention(torch.nn.Module):
         else:
             if ulysses_world_size > 1:
                 query_layer = SeqAllToAll4D.apply(
-                    self.ulysses_pg, query, self.scatter_idx, self.gather_idx, use_sync=self.use_sync
+                    self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync
                 )
                 key_layer = SeqAllToAll4D.apply(
-                    self.ulysses_pg, key, self.scatter_idx, self.gather_idx, use_sync=self.use_sync
+                    self.ulysses_pg, key, self.scatter_idx, self.gather_idx, self.use_sync
                 )
                 value_layer = SeqAllToAll4D.apply(
-                    self.ulysses_pg, value, self.scatter_idx, self.gather_idx, use_sync=self.use_sync
+                    self.ulysses_pg, value, self.scatter_idx, self.gather_idx, self.use_sync
                 )
             else:
                 query_layer, key_layer, value_layer = query, key, value
@@ -127,7 +128,7 @@ class LongContextAttention(torch.nn.Module):
 
         if ulysses_world_size > 1:
             output = SeqAllToAll4D.apply(
-                self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, use_sync=self.use_sync
+                self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync
             )
         else:
             output = context_layer
