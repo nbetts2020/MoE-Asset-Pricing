@@ -6,6 +6,7 @@ FLASH_PATH = os.path.expanduser("~/MoE-Asset-Pricing/flash-attention")
 sys.path.insert(0, FLASH_PATH)
 
 import torch
+import torch.distributed as dist
 import os
 import argparse
 import logging
@@ -15,6 +16,19 @@ import json
 import subprocess
 from multiprocessing import cpu_count
 from sklearn.metrics import mean_squared_error, r2_score
+
+dist.init_process_group(backend="nccl")
+
+from yunchang import set_seq_parallel_pg
+from utils.config import config
+
+# Make sure SP_ULYSSES_DEGREE * SP_RING_DEGREE == dist.get_world_size()
+set_seq_parallel_pg(
+    config.SP_ULYSSES_DEGREE,
+    config.SP_RING_DEGREE,
+    dist.get_rank(),
+    dist.get_world_size(),
+)
 
 import deepspeed
 from transformers import AutoTokenizer, LlamaTokenizerFast
@@ -38,7 +52,6 @@ from utils.utils import (
     prepare_dataloader,
     process_run_dataset
 )
-from utils.config import config
 from pandarallel import pandarallel
 from utils.si import SynapticIntelligence
 from utils.memory_replay_buffer import MemoryReplayBuffer
@@ -466,7 +479,6 @@ def main():
 
     # Destroy distributed process group if it was used
     if args.use_ddp:
-        import torch.distributed as dist
         dist.destroy_process_group()
 
 if __name__ == "__main__":
