@@ -115,14 +115,6 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer("rope_sin", sin.float(), persistent=False)
         self.register_buffer("rope_cos", cos.float(), persistent=False)
 
-        if dist.is_initialized():
-            set_seq_parallel_pg(
-                config.SP_ULYSSES_DEGREE,
-                config.SP_RING_DEGREE,
-                dist.get_rank(),
-                dist.get_world_size()
-            )
-
         self.usp_attn = LongContextAttention(
             scatter_idx=2,
             gather_idx=1,
