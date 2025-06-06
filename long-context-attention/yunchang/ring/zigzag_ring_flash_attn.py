@@ -24,40 +24,44 @@ def zigzag_ring_flash_attn_forward(
 
     out = None
     lse = None
-    next_k, next_v = None, None
 
-    def forward(q, k, v, causal):
+    def forward_block(q_block, k_block, v_block, causal_flag):
         fn = select_flash_attn_impl(attn_type, stage="fwd-only")
-        block_out, block_lse = fn(
-            q,
-            k,
-            v,
+        return fn(
+            q_block,
+            k_block,
+            v_block,
             dropout_p,
             softmax_scale,
-            causal=causal,
+            causal=causal_flag,
             window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
-            return_softmax=True and dropout_p > 0,
+            return_softmax=(dropout_p > 0),
         )
-        return block_out, block_lse
 
     for step in range(comm.world_size):
+        # 1) Exchange full k, v before any slicing
         if step + 1 != comm.world_size:
-            next_k: torch.Tensor = comm.send_recv(k)
-            next_v: torch.Tensor = comm.send_recv(v)
+            print(f"[rank {dist.get_rank()}] forward step={step} (pre-exchange), k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}")
+            next_k = comm.send_recv(k)
+            next_v = comm.send_recv(v)
             comm.commit()
+            comm.wait()
+            k, v = next_k, next_v
+            print(f"[rank {dist.get_rank()}] forward step={step} (post-exchange), k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}")
 
+        # 2) Perform attention on appropriate slice
         if step == 0:
-            block_out, block_lse = forward(q, k, v, causal=True)
+            block_out, block_lse = forward_block(q, k, v, causal=True)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         elif step <= comm.rank:
             k0 = k[:, :block_seq_len]
             v0 = v[:, :block_seq_len]
-            block_out, block_lse = forward(q, k0, v0, causal=False)
+            block_out, block_lse = forward_block(q, k0, v0, causal=False)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         else:
-            block_out, block_lse = forward(q1, k, v, causal=False)
+            block_out, block_lse = forward_block(q1, k, v, causal=False)
             out, lse = update_out_and_lse(
                 out,
                 lse,
@@ -65,11 +69,6 @@ def zigzag_ring_flash_attn_forward(
                 block_lse,
                 slice_=(slice(None), slice(block_seq_len, None)),
             )
-
-        if step + 1 != comm.world_size:
-            comm.wait()
-            k = next_k
-            v = next_v
 
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
@@ -107,7 +106,7 @@ def zigzag_ring_flash_attn_backward(
     softmax_lse1 = softmax_lse.chunk(2, dim=2)[1].contiguous()
     block_seq_len = q.shape[1] // 2
 
-    # repeatly allocating buffer may be slow...
+    # buffers for backward
     dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     dv_buffer = torch.empty(v.shape, dtype=v.dtype, device=v.device)
@@ -138,6 +137,10 @@ def zigzag_ring_flash_attn_backward(
 
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
+            # DEBUG: log shapes before send_recv of k, v
+            print(
+                f"[rank {dist.get_rank()}] backward step={step}, sending k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}"
+            )
             next_k = kv_comm.send_recv(k)
             next_v = kv_comm.send_recv(v)
             kv_comm.commit()
@@ -155,7 +158,6 @@ def zigzag_ring_flash_attn_backward(
                 dq += dq_buffer
             else:
                 backward(dout1, q1, k, v, out1, softmax_lse1, causal=False)
-                # always use the first half in dq_buffer.
                 dq[:, block_seq_len:] += dq_buffer[:, :block_seq_len]
 
             d_kv_comm.wait()
@@ -174,6 +176,10 @@ def zigzag_ring_flash_attn_backward(
             k = next_k
             v = next_v
 
+        # DEBUG: log shapes before send_recv of dk, dv
+        print(
+            f"[rank {dist.get_rank()}] backward step={step}, sending dk.shape={tuple(dk.shape)}, dv.shape={tuple(dv.shape)}"
+        )
         next_dk = d_kv_comm.send_recv(dk, dk_comm_buffer)
         next_dv = d_kv_comm.send_recv(dv, dv_comm_buffer)
         d_kv_comm.commit()
