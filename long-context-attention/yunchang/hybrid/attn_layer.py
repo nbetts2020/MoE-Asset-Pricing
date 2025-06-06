@@ -64,7 +64,7 @@ class LongContextAttention(torch.nn.Module):
                        query.shape[1] == value.shape[1]
 
         if can_pack_qkv:
-            qkv = torch.cat([query, key, value]).contiguous()
+            qkv = torch.cat([query, key, value], dim=-1).contiguous()
             if ulysses_world_size > 1:
                 qkv = SeqAllToAll4D.apply(
                     self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx, use_sync=self.use_sync
