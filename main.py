@@ -5,6 +5,9 @@ import os, sys
 FLASH_PATH = os.path.expanduser("~/MoE-Asset-Pricing/flash-attention")
 sys.path.insert(0, FLASH_PATH)
 
+LCA_PATH = os.path.expanduser("~/MoE-Asset-Pricing/long-context-attention")
+sys.path.insert(0, LCA_PATH)
+
 import torch
 import torch.distributed as dist
 import os
