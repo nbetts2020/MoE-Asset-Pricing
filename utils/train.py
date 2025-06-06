@@ -300,28 +300,6 @@ def train_model(
         )
         dbg(f"after RoPE update: block_size = {real_model.block_size}")
 
-        # ── 3. rebuild sequence-parallel process groups & each attention ────
-        if dist.is_initialized():
-            from yunchang import set_seq_parallel_pg, LongContextAttention
-            from yunchang.kernels import AttnType
-
-            set_seq_parallel_pg(
-                config.SP_ULYSSES_DEGREE,
-                config.SP_RING_DEGREE,
-                dist.get_rank(),
-                dist.get_world_size(),
-            )
-
-            for blk in real_model.blocks:
-                blk.sa.usp_attn = LongContextAttention(
-                    scatter_idx     = 2,
-                    gather_idx      = 1,
-                    ring_impl_type  = "zigzag",
-                    use_pack_qkv    = True,
-                    use_sync        = True,
-                    attn_type       = AttnType.FA,
-                    attn_processor  = None,
-                )
 
         # ── 4. zero out any optimizer state so momentum/etc doesn’t mix old context ─
         dbg("zeroing DeepSpeed optimizer state")
@@ -384,7 +362,7 @@ def train_model(
 
 
     # --------------------------------------------------------------------- #
-    #  PHASE 3 – Coconut (supervised) fine-tuning with mask curriculum      #
+    #  PHASE 3 – Reasoning                                                  #
     # --------------------------------------------------------------------- #
     if 3 in args.stages:
         dbg("→ entering Phase 3")
@@ -396,29 +374,6 @@ def train_model(
         dbg("loaded Phase-2 model")
 
         device   = torch.device("cuda")
-
-        # ── 3. rebuild sequence-parallel process groups & each attention ────
-        if dist.is_initialized():
-            from yunchang import set_seq_parallel_pg, LongContextAttention
-            from yunchang.kernels import AttnType
-
-            set_seq_parallel_pg(
-                config.SP_ULYSSES_DEGREE,
-                config.SP_RING_DEGREE,
-                dist.get_rank(),
-                dist.get_world_size(),
-            )
-
-            for blk in real_model.blocks:
-                blk.sa.usp_attn = LongContextAttention(
-                    scatter_idx     = 2,
-                    gather_idx      = 1,
-                    ring_impl_type  = "zigzag",
-                    use_pack_qkv    = True,
-                    use_sync        = True,
-                    attn_type       = AttnType.FA,
-                    attn_processor  = None,
-                )
 
         # ── 4. zero out any optimizer state so momentum/etc doesn’t mix old context ─
         dbg("zeroing DeepSpeed optimizer state")
