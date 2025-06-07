@@ -1,6 +1,7 @@
 import torch
 from .utils import RingComm, update_out_and_lse
 from yunchang.kernels import AttnType, select_flash_attn_impl
+import torch.distributed as dist
 
 def zigzag_ring_flash_attn_forward(
     process_group,
@@ -53,15 +54,15 @@ def zigzag_ring_flash_attn_forward(
 
         # 2) Perform attention on appropriate slice
         if step == 0:
-            block_out, block_lse = forward_block(q, k, v, causal=True)
+            block_out, block_lse = forward_block(q, k, v, True)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         elif step <= comm.rank:
             k0 = k[:, :block_seq_len]
             v0 = v[:, :block_seq_len]
-            block_out, block_lse = forward_block(q, k0, v0, causal=False)
+            block_out, block_lse = forward_block(q, k0, v0, False)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         else:
-            block_out, block_lse = forward_block(q1, k, v, causal=False)
+            block_out, block_lse = forward_block(q1, k, v, False)
             out, lse = update_out_and_lse(
                 out,
                 lse,
@@ -146,7 +147,7 @@ def zigzag_ring_flash_attn_backward(
             kv_comm.commit()
 
         if step == 0:
-            backward(dout, q, k, v, out, softmax_lse, causal=True)
+            backward(dout, q, k, v, out, softmax_lse, True)
             dq = dq_buffer.to(torch.float32)
             dk = dk_buffer.to(torch.float32)
             dv = dv_buffer.to(torch.float32)
@@ -154,10 +155,10 @@ def zigzag_ring_flash_attn_backward(
             if step <= kv_comm.rank:
                 k0 = k[:, :block_seq_len]
                 v0 = v[:, :block_seq_len]
-                backward(dout, q, k0, v0, out, softmax_lse, causal=False)
+                backward(dout, q, k0, v0, out, softmax_lse, False)
                 dq += dq_buffer
             else:
-                backward(dout1, q1, k, v, out1, softmax_lse1, causal=False)
+                backward(dout1, q1, k, v, out1, softmax_lse1, False)
                 dq[:, block_seq_len:] += dq_buffer[:, :block_seq_len]
 
             d_kv_comm.wait()
@@ -187,7 +188,6 @@ def zigzag_ring_flash_attn_backward(
     d_kv_comm.wait()
 
     return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
-
 
 class ZigZagRingFlashAttnFunc(torch.autograd.Function):
     @staticmethod
