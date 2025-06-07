@@ -48,6 +48,7 @@ from utils.ebm    import EnergyBasedModel
 from utils.data   import GLOBAL_TOKENIZER
 from cut_cross_entropy import linear_cross_entropy
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+from deepspeed import zero
 
 from yunchang import set_seq_parallel_pg, LongContextAttention, EXTRACT_FUNC_DICT
 from yunchang.kernels import AttnType
@@ -165,11 +166,18 @@ class MultiHeadAttention(nn.Module):
         else:
             current_k, current_v = k_rope, v_rope
 
-        # 4) trim to max cache
-        MAX = int(config.BLOCK_SIZE / world_size)
-        if current_k.shape[1] > MAX:
-            current_k = current_k[:, -MAX:, :, :]
-            current_v = current_v[:, -MAX:, :, :]
+        KV_CAP = config.BLOCK_SIZE // world_size        # identical on all ranks
+        seq_len = current_k.size(1)
+        
+        if seq_len < KV_CAP:                            # rank with shorter cache
+            pad = KV_CAP - seq_len
+            z_k = current_k.new_zeros(B, pad, self.n_head, self.head_dim)
+            z_v = current_v.new_zeros(B, pad, self.n_head, self.head_dim)
+            current_k = torch.cat([z_k, current_k], dim=1)
+            current_v = torch.cat([z_v, current_v], dim=1)
+        else:                                           # rank with longer cache
+            current_k = current_k[:, -KV_CAP:]
+            current_v = current_v[:, -KV_CAP:]
 
         # 5) chunked ring-flash
         # split into 4 KV chunks to save peak memory
@@ -213,41 +221,51 @@ class Expert(nn.Module):
             nn.Linear(hidden_dim, d),
             nn.Dropout(config.DROPOUT),
         )
-    def forward(self, x): return self.net(x)
+
+    def forward(self, x):
+        # ZeRO-3: gather the expert weights just for this call
+        with zero.GatheredParameters(self.net.parameters(), modifier_rank=None):
+            return self.net(x)
+
 
 class NoisyTopkRouter(nn.Module):
-    """Noisy Top-k Router."""
+    """Noisy Top-k Router compatible with ZeRO-3."""
     def __init__(self, d: int, n_exp: int, top_k: int):
         super().__init__()
         self.top_k = top_k
-        self.gate_proj = nn.Linear(d, n_exp, bias=False)
+        self.gate_proj  = nn.Linear(d, n_exp, bias=False)
         self.noise_proj = nn.Linear(d, n_exp, bias=False)
         self.register_buffer("router_step", torch.zeros((), dtype=torch.int64))
-        with torch.no_grad(): self.noise_proj.weight.normal_(0, 0.01)
+        with torch.no_grad():
+            self.noise_proj.weight.normal_(0, 0.01)
 
     def forward(self, hidden_states):
-        logits = self.gate_proj(hidden_states).float()
+        # gather full gate weights
+        with zero.GatheredParameters(self.gate_proj.parameters(), modifier_rank=None):
+            logits = self.gate_proj(hidden_states).float()
 
         if self.training:
-            # seed off the per‑module counter
+            # per-forward RNG seeded by counter
             g = torch.Generator(device=logits.device)
             g.manual_seed(int(self.router_step.item()))
 
-            # draw fresh noise each forward
+            # gather full noise-proj weights
+            with zero.GatheredParameters(self.noise_proj.parameters(), modifier_rank=None):
+                raw_noise = self.noise_proj(hidden_states).float()
+
             noise = torch.empty_like(logits)
             noise.normal_(mean=0.0, std=1.0, generator=g)
-            noise = noise * F.softplus(self.noise_proj(hidden_states).float())
+            noise = noise * F.softplus(raw_noise)
 
-            # bump the counter for next time
             self.router_step += 1
         else:
             noise = torch.zeros_like(logits)
 
         logits = logits + noise
-        gates = F.softmax(logits, dim=-1)
+        gates  = F.softmax(logits, dim=-1)
         vals, inds = torch.topk(gates, self.top_k, dim=-1, sorted=False)
         return vals.type_as(hidden_states), inds, gates.type_as(hidden_states)
-
+        
 class SparseMoE(nn.Module):
     """Sparse MoE layer."""
     def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 2):
@@ -260,65 +278,75 @@ class SparseMoE(nn.Module):
 
     def forward(self, hidden_states):
         """
-        hidden_states: (B, T, d)
-        returns: (B, T, d), aux_loss
+        SparseMoE.forward simplified: no collectives during forward,
+        uses global_tokens = local_tokens * world_size, and local load_frac.
         """
-        B, T, d = hidden_states.shape
+        B, T, d_model = hidden_states.shape
         num_tokens = B * T
-        flat = hidden_states.view(num_tokens, d)
-
-        # 1) Routing
-        top_vals, top_inds, dense_probs = self.router(flat)
-
-        # 2) Compute capacity and mask
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # local num_tokens == B*T on *this* rank
-        capacity = math.ceil(self.cap_factor * num_tokens / self.num_experts)
-
-        mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
-        mask.scatter_(1, top_inds, True)
-
-        # 3) Enforce capacity
-        cumsum = torch.cumsum(mask.long(), dim=0)
-        position = cumsum * mask - 1
-        keep = (position < capacity) & mask
-        kept = torch.where(keep)
-        tok_idx, exp_slot = kept  # exp_slot is which expert slot
-
-        # 4) Gather expert indices & weights
-        exp_idx = exp_slot
-        gate_vals = dense_probs[tok_idx, exp_slot].unsqueeze(1)
-
-        # 5) Dispatch to experts in sorted order for efficiency
-        final = torch.zeros_like(flat)
-        sorted_idx = torch.argsort(exp_idx)
-
-        seg_boundaries = torch.cat([
-            torch.tensor([0], device=flat.device),
-            torch.where(exp_idx[sorted_idx][:-1] != exp_idx[sorted_idx][1:])[0] + 1,
-            torch.tensor([sorted_idx.numel()], device=flat.device),
-        ])
-
-        for i in range(len(seg_boundaries) - 1):
-            s = seg_boundaries[i].item()
-            e = seg_boundaries[i + 1].item()
-            if s >= e:
+        flat = hidden_states.view(num_tokens, d_model)
+    
+        # Router
+        top_k_vals, top_k_ids, router_probs = self.router(flat)
+    
+        # Distributed info
+        world = dist.is_initialized()
+        rank  = dist.get_rank() if world else 0
+        world_sz = dist.get_world_size() if world else 1
+        device = flat.device
+    
+        # Global capacity with a 25% safety margin
+        SAFETY = 1.25
+        num_tok_glb = num_tokens * world_sz
+        capacity = math.ceil(SAFETY * self.cap_factor * num_tok_glb / self.num_experts)
+        capacity = max(1, capacity)
+    
+        if rank == 0:
+            print(f"[MoE Debug] local_tokens={num_tokens}  global_tokens={num_tok_glb}  capacity={capacity}")
+    
+        # Normalize gates
+        sum_g  = top_k_vals.sum(dim=-1, keepdim=True)
+        norm_v = top_k_vals / torch.where(sum_g == 0, torch.ones_like(sum_g), sum_g)
+    
+        # Build dispatch mask & weights
+        mask0 = torch.zeros(num_tokens, self.num_experts, dtype=torch.bool, device=device)
+        w0    = torch.zeros_like(mask0, dtype=flat.dtype)
+        mask0.scatter_(1, top_k_ids, True)
+        w0.scatter_(1, top_k_ids, norm_v)
+    
+        rank_in_q     = torch.cumsum(mask0.long(), dim=0) - 1
+        dispatch_mask = mask0 & (rank_in_q < capacity)
+        dispatch_w    = torch.where(dispatch_mask, w0, torch.zeros_like(w0))
+    
+        routed_frac = dispatch_mask.any(dim=1).float().mean().item()
+        if rank == 0:
+            print(f"[MoE Debug] token_routed_frac={routed_frac:.4f}")
+    
+        # Dispatch to experts
+        out_flat = torch.zeros_like(flat)
+        for e in range(self.num_experts):
+            sel = dispatch_mask[:, e]
+            if not sel.any():
                 continue
-            expert_i = exp_idx[sorted_idx[s]].item()
-            idxs = tok_idx[sorted_idx[s:e]]
-            gv = gate_vals[sorted_idx[s:e]]
-            out = self.experts[expert_i](flat[idxs])
-            final.index_add_(0, idxs, out * gv)
-
-        # 6) Compute auxiliary load‐balancing loss
-        aux_loss = torch.tensor(0.0, device=flat.device)
+            idx   = sel.nonzero(as_tuple=True)[0]
+            gates = dispatch_w[idx, e].unsqueeze(1)
+            out   = self.experts[e](flat[idx]) * gates
+            out_flat.index_add_(0, idx, out)
+    
+        # Auxiliary load-balancing loss using local counts only
+        aux = torch.tensor(0.0, device=device)
         if self.training:
-            frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
-            frac_probs = dense_probs.mean(dim=0)
-            aux_loss = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
-
-        # 7) Reshape back to (B, T, d)
-        return final.view(B, T, d), aux_loss
+            cnt = dispatch_mask.sum(dim=0, dtype=torch.float)  # local only
+            total = cnt.sum().item()
+            load_frac = cnt / total if total else torch.zeros_like(cnt)
+    
+            AUX_W = 0.0025
+            prob = router_probs.mean(dim=0)
+            aux  = (prob * load_frac.to(device)).sum() * AUX_W
+    
+            if rank == 0:
+                print(f"[MoE Debug] load_frac={load_frac.tolist()}  aux={aux.item():.6f}")
+    
+        return out_flat.view(B, T, d_model), aux
 
 
 class Block(nn.Module):
