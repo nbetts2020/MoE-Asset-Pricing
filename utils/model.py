@@ -271,11 +271,9 @@ class SparseMoE(nn.Module):
         top_vals, top_inds, dense_probs = self.router(flat)
 
         # 2) Compute capacity and mask
-        num_tokens_tensor = torch.tensor(num_tokens, device=flat.device)
-        if dist.is_initialized():
-            dist.all_reduce(num_tokens_tensor, op=dist.ReduceOp.SUM)
-        global_tokens = num_tokens_tensor.item()
-        capacity = math.ceil(self.cap_factor * global_tokens / self.num_experts)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # local num_tokens == B*T on *this* rank
+        capacity = math.ceil(self.cap_factor * num_tokens / self.num_experts)
 
         mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
         mask.scatter_(1, top_inds, True)
