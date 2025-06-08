@@ -235,12 +235,11 @@ def main():
         print_debug_info("TRAIN MODE START")
     
         # ── 2.  Build the model with ZeRO.Init so parameters start sharded ──────
-        with zero.Init(config_dict_or_path=args.deepspeed_config):
-            model, initialized_from_scratch = initialize_model(
-                args,
-                device,
-                init_from_scratch=True
-            )
+        if ds_stage == 3:
+            with zero.Init(config_dict_or_path=args.deepspeed_config):
+                model, _ = initialize_model(args, device, init_from_scratch=True)
+        else:                              # ZeRO-2 or 1
+            model, _ = initialize_model(args, device, init_from_scratch=True)
     
         # Optional custom weight init
         if initialized_from_scratch:
