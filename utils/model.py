@@ -165,12 +165,6 @@ class MultiHeadAttention(nn.Module):
         else:
             current_k, current_v = k_rope, v_rope
 
-        # 4) trim to max cache
-        MAX = int(config.BLOCK_SIZE / world_size)
-        if current_k.shape[1] > MAX:
-            current_k = current_k[:, -MAX:, :, :]
-            current_v = current_v[:, -MAX:, :, :]
-
         # 5) chunked ring-flash
         # split into 4 KV chunks to save peak memory
         M = 1
