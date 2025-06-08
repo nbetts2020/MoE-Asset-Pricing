@@ -220,7 +220,7 @@ class NoisyTopkRouter(nn.Module):
         with torch.no_grad(): self.noise_proj.weight.normal_(0, 0.01)
 
     def forward(self, hidden_states):
-        logits = self.gate_proj(hidden_states)
+        logits = self.gate_proj(hidden_states) #.float()
 
         if self.training:
             # seed off the per‑module counter
@@ -229,7 +229,7 @@ class NoisyTopkRouter(nn.Module):
 
             # draw fresh noise each forward
             noise = torch.empty_like(logits)
-            noise.normal_(mean=0.0, std=1.0, generator=g)
+            noise.normal_(mean=0.0, std=3.0, generator=g)
             noise = noise * F.softplus(self.noise_proj(hidden_states))
 
             # bump the counter for next time
@@ -254,75 +254,102 @@ class SparseMoE(nn.Module):
 
     def forward(self, hidden_states):
         """
-        hidden_states: (B, T, d)
-        returns: (B, T, d), aux_loss
+        hidden_states : (B, T, d)
+        returns       : (B, T, d), aux_loss
         """
         B, T, d = hidden_states.shape
         num_tokens = B * T
         flat = hidden_states.view(num_tokens, d)
-    
-        # 1) Routing
-        top_vals, top_inds, dense_probs = self.router(flat)
-    
-        # --- DEBUG #1: router peakedness & entropy ---
-        avg_max = dense_probs.max(dim=-1).values.mean().item()
-        avg_entropy = -(dense_probs * (dense_probs + 1e-9).log()).sum(dim=-1).mean().item()
-        print(f">>> [MoE] avg gate-max={avg_max:.3f}, avg entropy={avg_entropy:.3f}")
-    
-        # 2) Compute capacity and mask
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        # --------------------------------------------------
+        # 1) Gating (Noisy-Top-k)
+        # --------------------------------------------------
+        vals, top_inds, dense_probs = self.router(flat)       # vals/top_inds: (N, top_k)
+
+        # Debug: gate quality
+        avg_pmax = dense_probs.max(dim=-1).values.mean().item()
+        avg_ent  = -(dense_probs * (dense_probs + 1e-9).log()).sum(dim=-1).mean().item()
+        print(f">>> [MoE] avg gate-max={avg_pmax:.3f}, avg entropy={avg_ent:.3f}")
+
+        # --------------------------------------------------
+        # 2) Capacity per expert (tokens to keep)
+        # --------------------------------------------------
         capacity = math.ceil(self.cap_factor * num_tokens / self.num_experts)
-        mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
-        mask.scatter_(1, top_inds, True)
-    
-        # --- DEBUG #2: how many tokens exceed capacity? ---
-        total_routed = mask.sum().item()
-        print(f">>> [MoE] capacity={capacity}, total tokens routed={total_routed}")
-    
-        # 3) Enforce capacity
-        cumsum = torch.cumsum(mask.long(), dim=0)
-        position = cumsum * mask - 1
-        keep = (position < capacity) & mask
-        kept = torch.where(keep)
-        tok_idx, exp_slot = kept  # exp_slot is which expert slot
-    
-        # 4) Gather expert indices & weights
-        exp_idx = exp_slot
-        gate_vals = dense_probs[tok_idx, exp_slot].unsqueeze(1)
-    
-        # 5) Dispatch to experts in sorted order for efficiency
-        final = torch.zeros_like(flat)
-        sorted_idx = torch.argsort(exp_idx)
-        seg_boundaries = torch.cat([
-            torch.tensor([0], device=flat.device),
-            torch.where(exp_idx[sorted_idx][:-1] != exp_idx[sorted_idx][1:])[0] + 1,
-            torch.tensor([sorted_idx.numel()], device=flat.device),
-        ])
-        for i in range(len(seg_boundaries) - 1):
-            s = seg_boundaries[i].item()
-            e = seg_boundaries[i + 1].item()
-            if s >= e:
+
+        # --------------------------------------------------
+        # 3) Keep the top-`capacity` tokens *per expert*
+        # --------------------------------------------------
+        kept_tok   = []        # global token indices
+        exp_idx    = []        # matching expert IDs
+        gate_wgt   = []        # gate weights
+
+        for e in range(self.num_experts):
+            mask_e = (top_inds == e)                 # (N, top_k) → bool
+            if not mask_e.any():
                 continue
-            expert_i = exp_idx[sorted_idx[s]].item()
-            idxs = tok_idx[sorted_idx[s:e]]
-            gv = gate_vals[sorted_idx[s:e]]
-            out = self.experts[expert_i](flat[idxs])
-            final.index_add_(0, idxs, out * gv)
-    
-        # 6) Compute auxiliary load-balancing loss
+
+            tok_i, slot_i = mask_e.nonzero(as_tuple=True)     # positions that chose expert e
+            scores_e = vals[tok_i, slot_i]                    # (M,)
+
+            top_n = min(capacity, scores_e.size(0))
+            if top_n == 0:
+                continue
+
+            best = torch.topk(scores_e, top_n, largest=True).indices
+            kept_tok.append(tok_i[best])
+            exp_idx.append(torch.full((top_n,), e, device=flat.device, dtype=torch.long))
+            gate_wgt.append(scores_e[best].unsqueeze(1))
+
+        if not kept_tok:        # no routing happened (edge-case)
+            return hidden_states, torch.tensor(0.0, device=hidden_states.device)
+
+        kept_tok = torch.cat(kept_tok)          # (R,)
+        exp_idx  = torch.cat(exp_idx)           # (R,)
+        gate_wgt = torch.cat(gate_wgt)          # (R,1)
+
+        # Debug: utilisation
+        print(f">>> [MoE] capacity={capacity}, tokens kept={kept_tok.numel()}")
+
+        # --------------------------------------------------
+        # 4) Dispatch to experts and combine
+        # --------------------------------------------------
+        final = torch.zeros_like(flat)
+        order = torch.argsort(exp_idx)          # process one expert at a time
+        kept_tok = kept_tok[order]
+        exp_idx  = exp_idx[order]
+        gate_wgt = gate_wgt[order]
+
+        # segment boundaries where expert ID changes
+        seg = torch.cat([
+            torch.tensor([0], device=flat.device),
+            torch.where(exp_idx[:-1] != exp_idx[1:])[0] + 1,
+            torch.tensor([exp_idx.size(0)], device=flat.device)
+        ])
+
+        for s, e in zip(seg[:-1], seg[1:]):
+            s, e = s.item(), e.item()
+            ei   = exp_idx[s].item()
+            idxs = kept_tok[s:e]
+            w    = gate_wgt[s:e]
+            out  = self.experts[ei](flat[idxs])          # (tokens, d)
+            final.index_add_(0, idxs, out * w)
+
+        # --------------------------------------------------
+        # 5) Auxiliary load-balancing loss
+        # --------------------------------------------------
         aux_loss = torch.tensor(0.0, device=flat.device)
         if self.training:
             frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
-            frac_probs = dense_probs.mean(dim=0)
-            aux_loss = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
-    
-            # --- DEBUG #3: per-expert load & aux loss ---
+            frac_probs  = dense_probs.mean(dim=0)
+            aux_loss    = (frac_probs * frac_tokens).sum() * self.num_experts * 0.05
+
             snippet = frac_tokens[:4].tolist()
             print(f">>> [MoE] frac_tokens[:4]={snippet}, aux_loss={aux_loss.item():.6f}")
-    
-        # 7) Reshape back to (B, T, d)
-        return final.view(B, T, d), aux_loss
 
+        # --------------------------------------------------
+        # 6) Reshape back to (B, T, d)
+        # --------------------------------------------------
+        return final.view(B, T, d), aux_loss
 
 
 class Block(nn.Module):
@@ -627,14 +654,14 @@ class SparseMoELanguageModel(nn.Module):
         show_progress: bool = True,
     ):
         assert latent_token_id is not None  # Ensure latent_token_id is provided
-    
+
         world      = dist.is_initialized()
         world_size = dist.get_world_size() if world else 1
         rank       = dist.get_rank()      if world else 0
         device     = input_ids.device
         T_glb      = self.block_size
         B          = input_ids.size(0)
-    
+
         # Pad/trim & shard
         ids_full = self._pad_or_trim(input_ids, T_glb)  # (B, T_glb)
         if world_size > 1:
@@ -646,17 +673,17 @@ class SparseMoELanguageModel(nn.Module):
             start_idx_loc = 0
             end_idx_loc   = T_glb
         ids_loc = ids_full[:, start_idx_loc:end_idx_loc]  # (B, T_loc)
-    
+
         pad_id = self.tokenizer.pad_token_id or -1
         eot_id = self.tokenizer.convert_tokens_to_ids("</reasoning>")
         bot_id = latent_token_id
-    
+
         if attention_mask is None:
             full_attention_mask = (ids_full != pad_id)
         else:
             full_attention_mask = self._pad_or_trim(attention_mask.long(), T_glb).bool()
         loc_mask = full_attention_mask[:, start_idx_loc:end_idx_loc].to(device)
-    
+
         # Find spans & compute max_ct_steps_in_batch
         spans_full_global_indices = []
         max_ct_steps_in_batch = 0
@@ -677,7 +704,7 @@ class SparseMoELanguageModel(nn.Module):
             tmp = torch.tensor(max_ct_steps_in_batch, device=device)
             dist.all_reduce(tmp, op=dist.ReduceOp.MAX)
             max_ct_steps_in_batch = int(tmp.item())
-    
+
         # --- MODIFICATION: Cap max_ct_steps_in_batch to prevent OOM ---
         HARD_LIMIT_MAX_CTS = getattr(config, "COCONUT_MAX_ITERATIONS", 50)
         if max_ct_steps_in_batch > HARD_LIMIT_MAX_CTS:
@@ -685,14 +712,14 @@ class SparseMoELanguageModel(nn.Module):
                 print(f"WARNING: Capping max_ct_steps_in_batch from {max_ct_steps_in_batch} to {HARD_LIMIT_MAX_CTS}")
             max_ct_steps_in_batch = HARD_LIMIT_MAX_CTS
         # --- END MODIFICATION ---
-    
+
         # Prepare storage
         current_g_embeddings = self.token_embedding_table(ids_full).detach().clone()  # (B, T_glb, D)
         total_aux_loss = torch.zeros(1, device=device)
         n_layers = len(self.blocks)
         past_ks = [None] * n_layers
         past_vs = [None] * n_layers
-    
+
         # INITIAL FULL PASS TO BUILD CACHE
         x_loc = self.dropout_emb(current_g_embeddings[:, start_idx_loc:end_idx_loc])
         for i, blk in enumerate(self.blocks):
@@ -700,7 +727,7 @@ class SparseMoELanguageModel(nn.Module):
             total_aux_loss += aux
             past_ks[i], past_vs[i] = k, v
             x_loc = out
-    
+
         # Gather full hidden to select initial CT input
         if world:
             shards = [torch.empty_like(x_loc) for _ in range(world_size)]
@@ -708,13 +735,13 @@ class SparseMoELanguageModel(nn.Module):
             h_full_global = torch.cat(shards, dim=1)
         else:
             h_full_global = x_loc
-    
+
         # Pick the first '<reasoning>' hidden as 'cur'
         cur = torch.stack([
             h_full_global[b, spans_full_global_indices[b][0][0], :]
             for b in range(B)
         ], dim=0).unsqueeze(1)  # (B,1,D)
-    
+
         # ITERATIVE CT PASSES WITH KV CACHE
         for ct_iter in range(max_ct_steps_in_batch):
             if show_progress and rank == 0:
@@ -730,7 +757,7 @@ class SparseMoELanguageModel(nn.Module):
                 total_aux_loss += aux
                 past_ks[i], past_vs[i] = k, v
                 x_step = out
-    
+
             # Write the new hidden into current_g_embeddings
             for b_idx in range(B):
                 bot_g_idx, eot_g_idx = spans_full_global_indices[b_idx][0]
@@ -739,10 +766,10 @@ class SparseMoELanguageModel(nn.Module):
                 if tgt_idx < eot_g_idx:
                     current_g_embeddings[b_idx, tgt_idx, :] = x_step[b_idx, 0, :]
             cur = x_step
-    
+
         if show_progress and rank == 0:
             print(f"[Coconut] Final Logits Pass ({max_ct_steps_in_batch+1} total effective passes)")
-    
+
         # FINAL PASS & LOSS (core logic unchanged)
         final_input_embeddings_loc = current_g_embeddings[:, start_idx_loc:end_idx_loc].clone()
         x_loc = self.dropout_emb(final_input_embeddings_loc)
@@ -751,20 +778,20 @@ class SparseMoELanguageModel(nn.Module):
             x_loc, aux, _, _ = blk(x_loc, mask=loc_mask, past_k=None, past_v=None)
             iter_aux_loss += aux
         x_loc = self.ln_f(x_loc)
-    
+
         if world:
             final_shards = [torch.empty_like(x_loc) for _ in range(world_size)]
             dist.all_gather(final_shards, x_loc.contiguous())
             x_full_for_logits = torch.cat(final_shards, dim=1)
         else:
             x_full_for_logits = x_loc
-    
+
         loss_mask_full = torch.zeros_like(ids_full, dtype=torch.bool)
         for b_idx in range(B):
             bot_g_idx, eot_g_idx = spans_full_global_indices[b_idx][0]
             if eot_g_idx > bot_g_idx + 1:
                 loss_mask_full[b_idx, bot_g_idx+1:eot_g_idx] = True
-    
+
         lm_w = self.lm_head.weight
         with GatheredParameters([lm_w], enabled=hasattr(lm_w, "ds_numel")):
             w_for_ce = lm_w.clone() if hasattr(lm_w, "ds_numel") else lm_w
@@ -778,7 +805,7 @@ class SparseMoELanguageModel(nn.Module):
                 reduction="sum",
                 shift=True,
             )
-    
+
         n_valid = (targets_for_loss[:, 1:] != pad_id).sum()
         if world:
             with torch.no_grad():
@@ -786,12 +813,12 @@ class SparseMoELanguageModel(nn.Module):
                 dist.all_reduce(n_valid)
         mean_ce_loss = raw_ce / n_valid.clamp(min=1)
         final_loss = mean_ce_loss + (total_aux_loss + iter_aux_loss if self.training else 0.0)
-    
+
         if rank == 0 and show_progress:
             print(f"[Coconut] Final Loss: {final_loss.item():.4f} (CE: {mean_ce_loss.item():.4f}, Aux: {(total_aux_loss+iter_aux_loss).item():.4f})")
-    
+
         return final_loss
-        
+
     def get_embeddings(self, input_ids: torch.Tensor, pool: bool = True):
         """
         Memory-efficient distributed pooling of final hidden states.
