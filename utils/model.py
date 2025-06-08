@@ -220,7 +220,7 @@ class NoisyTopkRouter(nn.Module):
         with torch.no_grad(): self.noise_proj.weight.normal_(0, 0.01)
 
     def forward(self, hidden_states):
-        logits = self.gate_proj(hidden_states).float()
+        logits = self.gate_proj(hidden_states)
 
         if self.training:
             # seed off the per‑module counter
@@ -230,7 +230,7 @@ class NoisyTopkRouter(nn.Module):
             # draw fresh noise each forward
             noise = torch.empty_like(logits)
             noise.normal_(mean=0.0, std=1.0, generator=g)
-            noise = noise * F.softplus(self.noise_proj(hidden_states).float())
+            noise = noise * F.softplus(self.noise_proj(hidden_states))
 
             # bump the counter for next time
             self.router_step += 1
@@ -260,39 +260,44 @@ class SparseMoE(nn.Module):
         B, T, d = hidden_states.shape
         num_tokens = B * T
         flat = hidden_states.view(num_tokens, d)
-
+    
         # 1) Routing
         top_vals, top_inds, dense_probs = self.router(flat)
-
+    
+        # --- DEBUG #1: router peakedness & entropy ---
+        avg_max = dense_probs.max(dim=-1).values.mean().item()
+        avg_entropy = -(dense_probs * (dense_probs + 1e-9).log()).sum(dim=-1).mean().item()
+        print(f">>> [MoE] avg gate-max={avg_max:.3f}, avg entropy={avg_entropy:.3f}")
+    
         # 2) Compute capacity and mask
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # local num_tokens == B*T on *this* rank
         capacity = math.ceil(self.cap_factor * num_tokens / self.num_experts)
-
         mask = torch.zeros(num_tokens, self.num_experts, device=flat.device, dtype=torch.bool)
         mask.scatter_(1, top_inds, True)
-
+    
+        # --- DEBUG #2: how many tokens exceed capacity? ---
+        total_routed = mask.sum().item()
+        print(f">>> [MoE] capacity={capacity}, total tokens routed={total_routed}")
+    
         # 3) Enforce capacity
         cumsum = torch.cumsum(mask.long(), dim=0)
         position = cumsum * mask - 1
         keep = (position < capacity) & mask
         kept = torch.where(keep)
         tok_idx, exp_slot = kept  # exp_slot is which expert slot
-
+    
         # 4) Gather expert indices & weights
         exp_idx = exp_slot
         gate_vals = dense_probs[tok_idx, exp_slot].unsqueeze(1)
-
+    
         # 5) Dispatch to experts in sorted order for efficiency
         final = torch.zeros_like(flat)
         sorted_idx = torch.argsort(exp_idx)
-
         seg_boundaries = torch.cat([
             torch.tensor([0], device=flat.device),
             torch.where(exp_idx[sorted_idx][:-1] != exp_idx[sorted_idx][1:])[0] + 1,
             torch.tensor([sorted_idx.numel()], device=flat.device),
         ])
-
         for i in range(len(seg_boundaries) - 1):
             s = seg_boundaries[i].item()
             e = seg_boundaries[i + 1].item()
@@ -303,16 +308,21 @@ class SparseMoE(nn.Module):
             gv = gate_vals[sorted_idx[s:e]]
             out = self.experts[expert_i](flat[idxs])
             final.index_add_(0, idxs, out * gv)
-
-        # 6) Compute auxiliary load‐balancing loss
+    
+        # 6) Compute auxiliary load-balancing loss
         aux_loss = torch.tensor(0.0, device=flat.device)
         if self.training:
             frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
             frac_probs = dense_probs.mean(dim=0)
             aux_loss = (frac_probs * frac_tokens).sum() * self.num_experts * 0.01
-
+    
+            # --- DEBUG #3: per-expert load & aux loss ---
+            snippet = frac_tokens[:4].tolist()
+            print(f">>> [MoE] frac_tokens[:4]={snippet}, aux_loss={aux_loss.item():.6f}")
+    
         # 7) Reshape back to (B, T, d)
         return final.view(B, T, d), aux_loss
+
 
 
 class Block(nn.Module):
