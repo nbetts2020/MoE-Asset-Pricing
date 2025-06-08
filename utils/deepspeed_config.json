@@ -16,7 +16,11 @@
     "reduce_bucket_size": 5e8,
     "stage3_prefetch_bucket_size": 5e8,
     "stage3_param_persistence_threshold": 1e6,
-    "stage3_gather_16bit_weights_on_model_save": true
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "moe_params": {
+      "stage": 2,
+      "cpu_offload": true
+    }
   },
   "activation_checkpointing": {
     "partition_activations": true,
