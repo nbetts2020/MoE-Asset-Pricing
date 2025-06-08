@@ -248,16 +248,25 @@ def main():
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
     
         # ── 3.  Optimizer & DeepSpeed engine ────────────────────────────────────
+        from deepspeed.moe.utils import (
+            split_params_into_different_moe_groups_for_optimizer as split_moe
+        )
+        
         optimizers = prepare_optimizer(model, args)
-        logging.info(f"LOCAL_RANK (train): {local_rank}")
-        logging.info(f"Available GPUs (train): {torch.cuda.device_count()}")
-    
+        
+        # put every param in one base group, then let DeepSpeed split out
+        #  – router weights
+        #  – expert (MoE) weights
+        base = {'params': model.parameters(), 'name': 'all'}
+        param_groups = split_moe(base)
+        
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizers["main"],
-            model_parameters=model.parameters(),
+            model_parameters=param_groups,      # ← use the split groups
             config=args.deepspeed_config
         )
+
         print_debug_info("AFTER DEEPSPEED INIT")
     
         # ── 4.  Data ────────────────────────────────────────────────────────────
