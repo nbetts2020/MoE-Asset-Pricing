@@ -143,7 +143,7 @@ class MultiHeadAttention(nn.Module):
     ):
         B, T_new, C = x.shape
         device = x.device
-    
+
         # ------------------------------------------------------------------
         # 0) Global-position offset for sequence-parallel training
         # ------------------------------------------------------------------
@@ -155,32 +155,32 @@ class MultiHeadAttention(nn.Module):
             seq_offset = rank * T_local
         else:
             seq_offset = 0
-    
+
         # 1) project + split
         qkv   = self.qkv(x)
         q_new, k_new, v_new = qkv.view(B, T_new, self.n_head, 3 * self.head_dim)\
                                 .split(self.head_dim, dim=-1)
-    
+
         # 2) RoPE (use global positions)
         start      = past_k.shape[1] if past_k is not None else 0
         total_len  = seq_offset + start + T_new
         self.update_rope(total_len)
-    
+
         sin = self.rope_sin[seq_offset + start : seq_offset + start + T_new]\
                 .to(device=device, dtype=x.dtype)
         cos = self.rope_cos[seq_offset + start : seq_offset + start + T_new]\
                 .to(device=device, dtype=x.dtype)
-    
+
         q_rope, k_rope = apply_rope(q_new, k_new, sin, cos)
         v_rope = v_new
-    
+
         # 3) KV cache
         if past_k is not None:
             current_k = torch.cat([past_k, k_rope], dim=1)
             current_v = torch.cat([past_v, v_rope], dim=1)
         else:
             current_k, current_v = k_rope, v_rope
-    
+
         # 4) USP attention (chunk, if desired, to save memory)
         M = 1  # number of KV chunks
         attn_accum = torch.zeros_like(q_rope)
@@ -197,12 +197,12 @@ class MultiHeadAttention(nn.Module):
                 return_attn_probs  = False,
             )
             attn_accum += out                           # (B, T_new, n_head, head_dim)
-    
+
         attn_ctx = attn_accum.reshape(B, T_new, C)
-    
+
         # 5) final projection
         y = self.proj(attn_ctx)
-    
+
         if return_attn_probs:
             raise NotImplementedError("return_attn_probs not supported with chunking")
         return y, current_k, current_v
@@ -258,7 +258,7 @@ class NoisyTopkRouter(nn.Module):
 
 class SparseMoE(nn.Module):
     """Sparse MoE layer."""
-    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 2):
+    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1):
         super().__init__()
         self.router = NoisyTopkRouter(d, n_exp, top_k)
         self.experts = nn.ModuleList([Expert(d) for _ in range(n_exp)])
@@ -528,7 +528,7 @@ class SparseMoELanguageModel(nn.Module):
             padding = torch.full(
                 (B, target_length - T), pad_id, dtype=ids.dtype, device=ids.device
             )
-            return torch.cat([padding, ids], dim=1)
+            return torch.cat([ids, padding], dim=1)
 
     def forward(self, input_ids, attention_mask=None, labels=None, reduction="mean"):
         """Main forward pass; uses efficient next-token loss if labels provided."""
@@ -593,7 +593,7 @@ class SparseMoELanguageModel(nn.Module):
         lm_w   = self.lm_head.weight
         if hasattr(lm_w, "ds_numel"):                   # ZeRO-3 sharded weight
             with GatheredParameters([lm_w], enabled=True):
-                w = lm_w.clone()
+                w = lm_w #.clone()
         else:
             w = lm_w
 
