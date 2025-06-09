@@ -234,7 +234,7 @@ class NoisyTopkRouter(nn.Module):
         with torch.no_grad(): self.noise_proj.weight.normal_(0, 0.01)
 
     def forward(self, hidden_states):
-        logits = self.gate_proj(hidden_states) #.float()
+        logits = self.gate_proj(hidden_states).float()
 
         if self.training:
             # seed off the per‑module counter
@@ -257,114 +257,147 @@ class NoisyTopkRouter(nn.Module):
         return vals.type_as(hidden_states), inds, gates.type_as(hidden_states)
 
 class SparseMoE(nn.Module):
-    """Sparse MoE layer."""
-    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1):
+    """Multi-GPU expert-parallel Sparse-MoE (bf16-friendly)."""
+
+    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1.0):
         super().__init__()
-        self.router = NoisyTopkRouter(d, n_exp, top_k)
-        self.experts = nn.ModuleList([Expert(d) for _ in range(n_exp)])
-        self.top_k = top_k
-        self.cap_factor = cap_factor
+        self.top_k       = top_k
+        self.cap_factor  = cap_factor
         self.num_experts = n_exp
 
+        # Router (computes soft-max in fp32 internally)
+        self.router = NoisyTopkRouter(d, n_exp, top_k)
+
+        # ---------- distributed setup ----------
+        if dist.is_initialized():
+            self.world_size = dist.get_world_size()
+            self.rank       = dist.get_rank()
+            self.ep_group   = dist.new_group(list(range(self.world_size)))
+        else:
+            self.world_size = 1
+            self.rank       = 0
+            self.ep_group   = None
+
+        if n_exp % self.world_size != 0:
+            raise ValueError(
+                f"num_experts ({n_exp}) must be divisible by world_size ({self.world_size})"
+            )
+
+        self.exp_per_gpu     = n_exp // self.world_size
+        self.first_global_id = self.rank * self.exp_per_gpu
+        self.experts         = nn.ModuleList([Expert(d) for _ in range(self.exp_per_gpu)])
+
+    # ----------------------------------------------------------------------
     def forward(self, hidden_states):
-        """
-        hidden_states : (B, T, d)
-        returns       : (B, T, d), aux_loss
-        """
         B, T, d = hidden_states.shape
-        num_tokens = B * T
-        flat = hidden_states.view(num_tokens, d)
+        device  = hidden_states.device
+        N       = B * T
+        flat    = hidden_states.view(N, d)
 
-        # --------------------------------------------------
-        # 1) Gating (Noisy-Top-k)
-        # --------------------------------------------------
-        vals, top_inds, dense_probs = self.router(flat)       # vals/top_inds: (N, top_k)
+        # -- 1) routing (keep outputs in fp32) ------------------------------
+        vals_fp32, top_inds, dense_fp32 = self.router(flat)      # (N, k)
 
-        # Debug: gate quality
-        avg_pmax = dense_probs.max(dim=-1).values.mean().item()
-        avg_ent  = -(dense_probs * (dense_probs + 1e-9).log()).sum(dim=-1).mean().item()
-        print(f">>> [MoE] avg gate-max={avg_pmax:.3f}, avg entropy={avg_ent:.3f}")
+        # -- 2) capacity ----------------------------------------------------
+        capacity = math.ceil(self.cap_factor * N / self.num_experts)
 
-        # --------------------------------------------------
-        # 2) Capacity per expert (tokens to keep)
-        # --------------------------------------------------
-        capacity = math.ceil(self.cap_factor * num_tokens / self.num_experts)
-
-        # --------------------------------------------------
-        # 3) Keep the top-`capacity` tokens *per expert*
-        # --------------------------------------------------
-        kept_tok   = []        # global token indices
-        exp_idx    = []        # matching expert IDs
-        gate_wgt   = []        # gate weights
-
+        # -- 3) token selection ---------------------------------------------
+        kept_tok, exp_idx, gw_list = [], [], []
         for e in range(self.num_experts):
-            mask_e = (top_inds == e)                 # (N, top_k) → bool
-            if not mask_e.any():
+            mask = (top_inds == e)
+            if not mask.any():
                 continue
-
-            tok_i, slot_i = mask_e.nonzero(as_tuple=True)     # positions that chose expert e
-            scores_e = vals[tok_i, slot_i]                    # (M,)
-
-            top_n = min(capacity, scores_e.size(0))
+            tok_i, slot_i = mask.nonzero(as_tuple=True)
+            scores = vals_fp32[tok_i, slot_i]                    # fp32
+            top_n  = min(capacity, scores.size(0))
             if top_n == 0:
                 continue
-
-            best = torch.topk(scores_e, top_n, largest=True).indices
+            best = torch.topk(scores, top_n, largest=True).indices
             kept_tok.append(tok_i[best])
-            exp_idx.append(torch.full((top_n,), e, device=flat.device, dtype=torch.long))
-            gate_wgt.append(scores_e[best].unsqueeze(1))
+            exp_idx.append(torch.full((top_n,), e, device=device, dtype=torch.long))
+            gw_list.append(scores[best].unsqueeze(1))           # keep fp32
 
-        if not kept_tok:        # no routing happened (edge-case)
-            return hidden_states, torch.tensor(0.0, device=hidden_states.device)
+        if not kept_tok:                                        # edge-case
+            return hidden_states, torch.tensor(0.0, device=device)
 
-        kept_tok = torch.cat(kept_tok)          # (R,)
-        exp_idx  = torch.cat(exp_idx)           # (R,)
-        gate_wgt = torch.cat(gate_wgt)          # (R,1)
+        kept_tok = torch.cat(kept_tok)                          # (R,)
+        exp_idx  = torch.cat(exp_idx)                           # (R,)
+        gate_wgt = torch.cat(gw_list).to(flat.dtype)            # (R,1)  → bf16
 
-        # Debug: utilisation
-        print(f">>> [MoE] capacity={capacity}, tokens kept={kept_tok.numel()}")
+        # ---------------- single-GPU fallback -----------------------------
+        if self.world_size == 1:
+            final = torch.zeros_like(flat)
+            order = torch.argsort(exp_idx)
+            kt, ei, gw = kept_tok[order], exp_idx[order], gate_wgt[order]
+            seg = torch.cat([
+                torch.tensor([0], device=device),
+                torch.where(ei[:-1] != ei[1:])[0] + 1,
+                torch.tensor([ei.size(0)], device=device)
+            ])
+            for s, e in zip(seg[:-1], seg[1:]):
+                gid  = ei[s].item()
+                lid  = gid - self.first_global_id
+                idxs = kt[s:e]
+                out  = self.experts[lid](flat[idxs])
+                final.index_add_(0, idxs, out * gw[s:e])
+            aux = self._aux_loss(exp_idx, dense_fp32, N) if self.training else torch.tensor(0.0, device=device)
+            return final.view(B, T, d), aux
 
-        # --------------------------------------------------
-        # 4) Dispatch to experts and combine
-        # --------------------------------------------------
+        # ---------------- multi-GPU path -----------------------------------
+        target_rank = exp_idx // self.exp_per_gpu
+        local_id    = exp_idx %  self.exp_per_gpu
+
+        order = torch.argsort(target_rank)
+        kt, tr, lid, gw = kept_tok[order], target_rank[order], local_id[order], gate_wgt[order]
+        send_embed      = flat[kt]
+
+        send_counts = torch.bincount(tr, minlength=self.world_size).to(device)
+
+        # exchange counts
+        gathered = [torch.zeros_like(send_counts) for _ in range(self.world_size)]
+        dist.all_gather(gathered, send_counts, group=self.ep_group)
+        counts_mat  = torch.stack(gathered, dim=0)
+        recv_counts = counts_mat[:, self.rank]
+        assert torch.equal(counts_mat, counts_mat.t()), "send/recv mismatch"
+
+        # ----- embeddings -----
+        total_recv = int(recv_counts.sum().item())
+        recv_embed = torch.empty((total_recv, d), device=device, dtype=flat.dtype)
+        dist.all_to_all_single(recv_embed, send_embed,
+                               recv_counts.tolist(), send_counts.tolist(),
+                               self.ep_group)
+
+        # ----- local_id -----
+        send_lid = lid
+        recv_lid = torch.empty((total_recv,), device=device, dtype=lid.dtype)
+        dist.all_to_all_single(recv_lid, send_lid,
+                               recv_counts.tolist(), send_counts.tolist(),
+                               self.ep_group)
+
+        # ----- expert MLPs -----
+        out_local = torch.empty_like(recv_embed)
+        for l in range(self.exp_per_gpu):
+            mask = (recv_lid == l)
+            if mask.any():
+                out_local[mask] = self.experts[l](recv_embed[mask])
+
+        # ----- send outputs back -----
+        final_buffer = torch.empty_like(send_embed)  # same size as send
+        dist.all_to_all_single(final_buffer, out_local,
+                               send_counts.tolist(), recv_counts.tolist(),
+                               self.ep_group)
+
+        # ----- combine -----
         final = torch.zeros_like(flat)
-        order = torch.argsort(exp_idx)          # process one expert at a time
-        kept_tok = kept_tok[order]
-        exp_idx  = exp_idx[order]
-        gate_wgt = gate_wgt[order]
+        final.index_add_(0, kt, final_buffer * gw)
 
-        # segment boundaries where expert ID changes
-        seg = torch.cat([
-            torch.tensor([0], device=flat.device),
-            torch.where(exp_idx[:-1] != exp_idx[1:])[0] + 1,
-            torch.tensor([exp_idx.size(0)], device=flat.device)
-        ])
+        aux = self._aux_loss(exp_idx, dense_fp32, N) if self.training else torch.tensor(0.0, device=device)
+        return final.view(B, T, d), aux
 
-        for s, e in zip(seg[:-1], seg[1:]):
-            s, e = s.item(), e.item()
-            ei   = exp_idx[s].item()
-            idxs = kept_tok[s:e]
-            w    = gate_wgt[s:e]
-            out  = self.experts[ei](flat[idxs])          # (tokens, d)
-            final.index_add_(0, idxs, out * w)
-
-        # --------------------------------------------------
-        # 5) Auxiliary load-balancing loss
-        # --------------------------------------------------
-        aux_loss = torch.tensor(0.0, device=flat.device)
-        if self.training:
-            frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
-            frac_probs  = dense_probs.mean(dim=0)
-            aux_loss    = (frac_probs * frac_tokens).sum() * self.num_experts * 0.03
-
-            snippet = frac_tokens[:4].tolist()
-            print(f">>> [MoE] frac_tokens[:4]={snippet}, aux_loss={aux_loss.item():.6f}")
-
-        # --------------------------------------------------
-        # 6) Reshape back to (B, T, d)
-        # --------------------------------------------------
-        return final.view(B, T, d), aux_loss
-
+    # ------------------------------------------------------------------
+    def _aux_loss(self, exp_idx, dense_probs_fp32, N_tokens):
+        frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(N_tokens, 1)
+        frac_probs  = dense_probs_fp32.mean(dim=0)
+        return (frac_probs * frac_tokens).sum() * self.num_experts * 0.03
 
 class Block(nn.Module):
     """Transformer block using USP Attention and SparseMoE FFN, with KV-cache support."""
