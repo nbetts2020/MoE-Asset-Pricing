@@ -212,7 +212,7 @@ def main():
         raise ValueError("--percent_data must be between 0 and 100.")
 
     tokenizer = LlamaTokenizerFast.from_pretrained(
-    args.tokenizer_name, 
+    args.tokenizer_name,
     model_max_length=config.CONTEXT_WINDOW
     )
     special_tokens = {
@@ -236,41 +236,41 @@ def main():
 
         with open(args.deepspeed_config) as f:
             ds_stage = json.load(f)["zero_optimization"]["stage"]
-    
+
         # ── 2.  Build the model with ZeRO.Init so parameters start sharded ──────
         if ds_stage == 3:
             with zero.Init(config_dict_or_path=args.deepspeed_config):
                 model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
         else:                              # ZeRO-2 or 1
             model, initialized_from_scratch = initialize_model(args, device, init_from_scratch=True)
-    
+
         # Optional custom weight init
         if initialized_from_scratch:
-            model.apply(kaiming_init_weights)
+            #model.apply(kaiming_init_weights)
             logging.info("Initialized model from scratch and applied Kaiming initialization.")
-    
+
         # ── 3.  Optimizer & DeepSpeed engine ────────────────────────────────────
         from deepspeed.moe.utils import (
             split_params_into_different_moe_groups_for_optimizer as split_moe
         )
-        
+
         optimizers = prepare_optimizer(model, args)
-        
+
         # put every param in one base group, then let DeepSpeed split out
         #  – router weights
         #  – expert (MoE) weights
         base = {'params': model.parameters(), 'name': 'all'}
         param_groups = split_moe(base)
-        
+
         engine, engine_optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizers["main"],
-            model_parameters=param_groups,      # ← use the split groups
+            model_parameters=model.parameters(), #param_groups,      # ← use the split groups
             config=args.deepspeed_config
         )
 
         print_debug_info("AFTER DEEPSPEED INIT")
-    
+
         # ── 4.  Data ────────────────────────────────────────────────────────────
         train_loader = prepare_dataloader(
             epoch=1,
@@ -282,7 +282,7 @@ def main():
             global_max=1e12,
             args=args
         )
-    
+
         # ── 5.  Train ───────────────────────────────────────────────────────────
         train_model(
             model=engine,
@@ -305,10 +305,10 @@ def main():
         is_multi = mp_size > 1
         ckpt_file = "consolidated_final.pth" if is_multi else "model_full.pth"
         ckpt_path = os.path.join(args.save_dir, ckpt_file)
-        
+
         if not args.test and is_multi and not all([args.stock, args.date, args.text, args.bucket]):
             raise ValueError("For non-test multi-GPU run, provide --stock, --date, --text, and --bucket.")
-        
+
         # Download whichever checkpoint we need
         if current_rank == 0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
@@ -320,12 +320,12 @@ def main():
         if not os.path.exists(ckpt_path):
             logging.error(f"Checkpoint missing at {ckpt_path}")
             raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
-        
+
         # Load model weights
         model, _ = initialize_model(args, device, init_from_scratch=False)
         state_dict = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(state_dict)
-        
+
         if is_multi:
             model = deepspeed.init_inference(
                 model,
@@ -336,7 +336,7 @@ def main():
             )
         else:
             model.to(device)
-        
+
         model.eval()
         logging.info(f"Rank {current_rank}: Model loaded from {ckpt_path} (mp_size={mp_size})")
 
