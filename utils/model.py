@@ -229,7 +229,7 @@ class NoisyTopkRouter(nn.Module):
 
             # draw fresh noise each forward
             noise = torch.empty_like(logits)
-            noise.normal_(mean=0.0, std=3.0, generator=g)
+            noise.normal_(mean=0.0, std=1.0, generator=g)
             noise = noise * F.softplus(self.noise_proj(hidden_states))
 
             # bump the counter for next time
@@ -341,7 +341,7 @@ class SparseMoE(nn.Module):
         if self.training:
             frac_tokens = torch.bincount(exp_idx, minlength=self.num_experts).float() / max(num_tokens, 1)
             frac_probs  = dense_probs.mean(dim=0)
-            aux_loss    = (frac_probs * frac_tokens).sum() * self.num_experts * 0.05
+            aux_loss    = (frac_probs * frac_tokens).sum() * self.num_experts * 0.03
 
             snippet = frac_tokens[:4].tolist()
             print(f">>> [MoE] frac_tokens[:4]={snippet}, aux_loss={aux_loss.item():.6f}")
