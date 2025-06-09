@@ -139,56 +139,70 @@ class MultiHeadAttention(nn.Module):
         mask: torch.Tensor = None,
         past_k: torch.Tensor = None,
         past_v: torch.Tensor = None,
-        return_attn_probs: bool = False
+        return_attn_probs: bool = False,
     ):
         B, T_new, C = x.shape
         device = x.device
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-
+    
+        # ------------------------------------------------------------------
+        # 0) Global-position offset for sequence-parallel training
+        # ------------------------------------------------------------------
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank       = dist.get_rank()
+            # assumes global context length (self.max_seq) is divisible by world_size
+            T_local    = self.max_seq // world_size
+            seq_offset = rank * T_local
+        else:
+            seq_offset = 0
+    
         # 1) project + split
-        qkv = self.qkv(x)
-        q_new, k_new, v_new = qkv.view(B, T_new, self.n_head, 3 * self.head_dim).split(self.head_dim, dim=-1)
-
-        # 2) RoPE
-        start = past_k.shape[1] if past_k is not None else 0
-        total_len = start + T_new
+        qkv   = self.qkv(x)
+        q_new, k_new, v_new = qkv.view(B, T_new, self.n_head, 3 * self.head_dim)\
+                                .split(self.head_dim, dim=-1)
+    
+        # 2) RoPE (use global positions)
+        start      = past_k.shape[1] if past_k is not None else 0
+        total_len  = seq_offset + start + T_new
         self.update_rope(total_len)
-        sin = self.rope_sin[start:start+T_new].to(device=device, dtype=x.dtype)
-        cos = self.rope_cos[start:start+T_new].to(device=device, dtype=x.dtype)
+    
+        sin = self.rope_sin[seq_offset + start : seq_offset + start + T_new]\
+                .to(device=device, dtype=x.dtype)
+        cos = self.rope_cos[seq_offset + start : seq_offset + start + T_new]\
+                .to(device=device, dtype=x.dtype)
+    
         q_rope, k_rope = apply_rope(q_new, k_new, sin, cos)
         v_rope = v_new
-
+    
         # 3) KV cache
         if past_k is not None:
             current_k = torch.cat([past_k, k_rope], dim=1)
             current_v = torch.cat([past_v, v_rope], dim=1)
         else:
             current_k, current_v = k_rope, v_rope
-
-        # 5) chunked ring-flash
-        # split into 4 KV chunks to save peak memory
-        M = 1
+    
+        # 4) USP attention (chunk, if desired, to save memory)
+        M = 1  # number of KV chunks
         attn_accum = torch.zeros_like(q_rope)
         for k_chunk, v_chunk in zip(current_k.chunk(M, dim=1), current_v.chunk(M, dim=1)):
             out = self.usp_attn(
                 q_rope, k_chunk, v_chunk,
                 dropout_p = config.DROPOUT if self.training else 0.0,
-                softmax_scale=None,
-                causal=True,
-                window_size=(-1, -1),
-                softcap=0.0,
-                alibi_slopes=None,
-                deterministic=True,
-                return_attn_probs=False
+                softmax_scale = None,
+                causal       = True,
+                window_size  = (-1, -1),
+                softcap      = 0.0,
+                alibi_slopes = None,
+                deterministic      = True,
+                return_attn_probs  = False,
             )
-            # out is (B, T_new, n_head, head_dim)
-            attn_accum += out
-
+            attn_accum += out                           # (B, T_new, n_head, head_dim)
+    
         attn_ctx = attn_accum.reshape(B, T_new, C)
-
-        # 6) final projection
+    
+        # 5) final projection
         y = self.proj(attn_ctx)
-
+    
         if return_attn_probs:
             raise NotImplementedError("return_attn_probs not supported with chunking")
         return y, current_k, current_v
