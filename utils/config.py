@@ -11,7 +11,7 @@ class Config:
     CONTEXT_WINDOW = 16384
     DROPOUT = 0.0        # Dropout rate
     NUM_EXPERTS = 4      # Number of experts in the MoE layer
-    TOP_K = 2            # Number of experts to use per token
+    TOP_K = 1            # Number of experts to use per token
     LEARNING_RATE = 3e-4
     EPOCHS = 1
     BATCH_SIZE = 16       # Effective batch size is 32 with 2 grad accumulation steps
