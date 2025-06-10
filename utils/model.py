@@ -1,6 +1,6 @@
 # utils/model.py
 # =============================================================================
-#  Sequence-Parallel Unified‑SP (YunChang) Attention + Sparse‑MoE LM
+#  Sequence-Parallel Unified-SP (YunChang) Attention + Sparse-MoE LM
 # =============================================================================
 import sys
 sys.path.insert(0, "/home/ubuntu/MoE-Asset-Pricing/flash-attention")
@@ -14,26 +14,30 @@ import yunchang.hybrid.attn_layer as _yc_attn
 _SeqApply_orig = _yc_attn.SeqAllToAll4D.apply
 def _SeqApply_shim(*args, **kwargs):
     # Forward all args and kwargs to the real apply
-    return _SeqApply_orig(*args, **kwargs) # CORRECTED: Pass **kwargs
+    return _SeqApply_orig(*args, **kwargs)
 _yc_attn.SeqAllToAll4D.apply = _SeqApply_shim
 
 import flash_attn.flash_attn_interface as _fai
 import flash_attn                       as _fa
 
+# ─────────── OVERRIDE VARLEN TO USE PACKED ───────────
+# Force both the varlen and packed entrypoints to the same (packed) kernel
+_fai.flash_attn_varlen_qkvpacked_func = _fai.flash_attn_qkvpacked_func
+_fai.flash_attn_varlen_func           = _fai.flash_attn_qkvpacked_func
+_fa.flash_attn_varlen_func            = _fai.flash_attn_qkvpacked_func
+
+# Override torch.ops for CUDA kernels too:
+_fai._flash_attn_varlen_forward  = _fai._flash_attn_forward
+_fai._flash_attn_varlen_backward = _fai._flash_attn_backward
+torch.ops.flash_attn._flash_attn_varlen_forward  = _fai._flash_attn_forward
+torch.ops.flash_attn._flash_attn_varlen_backward = _fai._flash_attn_backward
+# ──────────────────────────────────────────────────────
+
+# Now the default (packed) implementations remain unchanged:
 _fai.flash_attn_func        = _fai.flash_attn_qkvpacked_func
-_fa .flash_attn_func        = _fai.flash_attn_qkvpacked_func
-_fai.flash_attn_varlen_func = _fai.flash_attn_varlen_qkvpacked_func
-_fa .flash_attn_varlen_func = _fai.flash_attn_varlen_qkvpacked_func
-
-_fai._flash_attn_forward         = _fai._flash_attn_forward
-_fai._flash_attn_backward        = _fai._flash_attn_backward
-_fai._flash_attn_varlen_forward  = _fai._flash_attn_varlen_forward
-_fai._flash_attn_varlen_backward = _fai._flash_attn_varlen_backward
-
-torch.ops.flash_attn._flash_attn_forward         = _fai._flash_attn_forward
-torch.ops.flash_attn._flash_attn_backward        = _fai._flash_attn_backward
-torch.ops.flash_attn._flash_attn_varlen_forward  = _fai._flash_attn_varlen_forward
-torch.ops.flash_attn._flash_attn_varlen_backward = _fai._flash_attn_varlen_backward
+_fa.flash_attn_func         = _fai.flash_attn_qkvpacked_func
+_fai._flash_attn_forward    = _fai._flash_attn_forward
+_fai._flash_attn_backward   = _fai._flash_attn_backward
 
 import math, logging
 from typing import Tuple, Optional
@@ -42,7 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-# project‑local imports … ------------------------------------------------------
+# project-local imports … ------------------------------------------------------
 from utils.config import config
 from utils.ebm    import EnergyBasedModel
 from utils.data   import GLOBAL_TOKENIZER
@@ -95,6 +99,22 @@ def apply_rope(
     k_rotated = torch.cat([k1 * cos_k - k2 * sin_k, k1 * sin_k + k2 * cos_k], dim=-1)
 
     return q_rotated, k_rotated
+
+class SafeLayerNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5, clip=6.5e4):  # 65504 is bf16 max
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias   = nn.Parameter(torch.zeros(dim))
+        self.eps    = eps
+        self.clip   = clip
+
+    def forward(self, x):
+        x32 = x.float()
+        mu  = x32.mean(-1, keepdim=True)
+        var = x32.var( -1, keepdim=True, unbiased=False)
+        y32 = (x32 - mu) * torch.rsqrt(var + self.eps)
+        y32 = torch.clamp(y32, -self.clip, self.clip)   # prevent ±inf on cast
+        return y32.to(x.dtype) * self.weight + self.bias
 
 # -----------------------------------------------------------------------------#
 #  Multi-Head Attention (Using YunChang USP)
@@ -234,27 +254,31 @@ class NoisyTopkRouter(nn.Module):
         with torch.no_grad(): self.noise_proj.weight.normal_(0, 0.01)
 
     def forward(self, hidden_states):
-        logits = self.gate_proj(hidden_states).float()
-
+        # logits in bf16
+        logits = self.gate_proj(hidden_states)
+    
         if self.training:
-            # seed off the per‑module counter
-            g = torch.Generator(device=logits.device)
-            g.manual_seed(int(self.router_step.item()))
-
-            # draw fresh noise each forward
-            noise = torch.empty_like(logits)
-            noise.normal_(mean=0.0, std=1.0, generator=g)
-            noise = noise * F.softplus(self.noise_proj(hidden_states))
-
-            # bump the counter for next time
+            # only draw true random noise every top_k calls to avoid runaway seeding
+            if (self.router_step.item() % self.top_k) == 0:
+                g = torch.Generator(device=logits.device).manual_seed(0)
+                noise = torch.randn(
+                    *logits.shape,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                    generator=g
+                )
+            else:
+                noise = torch.zeros_like(logits)
+    
+            scale  = F.softplus(self.noise_proj(hidden_states))   # bf16 scale
+            logits = logits + noise * scale
             self.router_step += 1
-        else:
-            noise = torch.zeros_like(logits)
-
-        logits = logits + noise
-        gates = F.softmax(logits, dim=-1)
+        # else: on eval, we leave logits unchanged
+    
+        gates = F.softmax(logits, dim=-1)                        # bf16 softmax
         vals, inds = torch.topk(gates, self.top_k, dim=-1, sorted=False)
-        return vals.type_as(hidden_states), inds, gates.type_as(hidden_states)
+        return vals, inds, gates
+
 
 class SparseMoE(nn.Module):
     """Multi-GPU expert-parallel Sparse-MoE (bf16-friendly)."""
@@ -293,37 +317,35 @@ class SparseMoE(nn.Module):
         device  = hidden_states.device
         N       = B * T
         flat    = hidden_states.view(N, d)
-
-        # -- 1) routing (keep outputs in fp32) ------------------------------
-        vals_fp32, top_inds, dense_fp32 = self.router(flat)      # (N, k)
-
-        # -- 2) capacity ----------------------------------------------------
+    
+        # 1) router (fp32)
+        vals_fp32, top_inds, dense_fp32 = self.router(flat)
         capacity = math.ceil(self.cap_factor * N / self.num_experts)
-
-        # -- 3) token selection ---------------------------------------------
+    
+        # 2) select tokens ---------------------------------------------------
         kept_tok, exp_idx, gw_list = [], [], []
         for e in range(self.num_experts):
             mask = (top_inds == e)
             if not mask.any():
                 continue
             tok_i, slot_i = mask.nonzero(as_tuple=True)
-            scores = vals_fp32[tok_i, slot_i]                    # fp32
-            top_n  = min(capacity, scores.size(0))
+            scores = vals_fp32[tok_i, slot_i]
+            top_n  = min(capacity, scores.numel())
             if top_n == 0:
                 continue
             best = torch.topk(scores, top_n, largest=True).indices
             kept_tok.append(tok_i[best])
             exp_idx.append(torch.full((top_n,), e, device=device, dtype=torch.long))
-            gw_list.append(scores[best].unsqueeze(1))           # keep fp32
-
-        if not kept_tok:                                        # edge-case
+            gw_list.append(scores[best].unsqueeze(1))
+    
+        if not kept_tok:
             return hidden_states, torch.tensor(0.0, device=device)
-
-        kept_tok = torch.cat(kept_tok)                          # (R,)
-        exp_idx  = torch.cat(exp_idx)                           # (R,)
-        gate_wgt = torch.cat(gw_list).to(flat.dtype)            # (R,1)  → bf16
-
-        # ---------------- single-GPU fallback -----------------------------
+    
+        kept_tok = torch.cat(kept_tok)          # (R,)
+        exp_idx  = torch.cat(exp_idx)           # (R,)
+        gate_wgt = torch.cat(gw_list).to(flat.dtype)   # cast to bf16/fp16
+    
+        # ---------------- single-GPU ----------------------------------------
         if self.world_size == 1:
             final = torch.zeros_like(flat)
             order = torch.argsort(exp_idx)
@@ -341,57 +363,64 @@ class SparseMoE(nn.Module):
                 final.index_add_(0, idxs, out * gw[s:e])
             aux = self._aux_loss(exp_idx, dense_fp32, N) if self.training else torch.tensor(0.0, device=device)
             return final.view(B, T, d), aux
-
-        # ---------------- multi-GPU path -----------------------------------
+    
+        # ---------------- multi-GPU path ------------------------------------
         target_rank = exp_idx // self.exp_per_gpu
         local_id    = exp_idx %  self.exp_per_gpu
-
+    
         order = torch.argsort(target_rank)
         kt, tr, lid, gw = kept_tok[order], target_rank[order], local_id[order], gate_wgt[order]
-        send_embed      = flat[kt]
-
+        send_embed      = flat[kt]                     # (S, d)
+    
         send_counts = torch.bincount(tr, minlength=self.world_size).to(device)
-
-        # exchange counts
+    
+        # gather recv_counts from peers
         gathered = [torch.zeros_like(send_counts) for _ in range(self.world_size)]
         dist.all_gather(gathered, send_counts, group=self.ep_group)
         counts_mat  = torch.stack(gathered, dim=0)
         recv_counts = counts_mat[:, self.rank]
-        assert torch.equal(counts_mat, counts_mat.t()), "send/recv mismatch"
-
-        # ----- embeddings -----
-        total_recv = int(recv_counts.sum().item())
-        recv_embed = torch.empty((total_recv, d), device=device, dtype=flat.dtype)
-        dist.all_to_all_single(recv_embed, send_embed,
-                               recv_counts.tolist(), send_counts.tolist(),
-                               self.ep_group)
-
-        # ----- local_id -----
-        send_lid = lid
-        recv_lid = torch.empty((total_recv,), device=device, dtype=lid.dtype)
-        dist.all_to_all_single(recv_lid, send_lid,
-                               recv_counts.tolist(), send_counts.tolist(),
-                               self.ep_group)
-
-        # ----- expert MLPs -----
+    
+        # ---------- 1) embeddings -------------------------------------------
+        send_chunks = list(send_embed.split(send_counts.tolist(), dim=0))
+        recv_chunks = [
+            torch.empty((cnt.item(), d), device=device, dtype=flat.dtype)
+            for cnt in recv_counts
+        ]
+        dist.all_to_all(recv_chunks, send_chunks, group=self.ep_group)
+        recv_embed = torch.cat(recv_chunks, dim=0)     # (R, d)
+    
+        # ---------- 2) local_id ---------------------------------------------
+        send_lid_chunks = list(lid.split(send_counts.tolist(), dim=0))
+        recv_lid_chunks = [
+            torch.empty((cnt.item(),), device=device, dtype=lid.dtype)
+            for cnt in recv_counts
+        ]
+        dist.all_to_all(recv_lid_chunks, send_lid_chunks, group=self.ep_group)
+        recv_lid = torch.cat(recv_lid_chunks, dim=0)   # (R,)
+    
+        # ---------- 3) expert MLPs ------------------------------------------
         out_local = torch.empty_like(recv_embed)
         for l in range(self.exp_per_gpu):
             mask = (recv_lid == l)
             if mask.any():
                 out_local[mask] = self.experts[l](recv_embed[mask])
-
-        # ----- send outputs back -----
-        final_buffer = torch.empty_like(send_embed)  # same size as send
-        dist.all_to_all_single(final_buffer, out_local,
-                               send_counts.tolist(), recv_counts.tolist(),
-                               self.ep_group)
-
-        # ----- combine -----
+    
+        # ---------- 4) send outputs back ------------------------------------
+        out_chunks = list(out_local.split(recv_counts.tolist(), dim=0))
+        ret_chunks = [
+            torch.empty((cnt.item(), d), device=device, dtype=out_local.dtype)
+            for cnt in send_counts
+        ]
+        dist.all_to_all(ret_chunks, out_chunks, group=self.ep_group)
+        final_buffer = torch.cat(ret_chunks, dim=0)    # same order as send_embed
+    
+        # ---------- 5) combine ----------------------------------------------
         final = torch.zeros_like(flat)
         final.index_add_(0, kt, final_buffer * gw)
-
+    
         aux = self._aux_loss(exp_idx, dense_fp32, N) if self.training else torch.tensor(0.0, device=device)
         return final.view(B, T, d), aux
+
 
     # ------------------------------------------------------------------
     def _aux_loss(self, exp_idx, dense_probs_fp32, N_tokens):
@@ -401,31 +430,40 @@ class SparseMoE(nn.Module):
 
 class Block(nn.Module):
     """Transformer block using USP Attention and SparseMoE FFN, with KV-cache support."""
-    def __init__(self, d: int, n_head: int, n_exp: int, top_k: int):
+    def __init__(self, d, n_head, n_exp, top_k):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d)
+        self.ln1 = SafeLayerNorm(d)
         self.sa  = MultiHeadAttention(d, n_head)
-        self.ln2 = nn.LayerNorm(d)
+        self.ln2 = SafeLayerNorm(d)
         self.moe = SparseMoE(d, n_exp, top_k)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        past_k: Optional[torch.Tensor] = None,
-        past_v: Optional[torch.Tensor] = None,
-    ):
-        # 1) Self-attn with cache
+    def forward(self, x, mask=None, past_k=None, past_v=None):
+        # 0) Sanity-check the input
+        assert not torch.isnan(x).any(), "NaN in block input"
+        assert not torch.isinf(x).any(), "Inf in block input"
+
+        # 1) Pre-attention LayerNorm
         x_norm = self.ln1(x)
+        assert not torch.isnan(x_norm).any(), "NaN detected in ln1 output"
+        assert not torch.isinf(x_norm).any(), "Inf detected in ln1 output"
+
+        # 2) Self-attention
         attn_out, k, v = self.sa(x_norm, mask=mask, past_k=past_k, past_v=past_v)
         x = x + attn_out
+        assert not torch.isnan(x).any(), "NaN after attention residual"
+        assert not torch.isinf(x).any(), "Inf after attention residual"
 
-        # 2) MoE feed-forward
+        # 3) Pre-MoE LayerNorm
         ff_in = self.ln2(x)
+        assert not torch.isnan(ff_in).any(), "NaN detected in ln2 output"
+        assert not torch.isinf(ff_in).any(), "Inf detected in ln2 output"
+
+        # 4) MoE feed-forward
         moe_out, aux_loss = self.moe(ff_in)
         x = x + moe_out
+        assert not torch.isnan(x).any(), "NaN after MoE residual"
+        assert not torch.isinf(x).any(), "Inf after MoE residual"
 
-        # 3) Return updated hidden + aux loss + new cache
         return x, aux_loss, k, v
 
 # -----------------------------------------------------------------------------#
@@ -488,7 +526,7 @@ class SparseMoELanguageModel(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(n_embed, n_head, num_experts, top_k) for _ in range(n_layer)]
         )
-        self.ln_f = nn.LayerNorm(n_embed)
+        self.ln_f = SafeLayerNorm(n_embed, eps=1e-5)
         self.lm_head = nn.Linear(n_embed, vocab_size, bias=False)
 
         # Weight tying
@@ -619,7 +657,7 @@ class SparseMoELanguageModel(nn.Module):
             cur, aux, _, _ = blk(cur, mask=local_mask)
             if self.training:
                 total_aux += aux
-        x_processed = self.ln_f(cur)                    # (B, T_local, D)
+        x_processed = self.ln_f(cur)
 
         # 4) local cut-cross-entropy (memory-friendly, no gather)
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
