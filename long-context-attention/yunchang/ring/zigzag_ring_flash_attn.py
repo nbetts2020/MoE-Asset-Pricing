@@ -75,7 +75,6 @@ def zigzag_ring_flash_attn_forward(
     lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse
 
-
 def zigzag_ring_flash_attn_backward(
     process_group,
     dout,
@@ -112,23 +111,28 @@ def zigzag_ring_flash_attn_backward(
     dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     dv_buffer = torch.empty(v.shape, dtype=v.dtype, device=v.device)
 
-    def backward(dout, q, k, v, out, softmax_lse, causal):
-        seqlen_q = q.shape[1]
-        seqlen_kv = k.shape[1]
+    def backward_step(dout_local, q_local, k_local, v_local, out_local, lse_local, causal_flag, step):
+        seqlen_q = q_local.shape[1]
+        seqlen_kv = k_local.shape[1]
         fn = select_flash_attn_impl(attn_type, stage="bwd-only")
+
+        # Debug before fn: check for non-finite
+        if not torch.isfinite(dq_buffer).all() or not torch.isfinite(dk_buffer).all() or not torch.isfinite(dv_buffer).all():
+            print(f"[rank {dist.get_rank()}] Non-finite in buffers BEFORE backward call, step={step}")
+
         fn(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
+            dout_local,
+            q_local,
+            k_local,
+            v_local,
+            out_local,
+            lse_local,
             dq_buffer[:, :seqlen_q],
             dk_buffer[:, :seqlen_kv],
             dv_buffer[:, :seqlen_kv],
             dropout_p,
             softmax_scale,
-            causal,
+            causal_flag,
             window_size,
             softcap,
             alibi_slopes,
@@ -136,35 +140,42 @@ def zigzag_ring_flash_attn_backward(
             rng_state=None,
         )
 
+        # Debug after fn: check for non-finite
+        if not torch.isfinite(dq_buffer).all():
+            print(f"[rank {dist.get_rank()}] Non-finite in dq_buffer AFTER backward call, step={step}")
+        if not torch.isfinite(dk_buffer).all():
+            print(f"[rank {dist.get_rank()}] Non-finite in dk_buffer AFTER backward call, step={step}")
+        if not torch.isfinite(dv_buffer).all():
+            print(f"[rank {dist.get_rank()}] Non-finite in dv_buffer AFTER backward call, step={step}")
+
     for step in range(kv_comm.world_size):
+        # Exchange k/v
         if step + 1 != kv_comm.world_size:
-            # DEBUG: log shapes before send_recv of k, v
-            print(
-                f"[rank {dist.get_rank()}] backward step={step}, sending k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}"
-            )
+            print(f"[rank {dist.get_rank()}] backward step={step}, sending k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}")
             next_k = kv_comm.send_recv(k)
             next_v = kv_comm.send_recv(v)
             kv_comm.commit()
 
+        # Compute local gradients
         if step == 0:
-            backward(dout, q, k, v, out, softmax_lse, True)
-            dq = dq_buffer.to(torch.float32)
-            dk = dk_buffer.to(torch.float32)
-            dv = dv_buffer.to(torch.float32)
+            backward_step(dout, q, k, v, out, softmax_lse, True, step)
+            dq = dq_buffer.float()
+            dk = dk_buffer.float()
+            dv = dv_buffer.float()
         else:
             if step <= kv_comm.rank:
-                k0 = k[:, :block_seq_len]
-                v0 = v[:, :block_seq_len]
-                backward(dout, q, k0, v0, out, softmax_lse, False)
+                backward_step(dout, q, k[:, :block_seq_len], v[:, :block_seq_len], out, softmax_lse, False, step)
                 dq += dq_buffer
             else:
-                backward(dout1, q1, k, v, out1, softmax_lse1, False)
+                backward_step(dout1, q1, k, v, out1, softmax_lse1, False, step)
                 dq[:, block_seq_len:] += dq_buffer[:, :block_seq_len]
 
+            # Prepare gradient exchange
             d_kv_comm.wait()
             dk_comm_buffer, dv_comm_buffer = dk, dv
             dk, dv = next_dk, next_dv
 
+            # Accumulate
             if step <= kv_comm.rank:
                 dk[:, :block_seq_len] += dk_buffer[:, :block_seq_len]
                 dv[:, :block_seq_len] += dv_buffer[:, :block_seq_len]
@@ -172,22 +183,25 @@ def zigzag_ring_flash_attn_backward(
                 dk += dk_buffer
                 dv += dv_buffer
 
+        # Advance k/v for next step
         if step + 1 != kv_comm.world_size:
             kv_comm.wait()
-            k = next_k
-            v = next_v
+            k, v = next_k, next_v
 
-        # DEBUG: log shapes before send_recv of dk, dv
-        print(
-            f"[rank {dist.get_rank()}] backward step={step}, sending dk.shape={tuple(dk.shape)}, dv.shape={tuple(dv.shape)}"
-        )
+        # Exchange gradients
+        print(f"[rank {dist.get_rank()}] backward step={step}, sending dk.shape={tuple(dk.shape)}, dv.shape={tuple(dv.shape)}")
         next_dk = d_kv_comm.send_recv(dk, dk_comm_buffer)
         next_dv = d_kv_comm.send_recv(dv, dv_comm_buffer)
         d_kv_comm.commit()
 
     d_kv_comm.wait()
 
-    return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
+    # Final debug before return: check for non-finite final grads
+    if not torch.isfinite(dq).all() or not torch.isfinite(dk).all() or not torch.isfinite(dv).all():
+        print(f"[rank {dist.get_rank()}] Non-finite final grads: dq.norm={dq.norm().item()}, dk.norm={dk.norm().item()}, dv.norm={dv.norm().item()}")
+
+    # Return own gradients, not the 'next_' buffers
+    return dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
 
 class ZigZagRingFlashAttnFunc(torch.autograd.Function):
     @staticmethod
