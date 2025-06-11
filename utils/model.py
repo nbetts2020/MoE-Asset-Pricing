@@ -138,7 +138,7 @@ class MultiHeadAttention(nn.Module):
         self.usp_attn = LongContextAttention(
             scatter_idx=2,
             gather_idx=1,
-            ring_impl_type="zigzag",
+            ring_impl_type="strip",
             use_pack_qkv=True,
             use_sync=True,
             attn_type=AttnType.FA,
@@ -256,7 +256,7 @@ class NoisyTopkRouter(nn.Module):
     def forward(self, hidden_states):
         # logits in bf16
         logits = self.gate_proj(hidden_states)
-    
+
         if self.training:
             # only draw true random noise every top_k calls to avoid runaway seeding
             if (self.router_step.item() % self.top_k) == 0:
@@ -269,12 +269,12 @@ class NoisyTopkRouter(nn.Module):
                 )
             else:
                 noise = torch.zeros_like(logits)
-    
+
             scale  = F.softplus(self.noise_proj(hidden_states))   # bf16 scale
             logits = logits + noise * scale
             self.router_step += 1
         # else: on eval, we leave logits unchanged
-    
+
         gates = F.softmax(logits, dim=-1)                        # bf16 softmax
         vals, inds = torch.topk(gates, self.top_k, dim=-1, sorted=False)
         return vals, inds, gates
@@ -317,16 +317,16 @@ class SparseMoE(nn.Module):
         device  = hidden_states.device
         N       = B * T
         flat    = hidden_states.view(N, d)
-    
+
         # 0) Input sanity check
         assert torch.isfinite(flat).all(), "Non-finite entering SparseMoE"
-    
+
         # 1) router (fp32)
         vals_fp32, top_inds, dense_fp32 = self.router(flat)
         assert torch.isfinite(vals_fp32).all(),  "Non-finite in router values"
         assert torch.isfinite(dense_fp32).all(), "Non-finite in router probabilities"
         capacity = math.ceil(self.cap_factor * N / self.num_experts)
-    
+
         # 2) select tokens
         kept_tok, exp_idx, gw_list = [], [], []
         for e in range(self.num_experts):
@@ -342,18 +342,18 @@ class SparseMoE(nn.Module):
             kept_tok.append(tok_i[best])
             exp_idx.append(torch.full((top_n,), e, device=device, dtype=torch.long))
             gw_list.append(scores[best].unsqueeze(1))
-    
+
         if not kept_tok:
             return hidden_states, torch.tensor(0.0, device=device)
-    
+
         kept_tok = torch.cat(kept_tok)                            # (R,)
         exp_idx  = torch.cat(exp_idx)                             # (R,)
         gate_wgt = torch.cat(gw_list).to(flat.dtype)              # (R,1)
-    
+
         # Check tokens to experts input
         inputs_to_experts = flat[kept_tok]
         assert torch.isfinite(inputs_to_experts).all(), "Non-finite tokens sent to experts"
-    
+
         # single-GPU
         if self.world_size == 1:
             final = torch.zeros_like(flat)
@@ -374,23 +374,23 @@ class SparseMoE(nn.Module):
             aux = self._aux_loss(exp_idx, dense_fp32, N) if self.training else torch.tensor(0.0, device=device)
             assert torch.isfinite(final).all(), "Non-finite after single-GPU combine"
             return final.view(B, T, d), aux
-    
+
         # multi-GPU path
         target_rank = exp_idx // self.exp_per_gpu
         local_id    = exp_idx %  self.exp_per_gpu
-    
+
         order = torch.argsort(target_rank)
         kt, tr, lid, gw = kept_tok[order], target_rank[order], local_id[order], gate_wgt[order]
         send_embed      = flat[kt]
         assert torch.isfinite(send_embed).all(), "Non-finite send_embed"
-    
+
         send_counts = torch.bincount(tr, minlength=self.world_size).to(device)
-    
+
         # exchange counts
         gathered    = [torch.zeros_like(send_counts) for _ in range(self.world_size)]
         dist.all_gather(gathered, send_counts, group=self.ep_group)
         recv_counts = torch.stack(gathered, dim=0)[:, self.rank]
-    
+
         # embeddings exchange
         send_chunks = list(send_embed.split(send_counts.tolist(), dim=0))
         recv_chunks = [torch.empty((cnt.item(), d), device=device, dtype=flat.dtype)
@@ -398,14 +398,14 @@ class SparseMoE(nn.Module):
         dist.all_to_all(recv_chunks, send_chunks, group=self.ep_group)
         recv_embed = torch.cat(recv_chunks, dim=0)
         assert torch.isfinite(recv_embed).all(), "Non-finite recv_embed"
-    
+
         # local_id exchange
         send_lid_chunks = list(lid.split(send_counts.tolist(), dim=0))
         recv_lid_chunks = [torch.empty((cnt.item(),), device=device, dtype=lid.dtype)
                            for cnt in recv_counts]
         dist.all_to_all(recv_lid_chunks, send_lid_chunks, group=self.ep_group)
         recv_lid = torch.cat(recv_lid_chunks, dim=0)
-    
+
         # expert MLPs
         out_local = torch.empty_like(recv_embed)
         for e in range(self.exp_per_gpu):
@@ -414,7 +414,7 @@ class SparseMoE(nn.Module):
                 expert_out = self.experts[e](recv_embed[mask])
                 assert torch.isfinite(expert_out).all(), f"Non-finite from expert {e}"
                 out_local[mask] = expert_out
-    
+
         # send back outputs
         out_chunks = list(out_local.split(recv_counts.tolist(), dim=0))
         ret_chunks = [torch.empty((cnt.item(), d), device=device, dtype=out_local.dtype)
@@ -422,12 +422,12 @@ class SparseMoE(nn.Module):
         dist.all_to_all(ret_chunks, out_chunks, group=self.ep_group)
         final_buffer = torch.cat(ret_chunks, dim=0)
         assert torch.isfinite(final_buffer).all(), "Non-finite final_buffer"
-    
+
         # combine
         final = torch.zeros_like(flat)
         final.index_add_(0, kt, final_buffer * gw)
         assert torch.isfinite(final).all(), "Non-finite after combine"
-    
+
         aux = self._aux_loss(exp_idx, dense_fp32, N) if self.training else torch.tensor(0.0, device=device)
         return final.view(B, T, d), aux
 
