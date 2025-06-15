@@ -405,7 +405,7 @@ def train_model(
         epoch_loss = 0.0
         dbg("entering training loop")
 
-        PHASE3_EPOCHS = 10
+        PHASE3_EPOCHS = 100
         for epoch in range(1, PHASE3_EPOCHS + 1):
             print(epoch, PHASE3_EPOCHS)
             for idx, batch in enumerate(continual_loader):
