@@ -284,7 +284,7 @@ def train_model(
         real_model = engine.module  # unwrap DeepSpeed
         dbg("loaded Phase-1 model")
 
-        NEW_LEN = 4096                     # target context length
+        NEW_LEN = 16384                     # target context length
         device   = torch.device("cuda")
 
         # ── 1. global sync so all ranks have the same model state ───────────
