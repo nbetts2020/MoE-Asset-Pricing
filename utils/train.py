@@ -9,7 +9,7 @@ import logging
 import subprocess
 import re
 
-from utils.utils import compute_l2_loss, upload_checkpoint_to_s3
+from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, download_models_from_s3
 from utils.data import prepare_ft_dataloader
 from utils.config import config
 from utils.ewc import ElasticWeightConsolidation
@@ -275,7 +275,9 @@ def train_model(
     # ===================================================================== #
     if 2 in args.stages:
         dbg("→ entering Phase 2")
-
+        if args.bucket:
+            download_models_from_s3(bucket=args.bucket)
+            dist.barrier()
         # ── 0. load the Phase-1 checkpoint before touching RoPE or SP groups ─────
         dbg("loading Phase-1 checkpoint")
         engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
@@ -353,12 +355,13 @@ def train_model(
         tag = STAGE_TAG[2]
         engine.save_checkpoint(args.save_dir, tag=tag)
 
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            upload_checkpoint_to_s3(
-                local_dir  = os.path.join(args.save_dir, tag),
-                bucket     = args.bucket,
-                remote_dir = f"model/{tag}",
-            )
+        save_checkpoint(
+            engine   = engine if use_deepspeed else None,
+            model    = real_model,
+            save_dir = args.save_dir,
+            tag      = STAGE_TAG[1],
+            bucket   = args.bucket,
+        )
 
 
     # --------------------------------------------------------------------- #
@@ -366,7 +369,9 @@ def train_model(
     # --------------------------------------------------------------------- #
     if 3 in args.stages:
         dbg("→ entering Phase 3")
-
+        if args.bucket:
+            download_models_from_s3(bucket=args.bucket)
+            dist.barrier()
         # ── 0. load the Phase-1 checkpoint before touching RoPE or SP groups ─────
         dbg("loading Phase-2 checkpoint")
         engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[2])
@@ -428,19 +433,24 @@ def train_model(
         tag = STAGE_TAG[3]
         engine.save_checkpoint(args.save_dir, tag=tag)
 
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            upload_checkpoint_to_s3(
-                local_dir  = os.path.join(args.save_dir, tag),
-                bucket     = args.bucket,
-                remote_dir = f"model/{tag}",
-            )
+        save_checkpoint(
+            engine   = engine if use_deepspeed else None,
+            model    = real_model,
+            save_dir = args.save_dir,
+            tag      = STAGE_TAG[1],
+            bucket   = args.bucket,
+        )
             
     # ------------------------------------------------------------------ #
     #  PHASE 4 – EBM fine-tuning (+ validation)                          #
     # ------------------------------------------------------------------ #
     if 4 in args.stages:
         logging.info("=== Starting EBM Fine-Tuning Phase ===")
-    
+
+        if args.bucket:
+            download_models_from_s3(bucket=args.bucket)
+            dist.barrier()
+
         # freeze backbone, train only the small EBM head
         for p in real_model.parameters():
             p.requires_grad_(False)
@@ -565,10 +575,13 @@ def train_model(
             torch.save(real_model.state_dict(),
                        os.path.join(final_dir, "model_with_ebm.pth"))
     
-        if (not dist.is_initialized()) or dist.get_rank() == 0:
-            upload_checkpoint_to_s3(local_dir=final_dir,
-                                    bucket=args.bucket,
-                                    remote_dir=f"model/{final_tag}")
+        save_checkpoint(
+            engine   = engine if use_deepspeed else None,
+            model    = real_model,
+            save_dir = args.save_dir,
+            tag      = STAGE_TAG[1],
+            bucket   = args.bucket,
+        )
     
         logging.info("=== Phase 4 complete ===")
     
