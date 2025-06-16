@@ -313,11 +313,12 @@ def train_model(
         for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
             # ── 1. sync to be safe ──────────────────────────────────────────
             if dist.is_initialized(): dist.barrier()
-    
-            # ── 2. resize context + RoPE ───────────────────────────────────
-            real_model.block_size = blk_sz
-            config.BLOCK_SIZE     = blk_sz
-            update_model_rope_for_extended_context(real_model, blk_sz)
+
+            if config.BLOCK_SIZE != blk_sz:
+                # ── 2. resize context + RoPE ───────────────────────────────────
+                real_model.block_size = blk_sz
+                config.BLOCK_SIZE     = blk_sz
+                update_model_rope_for_extended_context(real_model, blk_sz)
     
             if blk_sz % (dist.get_world_size() if dist.is_initialized() else 1) != 0:
                 raise ValueError(f"block_size {blk_sz} not divisible by world_size")
@@ -327,14 +328,37 @@ def train_model(
     
             # ── 4. build streaming dataloader for the *new* length ─────────
             dbg(f"building continual_loader (bs={blk_sz:,})")
-            continual_loader = prepare_ft_dataloader(
+            # continual_loader = prepare_ft_dataloader(
+            #     tokenizer,
+            #     block_size = blk_sz,
+            #     shuffle    = False,
+            #     args       = args,
+            #     stage      = 1,          # same dataset as before
+            #     streaming  = True,
+            # )
+            import itertools
+
+            # build each stage’s loader
+            loader_stage1 = prepare_ft_dataloader(
                 tokenizer,
                 block_size = blk_sz,
                 shuffle    = False,
                 args       = args,
-                stage      = 1,          # same dataset as before
+                stage      = 1,
                 streaming  = True,
             )
+            loader_stage2 = prepare_ft_dataloader(
+                tokenizer,
+                block_size = blk_sz,
+                shuffle    = False,
+                args       = args,
+                stage      = 2,
+                streaming  = True,
+            )
+            
+            # chain them into one
+            from itertools import chain
+            continual_loader = chain(loader_stage1, loader_stage2)
             dbg("continual_loader ready")
     
             # ── 5. train for n_ep epochs at this length ────────────────────
