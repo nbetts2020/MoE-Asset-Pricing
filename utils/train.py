@@ -23,7 +23,7 @@ from utils.model import update_model_rope_for_extended_context
 
 STAGE_TAG = {
     1: "normal_pretrained",
-    2: "supervised_finetuned_coconut", # "continual_pretrained_64k",
+    2: "continual_pretrained_64k",
     3: "supervised_finetuned_coconut",
     4: "model_with_ebm",
 }
@@ -211,64 +211,80 @@ def train_model(
         logging.info(f"Loaded checkpoint from Phase {min_stage} ('{prev_tag}')")
 
     real_model.ebm = real_model.ebm.to(torch.bfloat16)
-    # ===================================================================== #
-    #  PHASE 1 – Normal pre-training (updated)                              #
-    # ===================================================================== #
+    # ------------------------------------------------------------------ #
+    #  PHASE 1  –  curriculum pre-training (single shared dataloader)
+    # ------------------------------------------------------------------ #
     if 1 in args.stages:
-        PRETRAIN_EPOCHS = epochs
-        logging.info(f"→ Phase 1: normal pre-training for {PRETRAIN_EPOCHS} epoch(s)")
-
+        # map {block_size: num_epochs}
+        CURRICULUM = {
+            128 : 10,
+            512 : 2,
+            2048: 1,
+            4096: 1,
+        }
+    
+        total_epochs = sum(CURRICULUM.values())
+        logging.info(f"→ Phase 1: curriculum pre-training ({total_epochs} total epochs)")
+    
         open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
         m_len    = len(open_ids)
         close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
-
-        for epoch in range(1, PRETRAIN_EPOCHS + 1):
-            real_model.train()
-            epoch_loss = 0.0
-
-            # ————————————— mini-batch loop —————————————
-            for step, batch in enumerate(dataloader):
-                print(step, len(dataloader))
-                input_ids = pad_to_global(batch["input_ids"].to(device))
-                loss      = real_model.forward_next_token_efficient(input_ids, reduction="mean")
-                print(loss, "loss!!")
-
-                if engine:                       # DeepSpeed
-                    engine.zero_grad(); engine.backward(loss); engine.step()
-                else:                            # plain PyTorch
-                    adam_optimizer.zero_grad(); loss.backward()
-                    torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
-                    adam_optimizer.step()
-
-                # regularisers / replay
-                if args.use_si  and si : si.update_weights(real_model)
-                if args.use_ewc and ewc:
-                    for ew in ewc: loss += args.lambda_ewc * ew.penalty(real_model)
-                if replay_buffer and len(replay_buffer.buffer):
-                    loss += replay_buffer.replay_and_calculate_loss(
-                        model=real_model, tokenizer=tokenizer,
-                        replay_batch_size=args.replay_batch_size,
-                        device=device, alpha=args.replay_buffer_weight,
-                    )
-                epoch_loss += loss.item()
-
-            # ——————— epoch summary ———————
-            avg_loss = epoch_loss / len(dataloader)
-            logging.info(f"[Phase 1] Epoch {epoch}/{PRETRAIN_EPOCHS} — avg loss {avg_loss:.4f}")
-
-
-            # ——————— checkpoint ———————
-            save_checkpoint(
-                engine   = engine if use_deepspeed else None,
-                model    = real_model,
-                save_dir = args.save_dir,
-                tag      = STAGE_TAG[1],
-                bucket   = args.bucket,
-            )
-
-        if getattr(args, "stage_1_only", False):
-            logging.info("stage_1_only=True → stopping after Phase 1")
-            return
+    
+        for blk_sz, n_ep in CURRICULUM.items():
+    
+            # ── bump context length & RoPE tables ──────────────────────────
+            real_model.block_size = blk_sz
+            config.BLOCK_SIZE     = blk_sz
+            update_model_rope_for_extended_context(real_model, blk_sz)
+    
+            if dist.is_initialized() and blk_sz % dist.get_world_size() != 0:
+                raise ValueError(f"block_size {blk_sz} must be divisible by world_size")
+    
+            logging.info(f"[Phase 1] block_size {blk_sz:,} for {n_ep} epoch(s)")
+    
+            for ep in range(1, n_ep + 1):
+                real_model.train()
+                epoch_loss = 0.0
+    
+                # ———————————— mini-batch loop ————————————
+                for step, batch in enumerate(dataloader):
+                    input_ids = pad_to_global(batch["input_ids"].to(device))   # pads/trims to blk_sz
+                    loss      = real_model.forward_next_token_efficient(input_ids)
+    
+                    if engine:            # DeepSpeed
+                        engine.zero_grad(); engine.backward(loss); engine.step()
+                    else:                 # plain PyTorch
+                        adam_optimizer.zero_grad(); loss.backward()
+                        torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
+                        adam_optimizer.step()
+    
+                    # regularisers / replay (unchanged) ---------------------
+                    if args.use_si  and si : si.update_weights(real_model)
+                    if args.use_ewc and ewc:
+                        for ew in ewc: loss += args.lambda_ewc * ew.penalty(real_model)
+                    if replay_buffer and len(replay_buffer.buffer):
+                        loss += replay_buffer.replay_and_calculate_loss(
+                            model=real_model, tokenizer=tokenizer,
+                            replay_batch_size=args.replay_batch_size,
+                            device=device, alpha=args.replay_buffer_weight,
+                        )
+                    epoch_loss += loss.item()
+    
+                avg_loss = epoch_loss / max(1, len(dataloader))
+                logging.info(f"[Phase 1] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg_loss:.4f}")
+    
+                # optional checkpoint per context length ------------------------
+                save_checkpoint(
+                    engine   = engine if use_deepspeed else None,
+                    model    = real_model,
+                    save_dir = args.save_dir,
+                    tag      = f"{STAGE_TAG[1]}_bs{blk_sz}",
+                    bucket   = args.bucket,
+                )
+        
+            if getattr(args, "stage_1_only", False):
+                logging.info("stage_1_only=True → stopping after Phase 1")
+                return
 
     # ===================================================================== #
     #  PHASE 2 – Continual pre-training with extended context
@@ -327,7 +343,7 @@ def train_model(
         real_model.train()
         epoch_loss = 0.0
         dbg("entering training loop")
-        PHASE2_EPOCHS = 5
+        PHASE2_EPOCHS = 100
         for epoch in range(1, PHASE2_EPOCHS + 1):
             print(epoch, PHASE2_EPOCHS)
             for idx, batch in enumerate(continual_loader):
