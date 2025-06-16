@@ -278,7 +278,7 @@ def train_model(
                     engine   = engine if use_deepspeed else None,
                     model    = real_model,
                     save_dir = args.save_dir,
-                    tag      = f"{STAGE_TAG[1]}_bs{blk_sz}",
+                    tag      = f"{STAGE_TAG[1]}",
                     bucket   = args.bucket,
                 )
         
@@ -287,99 +287,90 @@ def train_model(
                 return
 
     # ===================================================================== #
-    #  PHASE 2 – Continual pre-training with extended context
+    #  PHASE 2 – continual pre-training with progressively longer contexts  #
     # ===================================================================== #
     if 2 in args.stages:
         dbg("→ entering Phase 2")
         if args.bucket:
             download_models_from_s3(bucket=args.bucket)
             dist.barrier()
-        # ── 0. load the Phase-1 checkpoint before touching RoPE or SP groups ─────
+    
+        # ------------------------------------------------------------------ #
+        #  0. restore the Phase-1 weights (module-only)                       #
+        # ------------------------------------------------------------------ #
         dbg("loading Phase-1 checkpoint")
         engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
-        real_model = engine.module  # unwrap DeepSpeed
+        real_model = engine.module
         dbg("loaded Phase-1 model")
-
-        NEW_LEN = 16384                     # target context length
-        device   = torch.device("cuda")
-
-        # ── 1. global sync so all ranks have the same model state ───────────
-        dbg("before barrier #1")
-        dist.barrier()
-        dbg("passed barrier #1")
-        real_model.block_size = NEW_LEN
-        config.BLOCK_SIZE = NEW_LEN
-        # ── 2. extend the RoPE tables in-place ──────────────────────────────
-        dbg("calling update_model_rope_for_extended_context")
-        update_model_rope_for_extended_context(
-            real_model,
-            new_seq_len = NEW_LEN,
-            base        = 10_000.0,
-        )
-        dbg(f"after RoPE update: block_size = {real_model.block_size}")
-
-
-        # ── 4. zero out any optimizer state so momentum/etc doesn’t mix old context ─
-        dbg("zeroing DeepSpeed optimizer state")
-        engine.optimizer.zero_grad(set_to_none=True)
-
-        # ── 5. sync again before you start training on the new context ─────────
-        dbg("before barrier #2")
-        dist.barrier()
-        dbg("passed barrier #2")
-
-        # ── 6. tiny RoPE-FT pass ─────────────────────────────────────────────
-        dbg("building continual_loader")
-        continual_loader = prepare_ft_dataloader(
-            tokenizer,
-            block_size = NEW_LEN,
-            shuffle    = False,
-            args       = args,
-            stage      = 1,
-            streaming  = True,
-        )
-        dbg("continual_loader ready")
-
-        real_model.train()
-        epoch_loss = 0.0
-        dbg("entering training loop")
-        PHASE2_EPOCHS = 100
-        for epoch in range(1, PHASE2_EPOCHS + 1):
-            print(epoch, PHASE2_EPOCHS)
-            for idx, batch in enumerate(continual_loader):
-                print(idx, len(continual_loader))
-                bsz = batch["input_ids"].size(0)
-                if bsz != config.BATCH_SIZE:
-                    dbg(f"Skipping stray batch of size {bsz}")
-                    continue
-
-                input_ids = pad_to_global(batch["input_ids"].to(device))
-                loss      = real_model.forward_next_token_efficient(
-                                input_ids, reduction="mean"
-                            )
-                print(loss, "loss!!")
-
-                engine.zero_grad()
-                engine.backward(loss)
-                engine.step()
-
-                epoch_loss += loss.item()
-
-                logging.info(f"[Phase 2] Avg loss {epoch_loss/len(continual_loader):.4f}")
-        
-                # ── 7. save & upload the Phase-2 checkpoint ───────────────────────────
-                tag = STAGE_TAG[2]
-                engine.save_checkpoint(args.save_dir, tag=tag)
-        
+    
+        # curriculum: {block_size : epochs}
+        CONTEXT_CURRICULUM = {
+            4096: 2,
+            8192  : 1,
+            16384 : 1
+        }
+    
+        for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
+            # ── 1. sync to be safe ──────────────────────────────────────────
+            if dist.is_initialized(): dist.barrier()
+    
+            # ── 2. resize context + RoPE ───────────────────────────────────
+            real_model.block_size = blk_sz
+            config.BLOCK_SIZE     = blk_sz
+            update_model_rope_for_extended_context(real_model, blk_sz)
+    
+            if blk_sz % (dist.get_world_size() if dist.is_initialized() else 1) != 0:
+                raise ValueError(f"block_size {blk_sz} not divisible by world_size")
+    
+            # ── 3. clear optimiser state so no old-context momentum leaks ──
+            engine.optimizer.zero_grad(set_to_none=True)
+    
+            # ── 4. build streaming dataloader for the *new* length ─────────
+            dbg(f"building continual_loader (bs={blk_sz:,})")
+            continual_loader = prepare_ft_dataloader(
+                tokenizer,
+                block_size = blk_sz,
+                shuffle    = False,
+                args       = args,
+                stage      = 1,          # same dataset as before
+                streaming  = True,
+            )
+            dbg("continual_loader ready")
+    
+            # ── 5. train for n_ep epochs at this length ────────────────────
+            logging.info(f"[Phase 2] block_size {blk_sz:,} for {n_ep} epoch(s)")
+            for ep in range(1, n_ep + 1):
+                real_model.train()
+                ep_loss = 0.0
+    
+                for batch in continual_loader:
+                    input_ids = pad_to_global(batch["input_ids"].to(device))
+                    loss      = real_model.forward_next_token_efficient(input_ids)
+                    print(loss, blk_sz, "loss!!")
+    
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+    
+                    ep_loss += loss.item()
+    
+                avg = ep_loss / max(1, len(continual_loader))
+                logging.info(f"[Phase 2] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg:.4f}")
+    
+                # ── 6. optional checkpoint at this length ──────────────────────
                 save_checkpoint(
                     engine   = engine if use_deepspeed else None,
                     model    = real_model,
                     save_dir = args.save_dir,
-                    tag      = STAGE_TAG[1],
+                    tag      = f"{STAGE_TAG[2]}",
                     bucket   = args.bucket,
                 )
-
-
+        
+            # stop early if user asked for only stage 2 -------------------------
+            if getattr(args, "stage_2_only", False):
+                logging.info("stage_2_only=True → stopping after Phase 2")
+                return
+    
     # --------------------------------------------------------------------- #
     #  PHASE 3 – Reasoning                                                  #
     # --------------------------------------------------------------------- #
@@ -445,17 +436,17 @@ def train_model(
 
                 logging.info(f"[Phase 3] Avg loss {epoch_loss/len(continual_loader):.4f}")
         
-                # ── 7. save & upload the Phase-2 checkpoint ───────────────────────────
-                tag = STAGE_TAG[3]
-                engine.save_checkpoint(args.save_dir, tag=tag)
-        
-                save_checkpoint(
-                    engine   = engine if use_deepspeed else None,
-                    model    = real_model,
-                    save_dir = args.save_dir,
-                    tag      = STAGE_TAG[1],
-                    bucket   = args.bucket,
-                )
+            # ── 7. save & upload the Phase-2 checkpoint ───────────────────────────
+            tag = STAGE_TAG[3]
+            engine.save_checkpoint(args.save_dir, tag=tag)
+    
+            save_checkpoint(
+                engine   = engine if use_deepspeed else None,
+                model    = real_model,
+                save_dir = args.save_dir,
+                tag      = STAGE_TAG[1],
+                bucket   = args.bucket,
+            )
 
     # ------------------------------------------------------------------ #
     #  PHASE 4 – EBM fine-tuning (+ validation)                          #
