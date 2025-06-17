@@ -28,6 +28,51 @@ STAGE_TAG = {
     4: "model_with_ebm",
 }
 
+# ------------------------------------------------------------
+# helper  ➜  merge all ZeRO-2 mp_rank_XX_model_states.pt files
+# ------------------------------------------------------------
+import glob, shutil
+
+def merge_zero2_shards(ckpt_root: str, tag: str = "continual_pretrained_64k") -> str:
+    """
+    ckpt_root/
+        continual_pretrained_64k/
+            mp_rank_00_model_states.pt
+            mp_rank_01_model_states.pt
+            ...
+    ───────────────────────────────────────────────────────────
+    Collects every `mp_rank_??_model_states.pt`, merges the
+    'module' dicts, and writes a *single* shard into
+
+        ckpt_root/<tag>_merged/mp_rank_00_model_states.pt
+
+    Returns that new directory so you can hand it to DeepSpeed.
+    """
+    src_dir   = os.path.join(ckpt_root, tag)
+    shard_paths = sorted(glob.glob(os.path.join(src_dir, "mp_rank_*_model_states.pt")))
+    assert shard_paths, f"No ZeRO shards found in {src_dir}"
+
+    merged = None
+    for p in shard_paths:
+        shard = torch.load(p, map_location="cpu")
+        if merged is None:
+            merged = shard
+        else:
+            merged["module"].update(shard["module"])    # <- add missing keys
+
+    tgt_dir = os.path.join(ckpt_root, f"{tag}_merged")
+    os.makedirs(tgt_dir, exist_ok=True)
+    torch.save(merged, os.path.join(tgt_dir, "mp_rank_00_model_states.pt"))
+
+    # (optional) copy the tokenizer / config json if you stored them there
+    for fname in ("latest", "ds_inference_config.json"):
+        fsrc = os.path.join(src_dir, fname)
+        if os.path.isfile(fsrc):
+            shutil.copy2(fsrc, tgt_dir)
+
+    logging.info(f"[merge] wrote merged ZeRO-2 checkpoint to {tgt_dir}")
+    return tgt_dir
+
 def extract_label_value(decoded_text):
     """
     Extracts the numerical label between
@@ -222,42 +267,42 @@ def train_model(
             2048: 1,
             4096: 1,
         }
-    
+
         total_epochs = sum(CURRICULUM.values())
         logging.info(f"→ Phase 1: curriculum pre-training ({total_epochs} total epochs)")
-    
+
         open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
         m_len    = len(open_ids)
         close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
-    
+
         for blk_sz, n_ep in CURRICULUM.items():
-    
+
             # ── bump context length & RoPE tables ──────────────────────────
             real_model.block_size = blk_sz
             config.BLOCK_SIZE     = blk_sz
             update_model_rope_for_extended_context(real_model, blk_sz)
-    
+
             if dist.is_initialized() and blk_sz % dist.get_world_size() != 0:
                 raise ValueError(f"block_size {blk_sz} must be divisible by world_size")
-    
+
             logging.info(f"[Phase 1] block_size {blk_sz:,} for {n_ep} epoch(s)")
-    
+
             for ep in range(1, n_ep + 1):
                 real_model.train()
                 epoch_loss = 0.0
-    
+
                 # ———————————— mini-batch loop ————————————
                 for step, batch in enumerate(dataloader):
                     input_ids = pad_to_global(batch["input_ids"].to(device))   # pads/trims to blk_sz
                     loss      = real_model.forward_next_token_efficient(input_ids)
-    
+
                     if engine:            # DeepSpeed
                         engine.zero_grad(); engine.backward(loss); engine.step()
                     else:                 # plain PyTorch
                         adam_optimizer.zero_grad(); loss.backward()
                         torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
                         adam_optimizer.step()
-    
+
                     # regularisers / replay (unchanged) ---------------------
                     if args.use_si  and si : si.update_weights(real_model)
                     if args.use_ewc and ewc:
@@ -269,10 +314,10 @@ def train_model(
                             device=device, alpha=args.replay_buffer_weight,
                         )
                     epoch_loss += loss.item()
-    
+
                 avg_loss = epoch_loss / max(1, len(dataloader))
                 logging.info(f"[Phase 1] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg_loss:.4f}")
-    
+
                 # optional checkpoint per context length ------------------------
                 save_checkpoint(
                     engine   = engine if use_deepspeed else None,
@@ -281,7 +326,7 @@ def train_model(
                     tag      = f"{STAGE_TAG[1]}",
                     bucket   = args.bucket,
                 )
-        
+
             if getattr(args, "stage_1_only", False):
                 logging.info("stage_1_only=True → stopping after Phase 1")
                 return
@@ -294,7 +339,7 @@ def train_model(
         if args.bucket:
             download_models_from_s3(bucket=args.bucket)
             dist.barrier()
-    
+
         # ------------------------------------------------------------------ #
         #  0. restore the Phase-1 weights (module-only)                       #
         # ------------------------------------------------------------------ #
@@ -302,14 +347,14 @@ def train_model(
         engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
         real_model = engine.module
         dbg("loaded Phase-1 model")
-    
+
         # curriculum: {block_size : epochs}
         CONTEXT_CURRICULUM = {
             4096: 2,
             8192  : 1,
             16384 : 1
         }
-    
+
         for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
             # ── 1. sync to be safe ──────────────────────────────────────────
             if dist.is_initialized(): dist.barrier()
@@ -319,13 +364,13 @@ def train_model(
                 real_model.block_size = blk_sz
                 config.BLOCK_SIZE     = blk_sz
                 update_model_rope_for_extended_context(real_model, blk_sz)
-    
+
             if blk_sz % (dist.get_world_size() if dist.is_initialized() else 1) != 0:
                 raise ValueError(f"block_size {blk_sz} not divisible by world_size")
-    
+
             # ── 3. clear optimiser state so no old-context momentum leaks ──
             engine.optimizer.zero_grad(set_to_none=True)
-    
+
             # ── 4. build streaming dataloader for the *new* length ─────────
             dbg(f"building continual_loader (bs={blk_sz:,})")
             # continual_loader = prepare_ft_dataloader(
@@ -355,32 +400,33 @@ def train_model(
                 stage      = 2,
                 streaming  = True,
             )
-            
+
             # chain them into one
             from itertools import chain
             continual_loader = chain(loader_stage1, loader_stage2)
             dbg("continual_loader ready")
-    
+
             # ── 5. train for n_ep epochs at this length ────────────────────
             logging.info(f"[Phase 2] block_size {blk_sz:,} for {n_ep} epoch(s)")
             for ep in range(1, n_ep + 1):
                 real_model.train()
                 ep_loss = 0.0
-    
-                for batch in continual_loader:
+
+                for step, batch in enumerate(continual_loader):
+                    print(step, "progress!!")
                     input_ids = pad_to_global(batch["input_ids"].to(device))
                     loss      = real_model.forward_next_token_efficient(input_ids)
                     print(loss, blk_sz, "loss!!")
-    
+
                     engine.zero_grad()
                     engine.backward(loss)
                     engine.step()
-    
+
                     ep_loss += loss.item()
-    
-                avg = ep_loss / max(1, len(continual_loader))
+
+                avg = ep_loss / 627
                 logging.info(f"[Phase 2] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg:.4f}")
-    
+
                 # ── 6. optional checkpoint at this length ──────────────────────
                 save_checkpoint(
                     engine   = engine if use_deepspeed else None,
@@ -389,12 +435,12 @@ def train_model(
                     tag      = f"{STAGE_TAG[2]}",
                     bucket   = args.bucket,
                 )
-        
+
             # stop early if user asked for only stage 2 -------------------------
             if getattr(args, "stage_2_only", False):
                 logging.info("stage_2_only=True → stopping after Phase 2")
                 return
-    
+
     # --------------------------------------------------------------------- #
     #  PHASE 3 – Reasoning                                                  #
     # --------------------------------------------------------------------- #
@@ -459,11 +505,11 @@ def train_model(
                 epoch_loss += loss.item()
 
                 logging.info(f"[Phase 3] Avg loss {epoch_loss/len(continual_loader):.4f}")
-        
+
             # ── 7. save & upload the Phase-2 checkpoint ───────────────────────────
             tag = STAGE_TAG[3]
             engine.save_checkpoint(args.save_dir, tag=tag)
-    
+
             save_checkpoint(
                 engine   = engine if use_deepspeed else None,
                 model    = real_model,
@@ -482,6 +528,21 @@ def train_model(
             download_models_from_s3(bucket=args.bucket)
             dist.barrier()
 
+        if dist.get_world_size() == 1:              # running on *one* GPU
+            merged_dir = merge_zero2_shards(args.save_dir, tag=STAGE_TAG[2])
+            engine.load_checkpoint(
+                load_dir            = merged_dir,
+                tag                 = None,         # no inner sub-folder
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+                load_module_only    = True,         # we only care about weights
+                load_module_strict  = False         # ignore any exotic keys
+            )
+        else:                                       # multi-GPU as before
+            engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[2])
+
+        real_model = engine.module
+        real_model.eval()
         # freeze backbone, train only the small EBM head
         for p in real_model.parameters():
             p.requires_grad_(False)
@@ -537,37 +598,37 @@ def train_model(
                             # start from just after the marker
                             prefix = ids[b, k, : j + m_len].unsqueeze(0)  # (1, L)
                             generated = prefix.clone()                    # (1, L)
-
-                            for _ in range(10):
-                                full_hs = real_model.forward_embeddings_only(generated)      # (1, block_size, D)
-                                hs      = full_hs[:, : generated.size(1), :]
-                                logits = real_model.lm_head(hs)[:, -1, :]  # (1, V)
-
-                                # apply temperature
-                                logits = logits / temperature
-
-                                # top-p (nucleus) filtering
-                                sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-                                cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                                # mask out everything above top_p
-                                sorted_idx_to_remove = cumulative_probs > top_p
-                                # shift mask right to keep at least one token
-                                sorted_idx_to_remove[..., 1:] = sorted_idx_to_remove[..., :-1].clone()
-                                sorted_idx_to_remove[..., 0]  =  False
-                                logits[0, sorted_idx[0, sorted_idx_to_remove[0]]] = -float("Inf")
-
-                                probs = torch.softmax(logits, dim=-1)
-                                nxt   = torch.multinomial(probs, num_samples=1)  # (1,1)
-
-                                generated = torch.cat([generated, nxt], dim=1)
-                                if nxt.item() == close_id:
-                                    break
-
-                            full = generated[0]
-                            print(tokenizer.decode(full, skip_special_tokens=False), "sampled")
-                            val = extract_label_value(tokenizer.decode(full, skip_special_tokens=False))
-                            if val is not None:
-                                preds[b, k] = val
+                            with torch.no_grad():
+                                for _ in range(10):
+                                    full_hs = real_model.forward_embeddings_only(generated)      # (1, block_size, D)
+                                    hs      = full_hs[:, : generated.size(1), :]
+                                    logits = real_model.lm_head(hs)[:, -1, :]  # (1, V)
+    
+                                    # apply temperature
+                                    logits = logits / temperature
+    
+                                    # top-p (nucleus) filtering
+                                    sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                                    cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                                    # mask out everything above top_p
+                                    sorted_idx_to_remove = cumulative_probs > top_p
+                                    # shift mask right to keep at least one token
+                                    sorted_idx_to_remove[..., 1:] = sorted_idx_to_remove[..., :-1].clone()
+                                    sorted_idx_to_remove[..., 0]  =  False
+                                    logits[0, sorted_idx[0, sorted_idx_to_remove[0]]] = -float("Inf")
+    
+                                    probs = torch.softmax(logits, dim=-1)
+                                    nxt   = torch.multinomial(probs, num_samples=1)  # (1,1)
+    
+                                    generated = torch.cat([generated, nxt], dim=1)
+                                    if nxt.item() == close_id:
+                                        break
+    
+                                full = generated[0]
+                                print(tokenizer.decode(full, skip_special_tokens=False), "sampled")
+                                val = extract_label_value(tokenizer.decode(full, skip_special_tokens=False))
+                                if val is not None:
+                                    preds[b, k] = val
 
                     # ---- 3. margin-ranking loss over K candidates ------------
                     flat_embs = embs.view(B*K, -1).to(torch.bfloat16)     # (B·K,D)
