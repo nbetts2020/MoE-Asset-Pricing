@@ -315,8 +315,7 @@ def process_run_dataset(
             )
             
             # Normalise label token
-            ctx = ctx.replace("<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>: ") \
-                     + " </STOCK PRICE 30 DAYS OUT>"
+            ctx = ctx.replace("<30 DAY LABEL>", "<STOCK PRICE 30 DAYS OUT>: ")
 
             # ---------------------------------------------------------- #
             #  2. Generate reasoning
@@ -324,7 +323,7 @@ def process_run_dataset(
             # ---------------------------------------------------------- #
             tokenizer.truncation_side = "left"
             if args.no_reasoning:
-                continue
+                pass
             else:
                 prefix_ids = tokenizer(
                     ctx + "\n<reasoning>",
@@ -359,7 +358,7 @@ def process_run_dataset(
             # ---------------------------------------------------------- #
             price_prefix = "\n<STOCK PRICE 30 DAYS OUT>: " if args.no_reasoning else f"{ctx}\n<reasoning>{reasoning_txt}</reasoning>\n<STOCK PRICE 30 DAYS OUT>: "
             prefix_ids = tokenizer(
-                price_prefix,
+                ctx + price_prefix,
                 truncation=True,
                 padding="max_length",
                 max_length=args.block_size,
@@ -532,9 +531,13 @@ def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, args):
                 return_tensors="pt"
             ).to(device)
 
-            # forward() expected to return (logits, energy, extras)
-            _, energy, _ = model(input_ids=enc["input_ids"])
-            energies.append(float(energy))
+            # 1) get hidden states
+            hs = model.forward_embeddings_only(enc["input_ids"])  # (1, T, D)
+            # 2) pool to (1, D)
+            pooled = hs.mean(dim=1)                               # (1, D)
+            # 3) energy from the EBM head
+            energy = model.ebm(pooled)                            # (1,)
+            energies.append(float(energy.item()))
 
     best_idx = int(np.argmin(np.abs(energies)))
     return sampled[best_idx]
