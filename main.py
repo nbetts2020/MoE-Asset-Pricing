@@ -301,44 +301,76 @@ def main():
     # ------------------ RUN (INFERENCE) MODE ------------------
     elif args.mode == "run":
         print_debug_info("RUN MODE START")
-        mp_size = int(os.environ.get("WORLD_SIZE", "1"))
+    
+        # ------------------------------------------------------------------ #
+        # 0) basic bookkeeping                                               #
+        # ------------------------------------------------------------------ #
+        tag       = STAGE_TAG[4]                 # "model_with_ebm"
+        ckpt_dir  = os.path.join(args.save_dir, tag)
+        single_ckpt_path   = os.path.join(ckpt_dir, "model_with_ebm.pth")
+        shard_ckpt_path    = os.path.join(ckpt_dir, "mp_rank_00_model_states.pt")
+    
+        mp_size  = int(os.environ.get("WORLD_SIZE", "1"))
         is_multi = mp_size > 1
-        ckpt_file = "consolidated_final.pth" if is_multi else "model_full.pth"
-        ckpt_path = os.path.join(args.save_dir, ckpt_file)
-
-        if not args.test and is_multi and not all([args.stock, args.date, args.text, args.bucket]):
-            raise ValueError("For non-test multi-GPU run, provide --stock, --date, --text, and --bucket.")
-
-        # Download whichever checkpoint we need
-        if current_rank == 0 and args.bucket:
+        rank0    = (not dist.is_initialized()) or dist.get_rank() == 0
+    
+        # ------------------------------------------------------------------ #
+        # 1) sync / download from S3                                         #
+        # ------------------------------------------------------------------ #
+        if rank0 and args.bucket:
             download_models_from_s3(bucket=args.bucket)
-            if not os.path.exists(ckpt_path):
-                logging.error(f"Checkpoint not found at {ckpt_path} after S3 download")
-                raise FileNotFoundError(f"Expected checkpoint at {ckpt_path}")
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        if not os.path.exists(ckpt_path):
-            logging.error(f"Checkpoint missing at {ckpt_path}")
-            raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
-
-        # Load model weights
+        if dist.is_initialized():
+            dist.barrier()
+    
+        # ------------------------------------------------------------------ #
+        # 2) work out which file to load                                     #
+        # ------------------------------------------------------------------ #
+        if os.path.isfile(single_ckpt_path):
+            # Case A ─ single-file checkpoint is present
+            fp32_state_dict = torch.load(single_ckpt_path, map_location="cpu")
+            logging.info(f"[load] single-file checkpoint → {single_ckpt_path}")
+    
+        elif os.path.isfile(shard_ckpt_path):
+            # Case B ─ ZeRO shard already merged (single shard present)
+            ckpt = torch.load(shard_ckpt_path, map_location="cpu")
+            fp32_state_dict = ckpt["module"]
+            logging.info(f"[load] merged ZeRO shard → {shard_ckpt_path}")
+    
+        else:
+            # Case C ─ only raw ZeRO shards → merge them now
+            merged_dir = merge_zero2_shards(args.save_dir, tag=tag)
+            merged_path = os.path.join(merged_dir, "mp_rank_00_model_states.pt")
+            ckpt = torch.load(merged_path, map_location="cpu")
+            fp32_state_dict = ckpt["module"]
+            logging.info(f"[load] merged on the fly → {merged_path}")
+    
+        # ------------------------------------------------------------------ #
+        # 3) materialise model & push weights                                #
+        # ------------------------------------------------------------------ #
         model, _ = initialize_model(args, device, init_from_scratch=False)
-        state_dict = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(state_dict)
-
+        missing, unexpected = model.load_state_dict(fp32_state_dict, strict=False)
+        if missing:
+            logging.warning(f"{len(missing)} keys missing (first 5: {missing[:5]})")
+        if unexpected:
+            logging.warning(f"{len(unexpected)} unexpected keys (first 5: {unexpected[:5]})")
+    
+        # ------------------------------------------------------------------ #
+        # 4) DeepSpeed inference wrapper if running multi-GPU                #
+        # ------------------------------------------------------------------ #
         if is_multi:
             model = deepspeed.init_inference(
                 model,
-                mp_size=mp_size,
-                dtype=torch.bfloat16,
-                replace_method="auto",
-                config=args.deepspeed_config
+                mp_size        = mp_size,
+                dtype          = torch.bfloat16,
+                replace_method = "auto",
+                config         = args.deepspeed_config,
             )
         else:
-            model.to(device)
-
+            model.to(device).bfloat16()
+    
         model.eval()
-        logging.info(f"Rank {current_rank}: Model loaded from {ckpt_path} (mp_size={mp_size})")
+        logging.info(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                     f"Model ready (mp_size={mp_size})")
 
         # ---------- Actual Inference Logic ----------
         if not args.test:
