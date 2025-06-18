@@ -18,6 +18,8 @@ from utils.memory_replay_buffer import MemoryReplayBuffer
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 import deepspeed
 
+from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
 # Import the helper function to update RoPE buffers.
 from utils.model import update_model_rope_for_extended_context
 
@@ -523,32 +525,40 @@ def train_model(
     # ------------------------------------------------------------------ #
     if 4 in args.stages:
         logging.info("=== Starting EBM Fine-Tuning Phase ===")
-
+    
         if args.bucket:
             download_models_from_s3(bucket=args.bucket)
             dist.barrier()
-
-        if dist.get_world_size() == 1:              # running on *one* GPU
-            merged_dir = merge_zero2_shards(args.save_dir, tag=STAGE_TAG[2])
-            engine.load_checkpoint(
-                load_dir            = merged_dir,
-                tag                 = None,         # no inner sub-folder
-                load_optimizer_states=False,
-                load_lr_scheduler_states=False,
-                load_module_only    = True,         # we only care about weights
-                load_module_strict  = False         # ignore any exotic keys
-            )
-        else:                                       # multi-GPU as before
-            engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[2])
-
-        real_model = engine.module
+    
+        # ------------ NEW: assemble one fp32 state_dict -----------------
+        ckpt_dir = os.path.join(args.save_dir, STAGE_TAG[2])  # “continual_pretrained_64k”
+        merged_dir = merge_zero2_shards(args.save_dir, tag=STAGE_TAG[2])
+        fp32_ckpt_path = os.path.join(merged_dir, "mp_rank_00_model_states.pt")
+    
+        logging.info(f"[load] torch.load → {fp32_ckpt_path}")
+        ckpt = torch.load(fp32_ckpt_path, map_location="cpu")
+        fp32_state = ckpt["module"]
+    
+        # (Optional) cache a single‐file FP32 checkpoint for next time
+        single_path = f"{merged_dir}_fp32.pth"
+        torch.save(fp32_state, single_path)
+        logging.info(f"[load] wrote single-file checkpoint to {single_path}")
+    
+        # push into the live model (engine.module if DeepSpeed, else model)
+        if use_deepspeed:
+            real_model = engine.module
+        else:
+            real_model = model
+        real_model.load_state_dict(fp32_state, strict=False)
+        # ---------------------------------------------------------------
+    
         real_model.eval()
         # freeze backbone, train only the small EBM head
         for p in real_model.parameters():
             p.requires_grad_(False)
         for p in real_model.ebm.parameters():
             p.requires_grad_(True)
-
+        
         ebm_opt   = torch.optim.AdamW(real_model.ebm.parameters(), lr=args.ebm_lr)
         margin    = getattr(args, "ebm_margin", 1.0)
         ebm_epochs = getattr(args, "ebm_epochs", 1)
@@ -571,7 +581,8 @@ def train_model(
                     ids        = batch["input_ids"].to(device)           # (B,K,T)
                     true_price = batch["labels"].to(device)              # (B,)
                     B, K, T    = ids.shape
-
+                    preds = torch.zeros((B, K), device=device)
+                    
                     # ---- 1. stream each candidate through frozen backbone ----
                     emb_chunks = []
                     for k_idx in range(K):
