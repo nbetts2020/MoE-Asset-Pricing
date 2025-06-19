@@ -305,7 +305,7 @@ def main():
         # ------------------------------------------------------------------ #
         # 0) basic bookkeeping                                               #
         # ------------------------------------------------------------------ #
-        tag       = STAGE_TAG[4]                 # "model_with_ebm"
+        tag       = "model_with_ebm"
         ckpt_dir  = os.path.join(args.save_dir, tag)
         single_ckpt_path   = os.path.join(ckpt_dir, "model_with_ebm.pth")
         shard_ckpt_path    = os.path.join(ckpt_dir, "mp_rank_00_model_states.pt")
@@ -347,7 +347,7 @@ def main():
         # ------------------------------------------------------------------ #
         # 3) materialise model & push weights                                #
         # ------------------------------------------------------------------ #
-        model, _ = initialize_model(args, device, init_from_scratch=False)
+        model, _ = initialize_model(args, device, init_from_scratch=True)
         missing, unexpected = model.load_state_dict(fp32_state_dict, strict=False)
         if missing:
             logging.warning(f"{len(missing)} keys missing (first 5: {missing[:5]})")
