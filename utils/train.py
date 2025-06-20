@@ -346,7 +346,14 @@ def train_model(
         #  0. restore the Phase-1 weights (module-only)                       #
         # ------------------------------------------------------------------ #
         dbg("loading Phase-1 checkpoint")
-        engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
+        # engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
+        engine.load_checkpoint(
+            load_dir                 = args.save_dir,
+            tag                      = STAGE_TAG[1],
+            load_optimizer_states    = False,
+            load_lr_scheduler_states = False,
+            load_module_only         = True,
+        )
         real_model = engine.module
         dbg("loaded Phase-1 model")
 
@@ -385,27 +392,27 @@ def train_model(
             # )
             import itertools
 
-            # build each stage’s loader
-            loader_stage1 = prepare_ft_dataloader(
-                tokenizer,
-                block_size = blk_sz,
-                shuffle    = False,
-                args       = args,
-                stage      = 1,
-                streaming  = True,
-            )
-            loader_stage2 = prepare_ft_dataloader(
-                tokenizer,
-                block_size = blk_sz,
-                shuffle    = False,
-                args       = args,
-                stage      = 2,
-                streaming  = True,
-            )
+            # # build each stage’s loader
+            # loader_stage1 = prepare_ft_dataloader(
+            #     tokenizer,
+            #     block_size = blk_sz,
+            #     shuffle    = False,
+            #     args       = args,
+            #     stage      = 1,
+            #     streaming  = True,
+            # )
+            # loader_stage2 = prepare_ft_dataloader(
+            #     tokenizer,
+            #     block_size = blk_sz,
+            #     shuffle    = False,
+            #     args       = args,
+            #     stage      = 2,
+            #     streaming  = True,
+            # )
 
             # chain them into one
             from itertools import chain
-            continual_loader = chain(loader_stage1, loader_stage2)
+            # continual_loader = chain(loader_stage1, loader_stage2)
             dbg("continual_loader ready")
 
             # ── 5. train for n_ep epochs at this length ────────────────────
@@ -413,6 +420,16 @@ def train_model(
             for ep in range(1, n_ep + 1):
                 real_model.train()
                 ep_loss = 0.0
+
+                loader_stage1 = prepare_ft_dataloader(
+                    tokenizer, block_size=blk_sz, shuffle=False,
+                    args=args, stage=1, streaming=True
+                )
+                loader_stage2 = prepare_ft_dataloader(
+                    tokenizer, block_size=blk_sz, shuffle=False,
+                    args=args, stage=2, streaming=True
+                )
+                continual_loader = chain(loader_stage1, loader_stage2)
 
                 for step, batch in enumerate(continual_loader):
                     print(step, "progress!!")
