@@ -51,7 +51,7 @@ class OnlineMetrics:
                 stats["wins"] += 1
                 stats["gross_profits"] += strategy_return
             elif strategy_return < 0:
-                stats["gross_losses"] -= strategy_return
+                stats["gross_losses"] += abs(strategy_return)
 
     def compute(self):
         mse = self.sum_sq_error / self.count if self.count > 0 else 0.0
