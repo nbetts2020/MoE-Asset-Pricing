@@ -483,43 +483,34 @@ def save_rl_attention(rl_module, epoch, save_dir="models", args=None):
 
 def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, args):
     """
-    Pick the context whose EBM energy is lowest (|energy| ~= best match).
-
-    Args
-    ----
-    df : pd.DataFrame            – dataset with columns iteration_{i}_text
-    idx : int                    – row index to evaluate
-    model : torch.nn.Module      – model whose forward returns (_, energy, _)
-    tokenizer : transformers.PreTrainedTokenizer
-    ebm_samples : int            – how many of the available candidates to score
-
-    Returns
-    -------
-    str  – the selected context text
+    Pick the context whose EBM energy is lowest (|energy| ~= best match),
+    using **marker pooling** instead of global mean.
     """
     import random
     import numpy as np
     import torch
     from utils.config import config
 
+    # Precompute marker token ID
+    open_ids  = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+    marker_id = open_ids[0]
+
     row = df.iloc[idx]
     candidates = [
         row.get(f"iteration_{i}_text")
-        for i in range(1, 31)
+        for i in range(1, 26)
         if row.get(f"iteration_{i}_text") is not None
     ]
     if not candidates:
         raise ValueError("No candidate contexts found for this sample.")
 
     sampled = random.sample(candidates, min(len(candidates), ebm_samples))
-
     if args.no_ebm:
         return sampled[0]
 
-    energies = []
     device = next(model.parameters()).device
     tokenizer.truncation_side = "left"
-
+    energies = []
     model.eval()
     with torch.no_grad(), torch.amp.autocast("cuda"):
         for text in sampled:
@@ -531,12 +522,21 @@ def ebm_select_contexts(df, idx, model, tokenizer, ebm_samples, args):
                 return_tensors="pt"
             ).to(device)
 
-            # 1) get hidden states
-            hs = model.forward_embeddings_only(enc["input_ids"])  # (1, T, D)
-            # 2) pool to (1, D)
-            pooled = hs.mean(dim=1)                               # (1, D)
+            # 1) get hidden states: (1, T, D)
+            hs = model.forward_embeddings_only(enc["input_ids"])
+
+            # 2) marker pooling → (1, D)
+            ids = enc["input_ids"][0]
+            hits = (ids == marker_id).nonzero(as_tuple=True)[0]
+            if hits.numel():
+                pos = hits[0].item()
+                pooled = hs[0, pos, :].unsqueeze(0)
+            else:
+                # fallback to mean if marker missing
+                pooled = hs.mean(dim=1)
+
             # 3) energy from the EBM head
-            energy = model.ebm(pooled)                            # (1,)
+            energy = model.ebm(pooled)  # (1,)
             energies.append(float(energy.item()))
 
     best_idx = int(np.argmin(np.abs(energies)))
