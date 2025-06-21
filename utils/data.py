@@ -346,7 +346,7 @@ def prepare_ft_dataloader(
                 lambda v: f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
             )
             for col in text_cols:
-                df[col] = df[col] + " " + label_tag
+                df[col] = df[col] + "\n" + label_tag
 
             source = df
 
