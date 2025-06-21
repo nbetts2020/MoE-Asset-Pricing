@@ -423,11 +423,11 @@ def train_model(
 
                 loader_stage1 = prepare_ft_dataloader(
                     tokenizer, block_size=blk_sz, shuffle=False,
-                    args=args, stage=1, streaming=True
+                    args=args, stage=1, streaming=False
                 )
                 loader_stage2 = prepare_ft_dataloader(
                     tokenizer, block_size=blk_sz, shuffle=False,
-                    args=args, stage=2, streaming=True
+                    args=args, stage=2, streaming=False
                 )
                 continual_loader = chain(loader_stage1, loader_stage2)
 
@@ -533,12 +533,12 @@ def train_model(
                 engine   = engine if use_deepspeed else None,
                 model    = real_model,
                 save_dir = args.save_dir,
-                tag      = STAGE_TAG[1],
+                tag      = STAGE_TAG[3],
                 bucket   = args.bucket,
             )
 
     # ------------------------------------------------------------------ #
-    #  PHASE 4 – EBM fine‑tuning (+ validation) with **marker pooling**   #
+    #  PHASE 4 – EBM fine‑tuning (+ validation) with marker pooling      #
     # ------------------------------------------------------------------ #
     if 4 in args.stages:
         logging.info("=== Starting EBM Fine‑Tuning Phase ===")
@@ -551,89 +551,93 @@ def train_model(
         ckpt_dir   = os.path.join(args.save_dir, STAGE_TAG[2])      # "continual_pretrained_64k"
         merged_dir = merge_zero2_shards(args.save_dir, tag=STAGE_TAG[2])
         fp32_path  = os.path.join(merged_dir, "mp_rank_00_model_states.pt")
-    
         logging.info(f"[load] torch.load → {fp32_path}")
         fp32_state = torch.load(fp32_path, map_location="cpu")["module"]
     
-        # cache single‑file version (optional)
+        # optional: cache single‑file fp32 checkpoint
         torch.save(fp32_state, f"{merged_dir}_fp32.pth")
     
-        # push weights into live model ------------------------------------------------
+        # ---- push weights into live model ----
         real_model = engine.module if use_deepspeed else model
         real_model.load_state_dict(fp32_state, strict=False)
     
-        # freeze backbone – train only EBM --------------------------------------------
+        # ---- freeze backbone; train only EBM head ----
         real_model.eval()
-        for p in real_model.parameters():         p.requires_grad_(False)
-        for p in real_model.ebm.parameters():     p.requires_grad_(True)
+        for p in real_model.parameters():
+            p.requires_grad_(False)
+        for p in real_model.ebm.parameters():
+            p.requires_grad_(True)
     
         ebm_opt    = torch.optim.AdamW(real_model.ebm.parameters(), lr=args.ebm_lr)
         margin     = getattr(args, "ebm_margin", 1.0)
         ebm_epochs = getattr(args, "ebm_epochs", 1)
     
-        # ─────────── helper: marker‑pooled embedding ────────────
-        open_ids   = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
-        marker_id  = open_ids[0]                           # first token of the marker
+        # ------------------------------------------------------------------
+        #  Marker‑pooling helper
+        # ------------------------------------------------------------------
+        open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ", add_special_tokens=False).input_ids
+        m_len    = len(open_ids)
+        close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
+        marker_tensor = torch.tensor(open_ids, device=device)
     
         def marker_pool(ids_batch: torch.Tensor) -> torch.Tensor:
-            """Return (B,D) embedding pooled at first <STOCK ...> token."""
-            # ids_batch: (B,T)
-            hs = real_model.forward_embeddings_only(ids_batch)      # (B,T,D)
-            B, T = ids_batch.shape
-            device = ids_batch.device
-            # locate first marker; if none, fall back to global mean
-            pos = torch.zeros(B, dtype=torch.long, device=device)
+            """Return (B,D) embedding at last token of first exact marker span.
+            Fallback = global mean when marker missing."""
+            hs = real_model.forward_embeddings_only(ids_batch)          # (B,T,D)
+            B, T, D = hs.shape
+            pooled = torch.empty(B, D, device=ids_batch.device, dtype=hs.dtype)
             for b in range(B):
-                hits = (ids_batch[b] == marker_id).nonzero(as_tuple=True)[0]
-                pos[b] = hits[0] if hits.numel() else 0
-            return hs[torch.arange(B, device=device), pos, :]        # (B,D)
+                idx = -1
+                for i in range(T - m_len + 1):
+                    if torch.equal(ids_batch[b, i:i+m_len], marker_tensor):
+                        idx = i + m_len - 1
+                        break
+                if idx >= 0:
+                    pooled[b] = hs[b, idx]
+                else:
+                    pooled[b] = hs[b].mean(dim=0)
+            return pooled
     
-        close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
-    
-        # ----------------------------------------------------------------------
-        #  TRAIN EBM
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        #  TRAINING LOOP
+        # ------------------------------------------------------------------
         for epoch in range(1, ebm_epochs + 1):
             real_model.ebm.train()
             total_loss, steps = 0.0, 0
     
-            for stage in range(3, 4):                                              # ft_datasets 3‑7
+            for stage in range(3, 4):   # ft_datasets 3‑7
                 loader = prepare_ft_dataloader(tokenizer,
                                                block_size=config.BLOCK_SIZE,
                                                shuffle=True,
                                                args=args, stage=stage,
-                                               streaming=True)
+                                               streaming=False)
                 for batch in loader:
-                    ids        = batch["input_ids"].to(device)                    # (B,K,T)
-                    true_price = batch["labels"].to(device)                       # (B,)
+                    ids        = batch["input_ids"].to(device)  # (B,K,T)
+                    true_price = batch["labels"].to(device)     # (B,)
                     B, K, T    = ids.shape
                     preds      = torch.zeros((B, K), device=device)
     
-                    # -------- 1. backbone → marker‑pooled embeddings -------------
-                    emb_list = []
-                    for k_idx in range(K):
-                        emb_k = marker_pool(ids[:, k_idx, :])                      # (B,D)
-                        emb_list.append(emb_k)
-                    embs = torch.stack(emb_list, dim=1)                            # (B,K,D)
+                    # ---- 1. embeddings via marker pooling ----
+                    emb_list = [marker_pool(ids[:, k, :]) for k in range(K)]  # list[(B,D)]
+                    embs = torch.stack(emb_list, dim=1)                       # (B,K,D)
     
-                    # -------- 2. greedy decode numeric preds (unchanged) ---------
+                    # ---- 2. greedy decode numeric preds (unchanged) --------
                     temperature, top_p = 0.8, 0.9
                     for b in range(B):
                         for k in range(K):
                             seq = ids[b, k].tolist()
-                            # find the “<STOCK PRICE 30 DAYS OUT>: ” marker
                             try:
-                                j = next(i for i in range(T - len(open_ids) + 1)
-                                         if seq[i:i+len(open_ids)] == open_ids)
+                                j = next(i for i in range(T - m_len + 1)
+                                         if seq[i:i+m_len] == open_ids)
                             except StopIteration:
                                 continue
-    
-                            prefix    = ids[b, k, : j + len(open_ids)].unsqueeze(0)
+                            prefix    = ids[b, k, : j + m_len].unsqueeze(0)
                             generated = prefix.clone()
                             with torch.no_grad():
                                 for _ in range(10):
-                                    hs = real_model.forward_embeddings_only(generated)    # (1,L,D)
-                                    logits = real_model.lm_head(hs)[:, -1, :]
+                                    full_hs = real_model.forward_embeddings_only(generated)      # (1, block_size, D)
+                                    hs_slice = full_hs[:, : generated.size(1), :]                # trim to current length
+                                    logits = real_model.lm_head(hs_slice)[:, -1, :]             # last token
                                     logits /= temperature
                                     sorted_logits, sorted_idx = logits.sort(descending=True)
                                     cprobs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
@@ -642,7 +646,7 @@ def train_model(
                                     remove[..., 0]  = False
                                     logits[0, sorted_idx[0, remove[0]]] = -float("inf")
                                     probs = torch.softmax(logits, dim=-1)
-                                    nxt   = torch.multinomial(probs, 1)
+                                    nxt = torch.multinomial(probs, 1)
                                     generated = torch.cat([generated, nxt], dim=1)
                                     if nxt.item() == close_id:
                                         break
@@ -651,25 +655,24 @@ def train_model(
                             if val is not None:
                                 preds[b, k] = val
     
-                    # -------- 3. margin‑ranking loss -----------------------------
+                    # ---- 3. margin‑ranking loss ----------------------------
                     flat_embs = embs.view(B*K, -1).to(torch.bfloat16)
                     energies  = real_model.ebm(flat_embs).view(B, K)
-    
-                    pos_idx = (preds - true_price[:, None]).abs().argmin(dim=1)
-                    pos_en  = energies[torch.arange(B), pos_idx]
-                    neg_mask = torch.ones_like(energies, dtype=torch.bool)
+                    pos_idx   = (preds - true_price[:, None]).abs().argmin(dim=1)
+                    pos_en    = energies[torch.arange(B), pos_idx]
+                    neg_mask  = torch.ones_like(energies, dtype=torch.bool)
                     neg_mask[torch.arange(B), pos_idx] = False
-                    neg_en  = energies[neg_mask].view(B, K-1)
-                    loss    = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
+                    neg_en    = energies[neg_mask].view(B, K-1)
+                    loss      = F.relu(margin + pos_en.unsqueeze(1) - neg_en).mean()
     
                     ebm_opt.zero_grad(); loss.backward(); ebm_opt.step()
                     total_loss += loss.item(); steps += 1
     
             logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs}  AvgLoss={total_loss/steps:.4f}")
     
-        # ----------------------------------------------------------------------
-        #  VALIDATION – same marker pooling + correct positive idx -------------
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        #  VALIDATION
+        # ------------------------------------------------------------------
         logging.info("=== EBM Validation (stage 8) ===")
         real_model.ebm.eval()
         val_loader = prepare_ft_dataloader(tokenizer,
@@ -680,15 +683,13 @@ def train_model(
         val_loss, steps = 0.0, 0
         with torch.no_grad():
             for batch in val_loader:
-                ids        = batch["input_ids"].to(device)                       # (B,K,T)
+                ids        = batch["input_ids"].to(device)  # (B,K,T)
                 true_price = batch["labels"].to(device)
-                B, K, T    = ids.shape
-    
-                emb_list = [marker_pool(ids[:, k, :]) for k in range(K)]          # list[(B,D)]
-                embs = torch.stack(emb_list, dim=1)                              # (B,K,D)
+                B, K, _    = ids.shape
+                emb_list = [marker_pool(ids[:, k, :]) for k in range(K)]
+                embs = torch.stack(emb_list, dim=1)
                 energies = real_model.ebm(embs.view(B*K, -1).to(torch.bfloat16)).view(B, K)
     
-                # pick same "closest" candidate as in training
                 preds = torch.zeros((B, K), device=device)
                 for b in range(B):
                     for k in range(K):
@@ -703,9 +704,9 @@ def train_model(
     
         logging.info(f"[EBM Val] AvgLoss={val_loss/steps:.4f}")
     
-        # ----------------------------------------------------------------------
-        #  SAVE -----------------------------------------------------------------
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        #  SAVE
+        # ------------------------------------------------------------------
         final_tag = "model_with_ebm"
         if use_deepspeed:
             engine.save_checkpoint(args.save_dir, tag=final_tag)
@@ -714,7 +715,8 @@ def train_model(
     
         save_checkpoint(engine if use_deepspeed else None,
                         real_model, args.save_dir, STAGE_TAG[4], bucket=args.bucket)
-
+    
         logging.info("=== Phase 4 complete ===")
-        
+
+            
     logging.info("Training complete.")
