@@ -320,6 +320,7 @@ def prepare_ft_dataloader(
             block_size      = block_size,
             mask_fraction   = mask_fraction,
             streaming       = streaming,
+            stage = stage
         )
         collate    = custom_collate_fn
         drop_last  = True
