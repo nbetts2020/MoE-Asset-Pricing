@@ -9,9 +9,11 @@ class EnergyBasedModel(nn.Module):
         super(EnergyBasedModel, self).__init__()
         # Now the input dimension is just embedding_dim instead of 2*embedding_dim.
         self.fc = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(embedding_dim, 4*embedding_dim),
             nn.ReLU(),
-            nn.Linear(embedding_dim, 1)
+            nn.Linear(4*embedding_dim, 2*embedding_dim),
+            nn.ReLU(),
+            nn.Linear(2*embedding_dim, 1)
         )
         self.temperature = temperature
 
