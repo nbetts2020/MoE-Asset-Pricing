@@ -377,9 +377,16 @@ def process_run_dataset(
                         break
                     cur = torch.cat([cur, nxt], dim=1)[:, -cur.size(1):]
 
+                # ─── if we never saw the close-tag, append it ───────────────
+                if not price_toks or price_toks[-1].item() != PRICE_CLOSE_ID:
+                    price_toks.append(
+                        torch.tensor([[PRICE_CLOSE_ID]], device=device)
+                    )
+
             full_ids = torch.cat([prefix_ids, torch.cat(price_toks, dim=1)], dim=1)[0]
             decoded  = tokenizer.decode(full_ids, skip_special_tokens=False)
             pred_val = extract_label_value(decoded)
+
             if pred_val is None:
                 continue
 
