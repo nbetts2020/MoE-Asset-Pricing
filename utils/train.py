@@ -334,6 +334,16 @@ def train_model(
 
                     ep_loss += loss.item()
 
+                    if step % 2500 == 0:
+                        # ── 6. optional checkpoint at this length ──────────────────────
+                        save_checkpoint(
+                            engine   = engine if use_deepspeed else None,
+                            model    = real_model,
+                            save_dir = args.save_dir,
+                            tag      = f"{STAGE_TAG[0]}",
+                            bucket   = args.bucket,
+                        )
+
                 avg = ep_loss / (step + 1)
                 logging.info(f"[Phase 0] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg:.4f}")
 
@@ -431,6 +441,14 @@ def train_model(
                             device=device, alpha=args.replay_buffer_weight,
                         )
                     epoch_loss += loss.item()
+                    if step % 1000 == 0:
+                        save_checkpoint(
+                            engine   = engine if use_deepspeed else None,
+                            model    = real_model,
+                            save_dir = args.save_dir,
+                            tag      = f"{STAGE_TAG[1]}",
+                            bucket   = args.bucket,
+                        )
 
                 avg_loss = epoch_loss / max(1, len(dataloader))
                 logging.info(f"[Phase 1] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg_loss:.4f}")
@@ -521,6 +539,14 @@ def train_model(
                     engine.step()
 
                     ep_loss += loss.item()
+                    if step % 500 == 0:
+                        save_checkpoint(
+                            engine   = engine if use_deepspeed else None,
+                            model    = real_model,
+                            save_dir = args.save_dir,
+                            tag      = f"{STAGE_TAG[2]}",
+                            bucket   = args.bucket,
+                        )
 
                 avg = ep_loss / (step + 1)
                 logging.info(f"[Phase 2] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg:.4f}")
