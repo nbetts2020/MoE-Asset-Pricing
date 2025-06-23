@@ -1,16 +1,18 @@
 import os
+import glob
+import logging
+
 import torch
 import pandas as pd
-import math
-import logging
+import pyarrow.parquet as pq
+
 from torch.utils.data import Dataset, DataLoader
-from transformers import LlamaTokenizerFast
-from utils.config import config
-from huggingface_hub import list_repo_files, hf_hub_download
 from torch.utils.data.distributed import DistributedSampler
 
-import pyarrow.parquet as pq
-from torch.utils.data import IterableDataset
+from transformers import LlamaTokenizerFast
+from huggingface_hub import snapshot_download, list_repo_files, hf_hub_download
+
+from utils.config import config
 
 # Disable tokenizer parallelism to avoid warnings after fork.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -286,53 +288,54 @@ def prepare_ft_dataloader(
     stage: int = 1,
     sampler=None,
     streaming: bool = False,
-    mask_fraction: float = 0.0
+    mask_fraction: float = 0.0,
 ):
     """
     stage:
-      0   → ALL years (2016–2024) from cc-news-formatted/*.parquet
-      1–6 → ft_dataset_{stage}.parquet (PrecomputedDataset)
-      7–8 → ft_dataset_{stage}.parquet (PrecomputedBootstrapDataset)
+      0   → ALL years (2016-2024) from cc-news-formatted/*.parquet
+      1–6 → ft_dataset_{stage}.parquet           (PrecomputedDataset)
+      7–8 → ft_dataset_{stage}.parquet           (PrecomputedBootstrapDataset)
     """
-    # ───────────────────────────────────────────────────────────────────────
-    #  1. Download & prep the Parquet source(s)
-    # ───────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
+    # 1. Resolve the parquet source(s)
+    # ────────────────────────────────────────────────────────────────
     if stage == 0:
-        # list all files in the public cc-news-formatted dataset
-        repo_id = "nbettencourt/cc-news-formatted"
-        files   = list_repo_files(repo_id=repo_id, repo_type="dataset")
-        years   = {f"{y}/" for y in range(2016, 2025)}
+        # one-shot local clone of the whole public dataset (no 429s)
+        cache_dir = snapshot_download(
+            repo_id="nbettencourt/cc-news-formatted",
+            repo_type="dataset",
+            force_download=False,   # reuse if already cached
+        )
 
-        # download every shard under 2016/ … 2024/
-        shard_paths = [
-            hf_hub_download(repo_id=repo_id, filename=f, repo_type="dataset")
-            for f in files
-            if any(f.startswith(y) for y in years) and f.endswith(".parquet")
-        ]
+        # gather every 2016-2024 shard
+        shard_paths = []
+        for y in range(2016, 2025):
+            shard_paths.extend(
+                glob.glob(os.path.join(cache_dir, str(y), "*filtered.parquet"))
+            )
+        if not shard_paths:
+            raise FileNotFoundError("No Common-Crawl shards found in snapshot.")
 
-        # concat into one DataFrame
         df = pd.concat((pd.read_parquet(p) for p in shard_paths), ignore_index=True)
-        for p in shard_paths: os.remove(p)   # clean up temp files
 
-        source = df
+        source        = df          # in-memory
         use_bootstrap = False
 
     else:
-        # existing ft_dataset_N.parquet logic
+        # existing pre-computed datasets
         repo_id  = "nbettencourt/sc454k-preprocessed-dfs"
         filename = f"ft_dataset_{stage}.parquet"
-        file_path = hf_hub_download(
-            repo_id   = repo_id,
-            filename  = filename,
-            repo_type = "dataset",
-        )
+        file_path = hf_hub_download(repo_id=repo_id,
+                                    filename=filename,
+                                    repo_type="dataset")
 
         if stage <= 6:
             source = file_path if streaming else pd.read_parquet(file_path)
-            if not streaming: os.remove(file_path)
+            if not streaming:
+                os.remove(file_path)
             use_bootstrap = False
 
-        else:  # stage 7 or 8 → bootstrap
+        else:                          # stages 7–8 → bootstrap
             text_cols = [f"iteration_text_{i}" for i in range(1, 26)]
             label_col = "weighted_avg_720_hrs"
 
@@ -350,9 +353,9 @@ def prepare_ft_dataloader(
 
             use_bootstrap = True
 
-    # ───────────────────────────────────────────────────────────────────────
-    #  2. Instantiate the Dataset
-    # ───────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
+    # 2. Build the Dataset
+    # ────────────────────────────────────────────────────────────────
     if not use_bootstrap:
         dataset = PrecomputedDataset(
             source        = source,
@@ -364,7 +367,6 @@ def prepare_ft_dataloader(
         )
         collate   = custom_collate_fn
         drop_last = True
-
     else:
         dataset = PrecomputedBootstrapDataset(
             source        = source,
@@ -377,9 +379,9 @@ def prepare_ft_dataloader(
         collate   = bootstrap_collate_fn
         drop_last = (stage < 8)
 
-    # ───────────────────────────────────────────────────────────────────────
-    #  3. Wrap in DataLoader (with optional DistributedSampler)
-    # ───────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
+    # 3. DataLoader (with optional distributed sampler)
+    # ────────────────────────────────────────────────────────────────
     if torch.distributed.is_initialized() and sampler is None:
         sampler = DistributedSampler(
             dataset,
