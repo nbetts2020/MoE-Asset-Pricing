@@ -150,14 +150,14 @@ def main():
                         help="Path to the DeepSpeed config file")
     parser.add_argument("--no_ebm", action="store_true", help="Turn off EBM for inference")
     parser.add_argument("--no_reasoning", action="store_true", help="Turn off reasoning for inference")
-    parser.add_argument("--stages", type=str, default="1,2,3,4", help="Comma-separated list of training stages to execute (1–4).")
+    parser.add_argument("--stages", type=str, default="0,1,2,3,4", help="Comma-separated list of training stages to execute (1–4).")
 
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
 
     args.stages = sorted({int(s.strip()) for s in args.stages.split(",") if s.strip()})
-    if not all(1 <= s <= 4 for s in args.stages):
-        raise ValueError("--stages must contain integers 1-4")
+    if not all(0 <= s <= 4 for s in args.stages):
+        raise ValueError("--stages must contain integers 0-4")
 
     # Handle small/test-mode hyperparameters
     if args.test_model:
