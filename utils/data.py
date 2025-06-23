@@ -305,7 +305,7 @@ def prepare_ft_dataloader(
     # ───────────────────────────────────────────────────────────────────────
     #  SINGLE-TEXT DATASETS (stages 1 & 2)                                  #
     # ───────────────────────────────────────────────────────────────────────
-    if stage in (1, 2):
+    if stage <= 6:
         # • streaming=True  → pass the path; PrecomputedDataset will read lazily
         # • streaming=False → keep legacy behaviour: load full df into RAM
         if streaming:
@@ -326,10 +326,10 @@ def prepare_ft_dataloader(
         drop_last  = True
 
     # ───────────────────────────────────────────────────────────────────────
-    #  BOOTSTRAP (K-text) DATASETS (stages 3-8)                             #
+    #  BOOTSTRAP (K-text) DATASETS (stages 7-8)                             #
     # ───────────────────────────────────────────────────────────────────────
     else:
-        # BOOTSTRAP (K-text) DATASETS (stages 3–8)
+        # BOOTSTRAP (K-text) DATASETS (stages 7–8)
         text_cols = [f"iteration_text_{i}" for i in range(1, 26)]
         label_col = "weighted_avg_720_hrs"
 
