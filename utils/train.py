@@ -476,7 +476,7 @@ def train_model(
         CONTEXT_CURRICULUM = {
             16384 : 1,
             32768  : 1,
-            65536 : 1
+            #65536 : 1
         }
 
         for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
