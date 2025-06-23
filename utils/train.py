@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 import logging
 import subprocess
 import re
+import itertools
+from itertools import chain
 
 from utils.utils import compute_l2_loss, upload_checkpoint_to_s3, download_models_from_s3
 from utils.data import prepare_ft_dataloader
@@ -26,6 +28,7 @@ from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoin
 from utils.model import update_model_rope_for_extended_context
 
 STAGE_TAG = {
+    0: "common_crawl_base",
     1: "normal_pretrained",
     2: "continual_pretrained_64k",
     3: "continual_pretrained_64k", #"supervised_finetuned_coconut",
@@ -236,7 +239,7 @@ def train_model(
     #  If we start at stage > 1, restore the previous checkpoint
     # -----------------------------------------------------------
     min_stage = min(args.stages)
-    if min_stage > 1:
+    if min_stage > 0:
         prev_tag  = STAGE_TAG[min_stage - 1]               # e.g. "normal_pretrained"
         ckpt_root = args.save_dir
         stage_dir = os.path.join(ckpt_root, prev_tag)
@@ -276,13 +279,104 @@ def train_model(
         logging.info(f"Loaded checkpoint from Phase {min_stage} ('{prev_tag}')")
 
     real_model.ebm = real_model.ebm.to(torch.bfloat16)
+
+    # ===================================================================== #
+    #  PHASE 0 – Common Crawl Base Pre-Train                                #
+    # ===================================================================== #
+    if 0 in args.stages:
+        dbg("→ entering Phase 0")
+
+        # curriculum: {block_size : epochs}
+        CONTEXT_CURRICULUM = {
+            4096: 1
+        }
+
+        for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
+            # ── 1. sync to be safe ──────────────────────────────────────────
+            if dist.is_initialized(): dist.barrier()
+
+            if config.BLOCK_SIZE != blk_sz:
+                # ── 2. resize context + RoPE ───────────────────────────────────
+                real_model.block_size = blk_sz
+                config.BLOCK_SIZE     = blk_sz
+                update_model_rope_for_extended_context(real_model, blk_sz)
+
+            if blk_sz % (dist.get_world_size() if dist.is_initialized() else 1) != 0:
+                raise ValueError(f"block_size {blk_sz} not divisible by world_size")
+
+            # ── 3. clear optimiser state so no old-context momentum leaks ──
+            engine.optimizer.zero_grad(set_to_none=True)
+
+            # ── 5. train for n_ep epochs at this length ────────────────────
+            logging.info(f"[Phase 0] block_size {blk_sz:,} for {n_ep} epoch(s)")
+            for ep in range(1, n_ep + 1):
+                real_model.train()
+                ep_loss = 0.0
+
+                stages = [2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+                loaders = [
+                    prepare_ft_dataloader(tokenizer, block_size=blk_sz, shuffle=False, args=args, stage=s, streaming=False) for s in stages
+                ]
+                continual_loader = chain(*loaders)
+
+                for step, batch in enumerate(continual_loader):
+                    print(step, "progress!!")
+                    input_ids = pad_to_global(batch["input_ids"].to(device))
+                    loss      = real_model.forward_next_token_efficient(input_ids)
+                    print(loss, blk_sz, "loss!!")
+
+                    engine.zero_grad()
+                    engine.backward(loss)
+                    engine.step()
+
+                    ep_loss += loss.item()
+
+                avg = ep_loss / (step + 1)
+                logging.info(f"[Phase 0] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg:.4f}")
+
+                # ── 6. optional checkpoint at this length ──────────────────────
+                save_checkpoint(
+                    engine   = engine if use_deepspeed else None,
+                    model    = real_model,
+                    save_dir = args.save_dir,
+                    tag      = f"{STAGE_TAG[0]}",
+                    bucket   = args.bucket,
+                )
+
+            # stop early if user asked for only stage 2 -------------------------
+            if getattr(args, "stage_0_only", False):
+                logging.info("stage_0_only=True → stopping after Phase 2")
+                return
+    
     # ------------------------------------------------------------------ #
     #  PHASE 1  –  curriculum pre-training (single shared dataloader)
     # ------------------------------------------------------------------ #
     if 1 in args.stages:
+        dbg("→ entering Phase 1")
+        if args.bucket:
+            download_models_from_s3(bucket=args.bucket)
+            dist.barrier()
+
+        # ------------------------------------------------------------------ #
+        #  0. restore the Phase-1 weights (module-only)                       #
+        # ------------------------------------------------------------------ #
+        dbg("loading Phase-1 checkpoint")
+        # engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[0])
+        engine.load_checkpoint(
+            load_dir                 = args.save_dir,
+            tag                      = STAGE_TAG[0],
+            load_optimizer_states    = False,
+            load_lr_scheduler_states = False,
+            load_module_only         = True,
+        )
+        real_model = engine.module
+        dbg("loaded Phase-0 model")
+
         # map {block_size: num_epochs}
         CURRICULUM = {
-            128 : 1,
+            4096 : 1,
+            8192: 1,
+            16384: 1
         }
 
         total_epochs = sum(CURRICULUM.values())
@@ -302,6 +396,8 @@ def train_model(
             if dist.is_initialized() and blk_sz % dist.get_world_size() != 0:
                 raise ValueError(f"block_size {blk_sz} must be divisible by world_size")
 
+            engine.optimizer.zero_grad(set_to_none=True)
+
             logging.info(f"[Phase 1] block_size {blk_sz:,} for {n_ep} epoch(s)")
 
             for ep in range(1, n_ep + 1):
@@ -310,9 +406,10 @@ def train_model(
 
                 # ———————————— mini-batch loop ————————————
                 for step, batch in enumerate(dataloader):
+                    print(step, "progress!!")
                     input_ids = pad_to_global(batch["input_ids"].to(device))   # pads/trims to blk_sz
                     loss      = real_model.forward_next_token_efficient(input_ids)
-
+                    print(loss, "loss!!")
                     if engine:            # DeepSpeed
                         engine.zero_grad(); engine.backward(loss); engine.step()
                     else:                 # plain PyTorch
@@ -374,9 +471,9 @@ def train_model(
 
         # curriculum: {block_size : epochs}
         CONTEXT_CURRICULUM = {
-            1024: 2,
-            8192  : 1,
-            16384 : 1
+            16384 : 1,
+            32768  : 1,
+            65536 : 1
         }
 
         for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
@@ -397,38 +494,6 @@ def train_model(
 
             # ── 4. build streaming dataloader for the *new* length ─────────
             dbg(f"building continual_loader (bs={blk_sz:,})")
-            # continual_loader = prepare_ft_dataloader(
-            #     tokenizer,
-            #     block_size = blk_sz,
-            #     shuffle    = False,
-            #     args       = args,
-            #     stage      = 1,          # same dataset as before
-            #     streaming  = True,
-            # )
-            import itertools
-
-            # # build each stage’s loader
-            # loader_stage1 = prepare_ft_dataloader(
-            #     tokenizer,
-            #     block_size = blk_sz,
-            #     shuffle    = False,
-            #     args       = args,
-            #     stage      = 1,
-            #     streaming  = True,
-            # )
-            # loader_stage2 = prepare_ft_dataloader(
-            #     tokenizer,
-            #     block_size = blk_sz,
-            #     shuffle    = False,
-            #     args       = args,
-            #     stage      = 2,
-            #     streaming  = True,
-            # )
-
-            # chain them into one
-            from itertools import chain
-            # continual_loader = chain(loader_stage1, loader_stage2)
-            dbg("continual_loader ready")
 
             # ── 5. train for n_ep epochs at this length ────────────────────
             logging.info(f"[Phase 2] block_size {blk_sz:,} for {n_ep} epoch(s)")
@@ -454,7 +519,7 @@ def train_model(
 
                     ep_loss += loss.item()
 
-                avg = ep_loss / 627
+                avg = ep_loss / (step + 1)
                 logging.info(f"[Phase 2] bs={blk_sz:,}  Epoch {ep}/{n_ep}  avg loss {avg:.4f}")
 
                 # ── 6. optional checkpoint at this length ──────────────────────
