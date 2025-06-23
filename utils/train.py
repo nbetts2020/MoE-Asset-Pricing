@@ -28,7 +28,7 @@ from utils.model import update_model_rope_for_extended_context
 STAGE_TAG = {
     1: "normal_pretrained",
     2: "continual_pretrained_64k",
-    3: "supervised_finetuned_coconut",
+    3: "continual_pretrained_64k", #"supervised_finetuned_coconut",
     4: "model_with_ebm",
 }
 
@@ -282,10 +282,7 @@ def train_model(
     if 1 in args.stages:
         # map {block_size: num_epochs}
         CURRICULUM = {
-            128 : 10,
-            512 : 2,
-            2048: 1,
-            4096: 1,
+            128 : 1,
         }
 
         total_epochs = sum(CURRICULUM.values())
@@ -377,7 +374,7 @@ def train_model(
 
         # curriculum: {block_size : epochs}
         CONTEXT_CURRICULUM = {
-            4096: 2,
+            1024: 2,
             8192  : 1,
             16384 : 1
         }
@@ -439,15 +436,11 @@ def train_model(
                 real_model.train()
                 ep_loss = 0.0
 
-                loader_stage1 = prepare_ft_dataloader(
-                    tokenizer, block_size=blk_sz, shuffle=False,
-                    args=args, stage=1, streaming=False
-                )
-                loader_stage2 = prepare_ft_dataloader(
-                    tokenizer, block_size=blk_sz, shuffle=False,
-                    args=args, stage=2, streaming=False
-                )
-                continual_loader = chain(loader_stage1, loader_stage2)
+                stages = [1,2,3,4,5,6]
+                loaders = [
+                    prepare_ft_dataloader(tokenizer, block_size=blk_sz, shuffle=False, args=args, stage=s, streaming=False) for s in stages
+                ]
+                continual_loader = chain(*loaders)
 
                 for step, batch in enumerate(continual_loader):
                     print(step, "progress!!")
@@ -585,26 +578,26 @@ def train_model(
 
         # add a LayerNorm in front of the head (place it on the same GPU)
         if not isinstance(real_model.ebm.fc[0], nn.LayerNorm):
-            ln = nn.LayerNorm(real_model.ebm.fc[0].in_features).to(device)
+            ln = nn.LayerNorm(real_model.ebm.fc[0].in_features, dtype=torch.bfloat16).to(device)
             real_model.ebm.fc = nn.Sequential(ln, *list(real_model.ebm.fc))
 
         for p in real_model.ebm.parameters():
             p.requires_grad_(True)
 
         ebm_opt    = torch.optim.AdamW(real_model.ebm.parameters(), lr=1e-5)
-        margin     = 0.1
+        margin     = 0.0
         ebm_epochs = getattr(args, "ebm_epochs", 1)
 
         # -------------------------------------------------------------- #
         #  Marker-pool helper                                            #
         # -------------------------------------------------------------- #
-        POOL_STRATEGY = "single_head"      # "last_token" | "single_head" | "multi_head"
-        POOL_WINDOW   = 256                # –1 ⇒ all tokens before marker
+        POOL_STRATEGY = "last_token"      # "last_token" | "single_head" | "multi_head"
+        POOL_WINDOW   = -1                # –1 ⇒ all tokens before marker
         NUM_HEADS     = 4                  # used only for "multi_head"
         # ──────────────────────────────────────────────────────────────────────────────
-        
+
         D = real_model.n_embed
-        
+
         # learnable query/queries for attention strategies
         if POOL_STRATEGY == "single_head":
             pool_q = nn.Parameter(torch.randn(D, device=device))
@@ -615,75 +608,88 @@ def train_model(
             head_dim = D // NUM_HEADS
             pool_q = nn.Parameter(torch.randn(NUM_HEADS, head_dim, device=device))
             real_model.register_parameter("pool_q", pool_q)
-        
+
         # constant IDs we need every call
         open_ids = tokenizer("<STOCK PRICE 30 DAYS OUT>: ",
                              add_special_tokens=False).input_ids
+        m_len    = len(open_ids)
         open_id = tokenizer("<STOCK PRICE 30 DAYS OUT>: ",
                             add_special_tokens=False).input_ids[0]
         delim_ids    = tokenizer("Last 8 Articles for the Current Stock",
                                  add_special_tokens=False).input_ids
         delim_len    = len(delim_ids)
         delim_tensor = torch.tensor(delim_ids, device=device)
-        
-        # ──────────────────────────────────────────────────────────────────────────────
+        close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
+
+        pre_ln = {}
+
+        def tap_pre_ln(module, input, output):
+            # input[0] is the tensor before the final LayerNorm
+            pre_ln['x'] = input[0].detach()
+            return output  # keep normal forward flow
+
+        # Register this once, after building/loading your model
+        handle = real_model.ln_f.register_forward_hook(tap_pre_ln)
+
         def marker_pool(ids_batch: torch.Tensor) -> torch.Tensor:
             """
             1) For each row, truncate at the delimiter “Last 8 Articles for the Current
                Stock”, append the <STOCK PRICE 30 DAYS OUT>: token.
-            2) Pad/trim to block_size and run the model to get hidden states.
+            2) Pad/trim to block_size and run the model to get hidden states (pre-LN).
             3) Pool according to POOL_STRATEGY.
             Returns (B, D).
             """
             B, _ = ids_batch.shape
             device = ids_batch.device
             seqs = []
-        
-            # ---------- build per-row sequences (prefix + marker) ----------
+
+            # build per-row sequences (prefix + marker)
             for b in range(B):
                 row = ids_batch[b]
-                split_idx = next( (i for i in range(row.size(0) - delim_len + 1)
-                                   if torch.equal(row[i:i+delim_len], delim_tensor)),
-                                  row.size(0) )                 # fallback to full row
+                split_idx = next(
+                    (i for i in range(row.size(0) - delim_len + 1)
+                     if torch.equal(row[i:i+delim_len], delim_tensor)),
+                    row.size(0)
+                )
                 prefix = row[:split_idx]
                 seqs.append(torch.cat([prefix, torch.tensor([open_id], device=device)]))
-        
-            # ---------- pad/trim each to model.block_size and stack ----------
+
+            # pad/trim each to model.block_size and stack
             padded = torch.stack([
                 real_model._pad_or_trim(s.unsqueeze(0), real_model.block_size).squeeze(0)
                 for s in seqs
-            ], dim=0)                                           # (B, block_size)
-        
-            hs = real_model.forward_embeddings_only(padded)     # (B, block_size, D)
-        
-            # the appended marker is always the *last* surviving token
-            marker_idx = hs.size(1) - 1
-        
-            # ---------- pooling -------------------------------------------------------
+            ], dim=0)  # (B, block_size)
+
+            # run full forward to trigger our pre-LN hook (we ignore the output)
+            _ = real_model(padded)
+
+            # retrieve the pre-LN hidden states
+            hs_raw = pre_ln['x']  # (B, block_size, D)
+            marker_idx = hs_raw.size(1) - 1
+
+            # pooling
             if POOL_STRATEGY == "last_token":
-                return hs[:, marker_idx, :]                     # (B, D)
-        
-            # choose window of tokens *before* the marker
+                return hs_raw[:, marker_idx, :]  # (B, D)
+
+            # window of tokens before the marker
             if POOL_WINDOW == -1:
                 start = 0
             else:
                 start = max(0, marker_idx - POOL_WINDOW)
-            window = hs[:, start:marker_idx, :]                 # (B, L, D)
-        
+            window = hs_raw[:, start:marker_idx, :]  # (B, L, D)
+
             if POOL_STRATEGY == "single_head":
-                # (B, L) attention scores
-                scores = torch.matmul(window, pool_q) / math.sqrt(D)
-                weights = torch.softmax(scores, dim=1).unsqueeze(-1)    # (B, L, 1)
-                return (weights * window).sum(dim=1)                    # (B, D)
-        
-            else:  # "multi_head"
-                H, d_h = pool_q.shape                     # (H, head_dim)
-                window = window.view(B, window.size(1), H, d_h)         # (B,L,H,d_h)
-                scores = (window * pool_q)               \
-                           .sum(-1) / math.sqrt(d_h)                     # (B,L,H)
-                weights = torch.softmax(scores, dim=1).unsqueeze(-1)     # (B,L,H,1)
-                pooled  = (weights * window).sum(1)                      # (B,H,d_h)
-                return pooled.view(B, D)                                 # (B, D)
+                scores = torch.matmul(window, pool_q) / math.sqrt(D)  # (B, L)
+                weights = torch.softmax(scores, dim=1).unsqueeze(-1)   # (B, L, 1)
+                return (weights * window).sum(dim=1)                   # (B, D)
+
+            else:  # multi_head
+                H, d_h = pool_q.shape  # (H, head_dim)
+                window = window.view(B, window.size(1), H, d_h)  # (B, L, H, d_h)
+                scores = (window * pool_q).sum(-1) / math.sqrt(d_h)  # (B, L, H)
+                weights = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, L, H, 1)
+                pooled = (weights * window).sum(1)                    # (B, H, d_h)
+                return pooled.view(B, D)                              # (B, D)
 
         # -------------------------------------------------------------- #
         #  TRAIN EBM                                                     #
@@ -695,21 +701,30 @@ def train_model(
             loader = prepare_ft_dataloader(tokenizer,
                                            block_size=config.BLOCK_SIZE,
                                            shuffle=True,
-                                           args=args, stage=3,
+                                           args=args, stage=7,
                                            streaming=False)
             for step, batch in enumerate(loader):
+                if step < 5:
+                    continue
+                if step == 9:
+                    break
                 ids, true_price = batch["input_ids"].to(device), batch["labels"].to(device)
                 B, K, T = ids.shape
                 preds   = torch.zeros((B, K), device=device)
                 # ---- 1. marker-pooled, L2-normalised embeddings -------------
-                embs = torch.stack([marker_pool(ids[:, k, :]) for k in range(K)], dim=1)
-                embs = F.normalize(embs, dim=-1)                                # (B,K,D)
-                var = embs.var(dim=1).mean().item()
-                norm = embs.norm(dim=-1).mean().item()
+                embs = torch.stack([marker_pool(ids[:, k, :]) for k in range(K)], dim=1)  # (B,K,D)
+
+                # batch‐wide z-score
+                mean = embs.mean(dim=(0,1), keepdim=True)                                 # (1,1,D)
+                std  = embs.std(dim=(0,1), keepdim=True).clamp(min=1e-5)                  # (1,1,D)
+                embs = (embs - mean) / std                                                # (B,K,D)
+
+                # **compute diagnostics** before printing**
+                var  = embs.var(dim=(0,1), unbiased=False).mean().item()                  # scalar ≈1
+                norm = embs.norm(dim=-1).mean().item()                                    # avg L2 norm
+
                 print(f"Avg var: {var:.4e}, Avg norm: {norm:.2f}, SNR: {var/(norm**2):.2%}")
                 print(f"[DEBUG] Avg embedding-var across K: {var:.6f}")
-                if step >= 0:
-                    break
                 # ---- 2. temperature / top-p sampling to predict price ------- #
                 temperature, top_p = 0.8, 0.9
                 for b in range(B):
@@ -748,6 +763,7 @@ def train_model(
 
                         txt = tokenizer.decode(generated[0], skip_special_tokens=False)
                         val = extract_label_value(txt)
+                        print(txt, step)
                         if val is not None:
                             preds[b, k] = val
 
@@ -755,19 +771,26 @@ def train_model(
                 energies = real_model.ebm(
                               embs.view(B*K, -1).to(torch.bfloat16)
                            ).view(B, K)
+                print(energies)
                 pos_idx = (preds - true_price[:, None]).abs().argmin(dim=1)
                 pos_en  = energies[torch.arange(B), pos_idx]
 
-                mask    = torch.ones_like(energies, dtype=torch.bool)
-                mask[torch.arange(B), pos_idx] = False
-                neg_en  = energies.masked_fill(mask, float("inf")).min(dim=1).values
-                loss    = F.relu(margin + pos_en - neg_en).mean()
+                # mask True for the positive example only
+                mask = torch.zeros_like(energies, dtype=torch.bool)
+                mask[torch.arange(B), pos_idx] = True
+
+                # set positives to +∞ so only negatives remain for the min
+                neg_en = energies.masked_fill(mask, float("inf")).min(dim=1).values
+
+                loss = F.relu(margin + pos_en - neg_en).mean()
 
                 correct += ((pos_en + margin) < neg_en).float().sum().item()
                 ebm_opt.zero_grad(); loss.backward(); ebm_opt.step()
                 total_loss += loss.item(); steps += 1
 
             train_acc = correct / (steps * B)
+            cls_acc = (energies.argmin(dim=1) == pos_idx).float().mean()
+            print(cls_acc, "cls_acc")
             logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs}  "
                          f"AvgLoss={total_loss/steps:.4f}  SepAcc={train_acc:.3f}")
 
@@ -808,11 +831,16 @@ def train_model(
                 pos_idx = (preds - true_price[:, None]).abs().argmin(dim=1)
                 pos_en  = energies[torch.arange(B), pos_idx]
 
-                mask    = torch.ones_like(energies, dtype=torch.bool)
-                mask[torch.arange(B), pos_idx] = False
-                neg_en  = energies.masked_fill(mask, float("inf")).min(dim=1).values
 
-                loss    = F.relu(margin + pos_en - neg_en).mean()
+                # mask True for the positive example only
+                mask = torch.zeros_like(energies, dtype=torch.bool)
+                mask[torch.arange(B), pos_idx] = True
+
+                # set positives to +∞ so only negatives remain for the min
+                neg_en = energies.masked_fill(mask, float("inf")).min(dim=1).values
+
+                loss = F.relu(margin + pos_en - neg_en).mean()
+
                 correct += ((pos_en + margin) < neg_en).float().sum().item()
                 val_loss += loss.item(); steps += 1
 
