@@ -313,13 +313,16 @@ def train_model(
                 real_model.train()
                 ep_loss = 0.0
 
-                stages = [2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
-                loaders = [
-                    prepare_ft_dataloader(tokenizer, block_size=blk_sz, shuffle=False, args=args, stage=s, streaming=False) for s in stages
-                ]
-                continual_loader = chain(*loaders)
+                loader = prepare_ft_dataloader(
+                    tokenizer,
+                    block_size=blk_sz,
+                    shuffle=False,
+                    args=args,
+                    stage=0,         # one call to get 2016–2024 merged
+                    streaming=False
+                )
 
-                for step, batch in enumerate(continual_loader):
+                for step, batch in enumerate(loader):
                     print(step, "progress!!")
                     input_ids = pad_to_global(batch["input_ids"].to(device))
                     loss      = real_model.forward_next_token_efficient(input_ids)
