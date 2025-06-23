@@ -290,79 +290,95 @@ def prepare_ft_dataloader(
 ):
     """
     stage:
-      1 → ft_dataset_1.parquet  (PrecomputedDataset)
-      2 → ft_dataset_2.parquet  (PrecomputedDataset)
-      3–7 → ft_dataset_{k}.parquet (PrecomputedBootstrapDataset)
-      8 → ft_dataset_8.parquet  (PrecomputedBootstrapDataset, val)
+      0   → ALL years (2016–2024) from cc-news-formatted/*.parquet
+      1–6 → ft_dataset_{stage}.parquet (PrecomputedDataset)
+      7–8 → ft_dataset_{stage}.parquet (PrecomputedBootstrapDataset)
     """
-    filename  = f"ft_dataset_{stage}.parquet"
-    file_path = hf_hub_download(
-        repo_id  = "nbettencourt/sc454k-preprocessed-dfs",
-        filename = filename,
-        repo_type= "dataset",
-    )
+    # ───────────────────────────────────────────────────────────────────────
+    #  1. Download & prep the Parquet source(s)
+    # ───────────────────────────────────────────────────────────────────────
+    if stage == 0:
+        # list all files in the public cc-news-formatted dataset
+        repo_id = "nbettencourt/cc-news-formatted"
+        files   = list_repo_files(repo_id=repo_id, repo_type="dataset")
+        years   = {f"{y}/" for y in range(2016, 2025)}
 
-    # ───────────────────────────────────────────────────────────────────────
-    #  SINGLE-TEXT DATASETS (stages 1 & 2)                                  #
-    # ───────────────────────────────────────────────────────────────────────
-    if stage <= 6:
-        # • streaming=True  → pass the path; PrecomputedDataset will read lazily
-        # • streaming=False → keep legacy behaviour: load full df into RAM
-        if streaming:
-            df_or_path = file_path
-        else:
-            df_or_path = pd.read_parquet(file_path)
-            os.remove(file_path)
+        # download every shard under 2016/ … 2024/
+        shard_paths = [
+            hf_hub_download(repo_id=repo_id, filename=f, repo_type="dataset")
+            for f in files
+            if any(f.startswith(y) for y in years) and f.endswith(".parquet")
+        ]
 
-        dataset = PrecomputedDataset(
-            df_or_path,
-            tokenizer,
-            block_size      = block_size,
-            mask_fraction   = mask_fraction,
-            streaming       = streaming,
-            stage = stage
-        )
-        collate    = custom_collate_fn
-        drop_last  = True
+        # concat into one DataFrame
+        df = pd.concat((pd.read_parquet(p) for p in shard_paths), ignore_index=True)
+        for p in shard_paths: os.remove(p)   # clean up temp files
 
-    # ───────────────────────────────────────────────────────────────────────
-    #  BOOTSTRAP (K-text) DATASETS (stages 7-8)                             #
-    # ───────────────────────────────────────────────────────────────────────
+        source = df
+        use_bootstrap = False
+
     else:
-        # BOOTSTRAP (K-text) DATASETS (stages 7–8)
-        text_cols = [f"iteration_text_{i}" for i in range(1, 26)]
-        label_col = "weighted_avg_720_hrs"
+        # existing ft_dataset_N.parquet logic
+        repo_id  = "nbettencourt/sc454k-preprocessed-dfs"
+        filename = f"ft_dataset_{stage}.parquet"
+        file_path = hf_hub_download(
+            repo_id   = repo_id,
+            filename  = filename,
+            repo_type = "dataset",
+        )
 
-        if streaming:
-            # stream directly from the Parquet file, one row at a time
-            source = file_path
-        else:
-            # load into memory and then delete the file
-            df = pd.read_parquet(file_path)
-            os.remove(file_path)
+        if stage <= 6:
+            source = file_path if streaming else pd.read_parquet(file_path)
+            if not streaming: os.remove(file_path)
+            use_bootstrap = False
 
-            # append the label tag to each text column in-memory
-            label_tag = df[label_col].map(
-                lambda v: f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
-            )
-            for col in text_cols:
-                df[col] = df[col] + "\n" + label_tag
+        else:  # stage 7 or 8 → bootstrap
+            text_cols = [f"iteration_text_{i}" for i in range(1, 26)]
+            label_col = "weighted_avg_720_hrs"
 
-            source = df
+            if streaming:
+                source = file_path
+            else:
+                df = pd.read_parquet(file_path)
+                os.remove(file_path)
+                tag = df[label_col].map(
+                    lambda v: f"<STOCK PRICE 30 DAYS OUT>: {v:.2f} </STOCK PRICE 30 DAYS OUT>"
+                )
+                for col in text_cols:
+                    df[col] = df[col] + "\n" + tag
+                source = df
 
+            use_bootstrap = True
+
+    # ───────────────────────────────────────────────────────────────────────
+    #  2. Instantiate the Dataset
+    # ───────────────────────────────────────────────────────────────────────
+    if not use_bootstrap:
+        dataset = PrecomputedDataset(
+            source        = source,
+            tokenizer     = tokenizer,
+            block_size    = block_size,
+            mask_fraction = mask_fraction,
+            streaming     = streaming,
+            stage         = stage,
+        )
+        collate   = custom_collate_fn
+        drop_last = True
+
+    else:
         dataset = PrecomputedBootstrapDataset(
-            source,
-            tokenizer    = tokenizer,
-            block_size   = block_size,
-            text_columns = text_cols,
-            label_column = label_col,
-            streaming    = streaming
+            source        = source,
+            tokenizer     = tokenizer,
+            block_size    = block_size,
+            text_columns  = text_cols,
+            label_column  = label_col,
+            streaming     = streaming,
         )
         collate   = bootstrap_collate_fn
         drop_last = (stage < 8)
 
     # ───────────────────────────────────────────────────────────────────────
-    #  DISTRIBUTED SAMPLING (unchanged)                                     #
+    #  3. Wrap in DataLoader (with optional DistributedSampler)
     # ───────────────────────────────────────────────────────────────────────
     if torch.distributed.is_initialized() and sampler is None:
         sampler = DistributedSampler(
@@ -372,10 +388,10 @@ def prepare_ft_dataloader(
             shuffle      = shuffle,
             seed         = getattr(args, "random_seed", 42),
         )
-        shuffle = False  # sampler handles shuffling
+        shuffle = False
 
     return DataLoader(
-        dataset,
+        dataset     = dataset,
         batch_size  = config.BATCH_SIZE,
         shuffle     = (shuffle and sampler is None),
         sampler     = sampler,
