@@ -283,7 +283,7 @@ class NoisyTopkRouter(nn.Module):
 class SparseMoE(nn.Module):
     """Multi-GPU expert-parallel Sparse-MoE (bf16-friendly)."""
 
-    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 1.1):
+    def __init__(self, d: int, n_exp: int, top_k: int, cap_factor: float = 2):
         super().__init__()
         self.top_k       = top_k
         self.cap_factor  = cap_factor
