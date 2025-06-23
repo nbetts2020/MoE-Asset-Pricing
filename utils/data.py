@@ -6,7 +6,7 @@ import logging
 from torch.utils.data import Dataset, DataLoader
 from transformers import LlamaTokenizerFast
 from utils.config import config
-from huggingface_hub import hf_hub_download
+from huggingface_hub import list_repo_files, hf_hub_download
 from torch.utils.data.distributed import DistributedSampler
 
 import pyarrow.parquet as pq
