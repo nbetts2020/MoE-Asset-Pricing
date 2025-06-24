@@ -154,6 +154,9 @@ def main():
 
     args = parser.parse_args()
     print_debug_info("AFTER ARGPARSE")
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda", args.local_rank)
+    logging.info(f"Pinned to GPU {args.local_rank}")
 
     args.stages = sorted({int(s.strip()) for s in args.stages.split(",") if s.strip()})
     if not all(0 <= s <= 4 for s in args.stages):
