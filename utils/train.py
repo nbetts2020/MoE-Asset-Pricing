@@ -352,7 +352,7 @@ def train_model(
 
                     ep_loss += loss.item()
 
-                    if step % 2500 == 0:
+                    if step % 1500 == 0:
                         # ── 6. optional checkpoint at this length ──────────────────────
                         save_checkpoint(
                             engine   = engine if use_deepspeed else None,
