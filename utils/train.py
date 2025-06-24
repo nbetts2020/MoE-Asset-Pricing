@@ -239,7 +239,7 @@ def train_model(
     #  If we start at stage > 1, restore the previous checkpoint
     # -----------------------------------------------------------
     min_stage = min(args.stages)
-    if min_stage > 0:
+    if min_stage >= 0:
         prev_tag  = STAGE_TAG[min_stage - 1]               # e.g. "normal_pretrained"
         ckpt_root = args.save_dir
         stage_dir = os.path.join(ckpt_root, prev_tag)
@@ -285,6 +285,24 @@ def train_model(
     # ===================================================================== #
     if 0 in args.stages:
         dbg("→ entering Phase 0")
+
+        if args.bucket:
+            download_models_from_s3(bucket=args.bucket)
+            dist.barrier()
+
+        # ------------------------------------------------------------------ #
+        #  0. restore the Phase-1 weights (module-only)                       #
+        # ------------------------------------------------------------------ #
+        dbg("loading Phase-1 checkpoint")
+        # engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[0])
+        engine.load_checkpoint(
+            load_dir                 = args.save_dir,
+            tag                      = STAGE_TAG[0],
+            load_optimizer_states    = False,
+            load_lr_scheduler_states = False,
+            load_module_only         = True,
+        )
+        real_model = engine.module
 
         # curriculum: {block_size : epochs}
         CONTEXT_CURRICULUM = {
