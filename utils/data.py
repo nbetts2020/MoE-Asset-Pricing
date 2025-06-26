@@ -331,8 +331,6 @@ def prepare_ft_dataloader(
 
         if stage <= 6:
             source = file_path if streaming else pd.read_parquet(file_path)
-            if not streaming:
-                os.remove(file_path)
             use_bootstrap = False
 
         else:                          # stages 7–8 → bootstrap
