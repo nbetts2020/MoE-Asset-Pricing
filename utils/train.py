@@ -500,7 +500,7 @@ def train_model(
         # engine.load_checkpoint(args.save_dir, tag=STAGE_TAG[1])
         engine.load_checkpoint(
             load_dir                 = args.save_dir,
-            tag                      = STAGE_TAG[1],
+            tag                      = STAGE_TAG[2],
             load_optimizer_states    = False,
             load_lr_scheduler_states = False,
             load_module_only         = True,
@@ -510,9 +510,11 @@ def train_model(
 
         # curriculum: {block_size : epochs}
         CONTEXT_CURRICULUM = {
-            16384 : 1,
-            32768  : 1,
-            #65536 : 1
+            # 16384 : 1,
+            # 32768  : 1,
+            65536 : 1,
+            82944 : 1,
+            100352: 1
         }
 
         for blk_sz, n_ep in CONTEXT_CURRICULUM.items():
@@ -557,7 +559,7 @@ def train_model(
                     engine.step()
 
                     ep_loss += loss.item()
-                    if step % 500 == 0:
+                    if step > 5 and step % 500 == 0:
                         save_checkpoint(
                             engine   = engine if use_deepspeed else None,
                             model    = real_model,
