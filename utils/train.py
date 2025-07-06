@@ -690,7 +690,6 @@ def train_model(
         for p in real_model.parameters():
             p.requires_grad_(False)
 
-        # 👇  NEW: JIT-compile the frozen backbone for cheap inference
         real_model = torch.compile(real_model, mode="reduce-overhead")   # <-- add
         real_model.ebm = torch.compile(real_model.ebm)                   # trainable MLP
 
@@ -884,6 +883,7 @@ def train_model(
                 neg_en = energies.masked_fill(mask, float("inf")).min(1).values
         
                 loss = F.relu(margin + pos_en - neg_en).mean()
+                print(loss, "loss!!")
         
                 correct += ((pos_en + margin) < neg_en).float().sum().item()
                 ebm_opt.zero_grad(); loss.backward(); ebm_opt.step()
