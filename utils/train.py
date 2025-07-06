@@ -837,16 +837,18 @@ def train_model(
         
                 # ────────── 2. BATCHED GENERATION (KV-cache) ─────────
                 # Build the per-candidate prefixes ending at the marker
+                MAX_PREF = 100000
                 prefixes = []
                 for row in flat_ids:
-                    try:
-                        j = next(i for i in range(T - m_len + 1)
-                                 if torch.equal(row[i:i+m_len],
-                                                torch.tensor(open_ids, device=device)))
-                    except StopIteration:
-                        j = T - m_len
-                    prefixes.append(row[: j + m_len])
-        
+                    # find marker
+                    j = next((i for i in range(T - m_len + 1)
+                              if torch.equal(row[i:i+ m_len], delim_tensor)),
+                             None)
+                    if j is None:
+                        raise RuntimeError("Delimiter missing in EBM sample")
+                    L = min(j + m_len, MAX_PREF)           # clamp length here
+                    prefixes.append(row[-L:])
+
                 from torch.nn.utils.rnn import pad_sequence
                 prefix_pad = pad_sequence(prefixes, batch_first=True,
                                           padding_value=tokenizer.pad_token_id)
@@ -920,15 +922,27 @@ def train_model(
                           ).view(B, K)
         
                 # quick batched decode
-                prefixes = [row[: row.tolist().index(close_id)+1
-                                if close_id in row else torch.cat([row, torch.tensor([close_id], device=device)])]
-                            for row in flat_ids]
-                prefix_pad = pad_sequence(prefixes, batch_first=True,
+                MAX_PREF = 100000
+                val_prefixes = []
+                for row in flat_ids:
+                    j = next((i for i in range(T - m_len + 1)
+                              if torch.equal(row[i:i+m_len], delim_tensor)),
+                             None)
+                    if j is None:
+                        raise RuntimeError("Delimiter missing in EBM sample")
+                    L = min(j + m_len, MAX_PREF)
+                    val_prefixes.append(row[-L:])
+                prefix_pad = pad_sequence(val_prefixes, batch_first=True,
                                           padding_value=tokenizer.pad_token_id)
-                gen_out = real_model.generate(input_ids=prefix_pad,
-                                              max_new_tokens=0,
-                                              eos_token_id=close_id,
-                                              pad_token_id=tokenizer.pad_token_id)
+
+                gen_out = real_model.generate(
+                    input_ids      = prefix_pad,
+                    max_new_tokens = 10,          # ← generate up to 10 new tokens
+                    do_sample      = False,       # or True, depending on val-time sampling
+                    eos_token_id   = close_id,
+                    pad_token_id   = tokenizer.pad_token_id,
+                    use_cache      = False,       # val is small—no need to cache
+                )
                 txts  = tokenizer.batch_decode(gen_out, skip_special_tokens=False)
                 preds = torch.zeros((B, K), device=device)
                 for i, s in enumerate(txts):
