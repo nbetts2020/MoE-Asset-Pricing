@@ -860,13 +860,14 @@ def train_model(
                         do_sample      = False,
                         eos_token_id   = close_id,
                         pad_token_id   = tokenizer.pad_token_id,
-                    )                                                   # (B·K, …)
+                    )
         
                 # Decode & extract numbers
                 txts  = tokenizer.batch_decode(gen_out,
                                                skip_special_tokens=False)
                 preds = torch.zeros((B, K), device=device)
                 for i, s in enumerate(txts):
+                    print(s, step, "step")
                     val = extract_label_value(s)
                     if val is not None:
                         preds.view(-1)[i] = val
