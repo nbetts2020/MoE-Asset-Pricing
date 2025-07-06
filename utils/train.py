@@ -690,6 +690,10 @@ def train_model(
         for p in real_model.parameters():
             p.requires_grad_(False)
 
+        # 👇  NEW: JIT-compile the frozen backbone for cheap inference
+        real_model = torch.compile(real_model, mode="reduce-overhead")   # <-- add
+        real_model.ebm = torch.compile(real_model.ebm)                   # trainable MLP
+
         # add a LayerNorm in front of the head (place it on the same GPU)
         if not isinstance(real_model.ebm.fc[0], nn.LayerNorm):
             ln = nn.LayerNorm(real_model.ebm.fc[0].in_features, dtype=torch.bfloat16).to(device)
@@ -818,98 +822,79 @@ def train_model(
                                            args=args, stage=7,
                                            streaming=False)
             for step, batch in enumerate(loader):
-                if step < 5:
-                    continue
-                if step == 9:
-                    break
                 ids, true_price = batch["input_ids"].to(device), batch["labels"].to(device)
                 B, K, T = ids.shape
-                preds   = torch.zeros((B, K), device=device)
-                # ---- 1. marker-pooled, L2-normalised embeddings -------------
-                embs = torch.stack([marker_pool(ids[:, k, :]) for k in range(K)], dim=1)  # (B,K,D)
-
-                # batch‐wide z-score
-                mean = embs.mean(dim=(0,1), keepdim=True)                                 # (1,1,D)
-                std  = embs.std(dim=(0,1), keepdim=True).clamp(min=1e-5)                  # (1,1,D)
-                embs = (embs - mean) / std                                                # (B,K,D)
-
-                # **compute diagnostics** before printing**
-                var  = embs.var(dim=(0,1), unbiased=False).mean().item()                  # scalar ≈1
-                norm = embs.norm(dim=-1).mean().item()                                    # avg L2 norm
-
-                print(f"Avg var: {var:.4e}, Avg norm: {norm:.2f}, SNR: {var/(norm**2):.2%}")
-                print(f"[DEBUG] Avg embedding-var across K: {var:.6f}")
-                # ---- 2. temperature / top-p sampling to predict price ------- #
-                temperature, top_p = 0.8, 0.9
-                for b in range(B):
-                    for k in range(K):
-                        seq = ids[b, k].tolist()
-                        try:
-                            j = next(i for i in range(T - m_len + 1)
-                                     if seq[i:i+m_len] == open_ids)
-                        except StopIteration:
-                            continue
-                        prefix    = ids[b, k, : j+m_len].unsqueeze(0)           # (1,L)
-                        generated = prefix.clone()
-                        with torch.no_grad():
-                            for _ in range(10):
-                                full_hs  = real_model.forward_embeddings_only(generated)
-                                hs_slice = full_hs[:, : generated.size(1), :]
-                                logits   = real_model.lm_head(hs_slice)[:, -1, :]
-                                logits  /= temperature
-
-                                sorted_logits, sorted_idx = logits.sort(descending=True)
-                                cprobs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                                remove = cprobs > top_p
-                                remove[..., 1:] = remove[..., :-1].clone()
-                                remove[..., 0]  = False
-                                logits[0, sorted_idx[0, remove[0]]] = float("-inf")
-
-                                probs = torch.softmax(logits, dim=-1)
-                                nxt   = torch.multinomial(probs, 1)
-                                generated = torch.cat([generated, nxt], dim=1)
-                                if nxt.item() == close_id:
-                                    break
-                        # ensure close-tag
-                        if generated[0, -1].item() != close_id:
-                            generated = torch.cat([generated,
-                                torch.tensor([[close_id]], device=device)], dim=1)
-
-                        txt = tokenizer.decode(generated[0], skip_special_tokens=False)
-                        val = extract_label_value(txt)
-                        print(txt, step)
-                        if val is not None:
-                            preds[b, k] = val
-
-                # ---- 3. hard-negative hinge loss --------------------------- #
-                energies = real_model.ebm(
-                              embs.view(B*K, -1).to(torch.bfloat16)
-                           ).view(B, K)
-                print(energies)
+        
+                # ────────── 1. MARKER-POOL (single forward) ──────────
+                flat_ids = ids.view(B * K, T)                          # (B·K, T)
+                with torch.inference_mode():                           # no autograd, cached KV
+                    embs = marker_pool(flat_ids)                       # (B·K, D)
+                embs = embs.view(B, K, -1)                             # (B, K, D)
+        
+                # batch-wide z-score
+                mean = embs.mean((0, 1), keepdim=True)
+                std  = embs.std((0, 1), keepdim=True).clamp_(min=1e-5)
+                embs = (embs - mean) / std
+        
+                # ────────── 2. BATCHED GENERATION (KV-cache) ─────────
+                # Build the per-candidate prefixes ending at the marker
+                prefixes = []
+                for row in flat_ids:
+                    try:
+                        j = next(i for i in range(T - m_len + 1)
+                                 if torch.equal(row[i:i+m_len],
+                                                torch.tensor(open_ids, device=device)))
+                    except StopIteration:
+                        j = T - m_len
+                    prefixes.append(row[: j + m_len])
+        
+                from torch.nn.utils.rnn import pad_sequence
+                prefix_pad = pad_sequence(prefixes, batch_first=True,
+                                          padding_value=tokenizer.pad_token_id)
+        
+                with torch.inference_mode():
+                    gen_out = real_model.generate(
+                        input_ids      = prefix_pad,
+                        max_new_tokens = 10,
+                        use_cache      = True,
+                        do_sample      = False,
+                        eos_token_id   = close_id,
+                        pad_token_id   = tokenizer.pad_token_id,
+                    )                                                   # (B·K, …)
+        
+                # Decode & extract numbers
+                txts  = tokenizer.batch_decode(gen_out,
+                                               skip_special_tokens=False)
+                preds = torch.zeros((B, K), device=device)
+                for i, s in enumerate(txts):
+                    val = extract_label_value(s)
+                    if val is not None:
+                        preds.view(-1)[i] = val
+        
+                # ────────── 3. HINGE LOSS  (unchanged) ───────────────
+                energies = real_model.ebm(embs.reshape(B*K, -1).to(torch.bfloat16)
+                                         ).view(B, K)
+        
                 pos_idx = (preds - true_price[:, None]).abs().argmin(dim=1)
                 pos_en  = energies[torch.arange(B), pos_idx]
-
-                # mask True for the positive example only
-                mask = torch.zeros_like(energies, dtype=torch.bool)
+        
+                mask   = torch.zeros_like(energies, dtype=torch.bool)
                 mask[torch.arange(B), pos_idx] = True
-
-                # set positives to +∞ so only negatives remain for the min
-                neg_en = energies.masked_fill(mask, float("inf")).min(dim=1).values
-
+                neg_en = energies.masked_fill(mask, float("inf")).min(1).values
+        
                 loss = F.relu(margin + pos_en - neg_en).mean()
-
+        
                 correct += ((pos_en + margin) < neg_en).float().sum().item()
                 ebm_opt.zero_grad(); loss.backward(); ebm_opt.step()
                 total_loss += loss.item(); steps += 1
-
+        
             train_acc = correct / (steps * B)
-            cls_acc = (energies.argmin(dim=1) == pos_idx).float().mean()
-            print(cls_acc, "cls_acc")
-            logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs}  "
+            cls_acc   = (energies.argmin(1) == pos_idx).float().mean()
+            logging.info(f"[EBM FT] Epoch {epoch}/{ebm_epochs} "
                          f"AvgLoss={total_loss/steps:.4f}  SepAcc={train_acc:.3f}")
-
+        
         # -------------------------------------------------------------- #
-        #  VALIDATION                                                    #
+        # 3)  VALIDATION – same batch-KV & inference_mode changes        #
         # -------------------------------------------------------------- #
         logging.info("=== EBM Validation (stage 8) ===")
         real_model.ebm.eval()
@@ -918,51 +903,53 @@ def train_model(
                                            shuffle=False,
                                            args=args, stage=8,
                                            streaming=True)
-
+        
         val_loss, steps, correct = 0.0, 0, 0
         with torch.no_grad():
             for batch in val_loader:
                 ids, true_price = batch["input_ids"].to(device), batch["labels"].to(device)
-                B, K, _ = ids.shape
-
-                embs = torch.stack([marker_pool(ids[:, k, :]) for k in range(K)], dim=1)
+                B, K, T = ids.shape
+        
+                flat_ids = ids.view(B * K, T)
+                with torch.inference_mode():
+                    embs = marker_pool(flat_ids).view(B, K, -1)
                 embs = F.normalize(embs, dim=-1)
                 energies = real_model.ebm(
-                              embs.view(B*K, -1).to(torch.bfloat16)
-                           ).view(B, K)
-
+                             embs.view(B*K, -1).to(torch.bfloat16)
+                          ).view(B, K)
+        
+                # quick batched decode
+                prefixes = [row[: row.tolist().index(close_id)+1
+                                if close_id in row else torch.cat([row, torch.tensor([close_id], device=device)])]
+                            for row in flat_ids]
+                prefix_pad = pad_sequence(prefixes, batch_first=True,
+                                          padding_value=tokenizer.pad_token_id)
+                gen_out = real_model.generate(input_ids=prefix_pad,
+                                              max_new_tokens=0,
+                                              eos_token_id=close_id,
+                                              pad_token_id=tokenizer.pad_token_id)
+                txts  = tokenizer.batch_decode(gen_out, skip_special_tokens=False)
                 preds = torch.zeros((B, K), device=device)
-                for b in range(B):
-                    for k in range(K):
-                        seq_ids = ids[b, k]
-                        if close_id not in seq_ids:
-                            seq_ids = torch.cat([seq_ids,
-                                       torch.tensor([close_id], device=device)])
-                        preds[b, k] = extract_label_value(
-                            tokenizer.decode(seq_ids, skip_special_tokens=False)
-                        ) or 0.0
-
-                pos_idx = (preds - true_price[:, None]).abs().argmin(dim=1)
+                for i, s in enumerate(txts):
+                    v = extract_label_value(s)
+                    if v is not None:
+                        preds.view(-1)[i] = v
+        
+                pos_idx = (preds - true_price[:, None]).abs().argmin(1)
                 pos_en  = energies[torch.arange(B), pos_idx]
-
-
-                # mask True for the positive example only
-                mask = torch.zeros_like(energies, dtype=torch.bool)
+                mask    = torch.zeros_like(energies, dtype=torch.bool)
                 mask[torch.arange(B), pos_idx] = True
-
-                # set positives to +∞ so only negatives remain for the min
-                neg_en = energies.masked_fill(mask, float("inf")).min(dim=1).values
-
+                neg_en  = energies.masked_fill(mask, float("inf")).min(1).values
+        
                 loss = F.relu(margin + pos_en - neg_en).mean()
-
                 correct += ((pos_en + margin) < neg_en).float().sum().item()
                 val_loss += loss.item(); steps += 1
-
+        
         val_acc = correct / (steps * B)
         logging.info(f"[EBM Val] AvgLoss={val_loss/steps:.4f}  SepAcc={val_acc:.3f}")
-
+        
         # -------------------------------------------------------------- #
-        #  SAVE                                                          #
+        # 4)  SAVE                                                       #
         # -------------------------------------------------------------- #
         save_checkpoint(
             engine   = engine if use_deepspeed else None,
@@ -971,7 +958,5 @@ def train_model(
             tag      = STAGE_TAG[4],
             bucket   = args.bucket,
         )
-
         logging.info("=== Phase 4 complete ===")
-
     logging.info("Training complete.")
