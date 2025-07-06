@@ -969,7 +969,107 @@ class SparseMoELanguageModel(nn.Module):
         pooled = sum_local / count_local.clamp(min=1.0)      # (B, D)
         return pooled
 
-
+    @torch.no_grad()
+    def generate(  # add to SparseMoELanguageModel
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        eos_token_id: int | None = None,
+        pad_token_id: int | None = None,
+        use_cache: bool = True,      # you already support KV-cache in your blocks
+    ) -> torch.LongTensor:
+        """
+        A minimal autoregressive sampler:
+          – supports greedy (do_sample=False) or top-p sampling
+          – re-uses your block’s KV-cache to avoid recomputing the full prefix
+        """
+        device = input_ids.device
+        B, seq_len = input_ids.shape
+    
+        # We'll keep track of past_k/v per layer:
+        past_ks = [None] * len(self.blocks)
+        past_vs = [None] * len(self.blocks)
+    
+        # Start generation loop:
+        generated = input_ids
+        for _ in range(max_new_tokens):
+            # 1) get final hidden states + updated past_k/v from your forward
+            #    you need a helper that returns (logits, new_past_ks, new_past_vs)
+            logits, past_ks, past_vs = self._step_forward(
+                generated,
+                past_ks,
+                past_vs,
+                use_cache=use_cache,
+            )
+            next_logits = logits[:, -1, :] / max(temperature, 1e-5)
+    
+            if do_sample:
+                # Top-p filter
+                sorted_logits, sorted_idx = next_logits.sort(descending=True, dim=-1)
+                probs = F.softmax(sorted_logits, dim=-1)
+                cum_probs = probs.cumsum(dim=-1)
+                mask = cum_probs > top_p
+                mask[..., 1:] &= ~mask[..., :-1]
+                sorted_logits[mask] = -float("inf")
+                next_probs = F.softmax(sorted_logits, dim=-1)
+                next_token = sorted_idx.gather(
+                    -1,
+                    torch.multinomial(next_probs, 1),
+                )
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+    
+            generated = torch.cat([generated, next_token], dim=1)
+    
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+    
+        # pad shorter sequences if you want a fixed length
+        if pad_token_id is not None and generated.size(1) < seq_len + max_new_tokens:
+            pad_len = seq_len + max_new_tokens - generated.size(1)
+            pad = torch.full((B, pad_len), pad_token_id, device=device, dtype=torch.long)
+            generated = torch.cat([generated, pad], dim=1)
+    
+        return generated
+    
+    def _step_forward(self, 
+        input_ids: torch.LongTensor,
+        past_ks: list[torch.Tensor | None],
+        past_vs: list[torch.Tensor | None],
+        use_cache: bool,
+    ):
+        """
+        A single forward pass returning:
+          - logits over vocab (B, cur_len, V)
+          - updated past_ks and past_vs for each block
+        """
+        # 1) pad / trim to block_size
+        x = self._pad_or_trim(input_ids, self.block_size)
+    
+        # 2) embed + dropout
+        x = self.dropout_emb(self.token_embedding_table(x))
+    
+        new_past_ks, new_past_vs = [], []
+        # 3) run through each block with KV-cache
+        for i, blk in enumerate(self.blocks):
+            x, _, k, v = blk(
+                x,
+                mask=None,    # assumes full context
+                past_k=past_ks[i],
+                past_v=past_vs[i],
+            )
+            new_past_ks.append(k)
+            new_past_vs.append(v)
+    
+        # 4) final LN + vocab projection
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+    
+        return logits, new_past_ks, new_past_vs
+    
 # -----------------------------------------------------------------------------#
 #  helpers to extend context length
 # -----------------------------------------------------------------------------#
