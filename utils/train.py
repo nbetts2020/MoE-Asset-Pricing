@@ -729,8 +729,7 @@ def train_model(
         m_len    = len(open_ids)
         open_id = tokenizer("<STOCK PRICE 30 DAYS OUT>: ",
                             add_special_tokens=False).input_ids[0]
-        delim_ids    = tokenizer("Last 8 Articles for the Current Stock",
-                                 add_special_tokens=False).input_ids
+        delim_ids    = [8897, 29871, 29947, 12952, 363, 9626, 10224, 29901]
         delim_len    = len(delim_ids)
         delim_tensor = torch.tensor(delim_ids, device=device)
         close_id = tokenizer.convert_tokens_to_ids("</STOCK PRICE 30 DAYS OUT>")
@@ -753,18 +752,29 @@ def train_model(
             3) Pool according to POOL_STRATEGY.
             Returns (B, D).
             """
-            B, _ = ids_batch.shape
+            B, T_in = ids_batch.shape
             device = ids_batch.device
             seqs = []
 
             # build per-row sequences (prefix + marker)
             for b in range(B):
                 row = ids_batch[b]
+                # Look for the delimiter, return -1 if not found
                 split_idx = next(
                     (i for i in range(row.size(0) - delim_len + 1)
                      if torch.equal(row[i:i+delim_len], delim_tensor)),
-                    row.size(0)
+                    -1
                 )
+
+                # Check if the delimiter was found. If not, log a warning.
+                if split_idx == -1:
+                    logging.warning(
+                        f"[marker_pool] Delimiter 'Last 8 Articles...' not found in sample for batch index {b}. "
+                        "Using the full, untruncated sequence. This may degrade model performance."
+                    )
+                    # Revert to original behavior (use full sequence) after warning
+                    split_idx = T_in
+
                 prefix = row[:split_idx]
                 seqs.append(torch.cat([prefix, torch.tensor([open_id], device=device)]))
 
@@ -856,17 +866,7 @@ def train_model(
                                     full_hs  = real_model.forward_embeddings_only(generated)
                                     hs_slice = full_hs[:, : generated.size(1), :]
                                     logits   = real_model.lm_head(hs_slice)[:, -1, :]
-                                    logits  /= temperature
-    
-                                    sorted_logits, sorted_idx = logits.sort(descending=True)
-                                    cprobs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                                    remove = cprobs > top_p
-                                    remove[..., 1:] = remove[..., :-1].clone()
-                                    remove[..., 0]  = False
-                                    logits[0, sorted_idx[0, remove[0]]] = float("-inf")
-    
-                                    probs = torch.softmax(logits, dim=-1)
-                                    nxt   = torch.multinomial(probs, 1)
+                                    nxt = torch.argmax(logits, dim=-1, keepdim=True)
                                     generated = torch.cat([generated, nxt], dim=1)
                                     if nxt.item() == close_id:
                                         break
@@ -948,16 +948,7 @@ def train_model(
                             full_hs = real_model.forward_embeddings_only(generated)
                             hs_slice = full_hs[:, :generated.size(1), :]
                             logits = real_model.lm_head(hs_slice)[:, -1, :]
-                            logits /= temperature
-
-                            sorted_logits, sorted_idx = logits.sort(descending=True)
-                            cprobs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                            remove = cprobs > top_p
-                            remove[..., 1:] = remove[..., :-1].clone(); remove[..., 0] = False
-                            logits[0, sorted_idx[0, remove[0]]] = float("-inf")
-                            
-                            probs = torch.softmax(logits, dim=-1)
-                            nxt = torch.multinomial(probs, 1)
+                            nxt = torch.argmax(logits, dim=-1, keepdim=True)
                             generated = torch.cat([generated, nxt], dim=1)
                             if nxt.item() == close_id: break
 
